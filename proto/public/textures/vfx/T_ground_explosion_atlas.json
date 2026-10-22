@@ -1,0 +1,11 @@
+{
+  "source": "T_ground_explosion64.png",
+  "file": "T_ground_explosion_atlas.png",
+  "cols": 8,
+  "rows": 8,
+  "frameCount": 64,
+  "cellWidth": 152,
+  "cellHeight": 173,
+  "aspect": 0.8786127167630058,
+  "note": "8x8 SubUV sheet; RGB remapped to warm fire via luminance (source was data-colored)"
+}

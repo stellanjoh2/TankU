@@ -1,0 +1,305 @@
+import * as THREE from 'three';
+
+/* ============================================================
+   TANK CAMERA CONFIG: every tweakable value lives here.
+   Units: metres, seconds, radians unless noted (deg = degrees,
+   converted internally). "lambda" values are damping rates:
+   higher = snappier, lower = lazier/floatier (frame-rate independent).
+   ============================================================ */
+export const CAMERA_CONFIG = {
+  // ---------- Base rig (where the camera sits) ----------
+  pivotHeight: 1.6,          // height above tank origin the camera orbits/looks around
+  distanceMin: 7.0,          // distance behind tank when standing still
+  distanceMax: 10.5,         // distance behind tank at top speed
+  heightMin: 2.8,            // camera height above pivot at standstill
+  heightMax: 2.2,            // camera height at top speed (lower = more "racing")
+  lookAheadStatic: 6.0,      // how far in front of the tank the camera aims at rest
+  lookAheadSpeed: 0.35,      // extra look-ahead per m/s of speed
+  lookAtHeight: 0.6,         // vertical offset of the look target (raise to see more sky)
+
+  // ---------- Follow lag (racing feel comes from this) ----------
+  followLambdaXZ: 7.0,       // position follow, horizontal. Lower = more trailing/lag
+  followLambdaY: 5.0,        // position follow, vertical (smooths bumps/hills)
+  yawLambda: 3.5,            // how fast camera swings to new heading. LOW = you see the tank's side in turns
+  yawLambdaFast: 2.5,        // yaw lambda at top speed (even lazier when fast)
+  steerYawOffsetDeg: 14,     // camera swings toward outside of a turn by this much at full steer + speed
+  reverseFlip: false,        // true: camera swings to look the other way when reversing
+  reverseThreshold: 1.5,     // m/s before reverse counts as reversing
+
+  // ---------- Turret influence ----------
+  turretFollowWeight: 0.45,  // 0 = camera ignores turret, 1 = camera fully follows turret yaw
+  turretLookWeight: 0.85,    // how much the LOOK target aims along the turret (0 = tank heading)
+  turretYawLambda: 6.0,      // smoothing for turret-driven aim
+  turretSwingRollDeg: 2.5,   // extra roll when turret slews quickly
+  turretSwingOffset: 0.8,    // sideways camera shift (m) while turret slews
+
+  // ---------- Steering tilt / lean ----------
+  maxRollDeg: 4.5,           // horizon roll into turns at full steer + speed
+  rollMinSpeedFactor: 0.25,  // fraction of roll kept at standstill (0 = none when stopped)
+  rollLambda: 5.0,           // how quickly roll follows
+  invertRoll: false,         // flip if the lean feels wrong-way
+  steerLateralOffset: 0.9,   // camera slides sideways (m) on steer, like racing cams
+  lateralLambda: 4.0,
+
+  // ---------- Speed zoom ----------
+  fovBase: 62,               // deg at standstill
+  fovMax: 78,                // deg at top speed
+  fovLambda: 4.0,
+  speedCurve: 1.4,           // >1 = zoom effect kicks in late, <1 = early
+  maxSpeed: 20,              // m/s that counts as "100% speed" (match your tank!)
+
+  // ---------- Fire kick-back ----------
+  kickDistance: 1.6,         // metres the camera is shoved back per unit kick
+  kickPitchDeg: 3.0,         // camera nose-up on fire
+  kickFovDeg: 6.0,           // FOV punch on fire (cheap, effective)
+  kickImpulse: 14.0,         // initial spring velocity: bigger = sharper snap
+  kickStiffness: 60.0,       // spring pulling back to rest: higher = faster return
+  kickDamping: 9.0,          // lower = more wobble/overshoot, higher = slow, no bounce
+  kickShake: 0.35,           // trauma added to shake on fire (0..1)
+
+  // ---------- Shake ----------
+  shakeMaxAngleDeg: 2.0,     // rotation at trauma = 1
+  shakeMaxOffset: 0.25,      // positional shake (m) at trauma = 1
+  shakeFrequency: 22,        // Hz-ish
+  shakeDecay: 1.6,           // trauma lost per second
+  speedShake: 0.0,           // constant rumble at top speed (0..0.3). Try 0.05
+  
+  // ---------- Pitch / terrain ----------
+  pitchFollowTilt: 0.35,     // 0..1 how much the camera tilts with terrain slope (needs state.pitch)
+  pitchLambda: 4.0,
+  basePitchDeg: 0,           // constant extra pitch up/down on the view
+
+  // ---------- Collision ----------
+  collisionEnabled: true,
+  collisionMargin: 0.4,      // gap kept from walls (m)
+  collisionPullInLambda: 25, // snap in fast when blocked
+  collisionReleaseLambda: 2.5, // ease out slowly after (avoids popping)
+  minDistance: 2.0,          // never closer than this to pivot
+
+  // ---------- Misc ----------
+  maxDt: 1 / 30,             // clamps big frame hitches
+  near: 0.1,
+  far: 1000,
+};
+
+/* ---------------- helpers ---------------- */
+const damp = (a, b, lambda, dt) => a + (b - a) * (1 - Math.exp(-lambda * dt));
+const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const deg = (d) => (d * Math.PI) / 180;
+const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+const dampAngle = (a, b, lambda, dt) => a + wrapAngle(b - a) * (1 - Math.exp(-lambda * dt));
+const lerpAngle = (a, b, t) => a + wrapAngle(b - a) * t;
+
+// Convention: yaw 0 faces -Z (three.js default), forward = (-sin yaw, 0, -cos yaw)
+const fwd = (yaw, out) => out.set(-Math.sin(yaw), 0, -Math.cos(yaw));
+const right = (yaw, out) => out.set(Math.cos(yaw), 0, -Math.sin(yaw));
+
+/**
+ * Usage:
+ *   const cam = new TankCamera(camera);                // or pass overrides: new TankCamera(camera, { fovMax: 85 })
+ *   // every frame:
+ *   cam.update(dt, {
+ *     position,      // THREE.Vector3, tank world position
+ *     heading,       // tank body yaw (rad)
+ *     turretYaw,     // turret WORLD yaw (rad)  (bodyYaw + localTurretYaw)
+ *     speed,         // signed forward speed m/s (negative = reversing)
+ *     steer,         // -1..1 (left negative, right positive: flip sign if needed)
+ *     turretTurn,    // optional -1..1 turret slew input/rate
+ *     pitch,         // optional tank body pitch from terrain (rad)
+ *   });
+ *   // on main gun fire:
+ *   cam.kick(1.0);   // strength multiplier, e.g. 0.5 for MG, 1.5 for big gun
+ *   cam.addShake(0.4); // explosions, impacts
+ */
+export class TankCamera {
+  constructor(camera, overrides = {}) {
+    this.camera = camera;
+    this.cfg = Object.assign({}, CAMERA_CONFIG, overrides);
+    this.colliders = [];                 // THREE.Object3D[] to raycast against
+    this.raycaster = new THREE.Raycaster();
+
+    // smoothed state
+    this.yaw = 0;
+    this.aimYaw = 0;
+    this.pivot = new THREE.Vector3();
+    this.roll = 0;
+    this.lateral = 0;
+    this.slew = 0;
+    this.pitch = 0;
+    this.fov = this.cfg.fovBase;
+    this.distance = this.cfg.distanceMin;
+    this.collisionDist = Infinity;       // max allowed distance from collision
+    this.initialised = false;
+
+    // kick spring (scalar displacement + velocity)
+    this.kickX = 0;
+    this.kickV = 0;
+
+    this.trauma = 0;
+    this.time = 0;
+
+    // scratch vectors
+    this._f = new THREE.Vector3();
+    this._r = new THREE.Vector3();
+    this._desired = new THREE.Vector3();
+    this._look = new THREE.Vector3();
+    this._dir = new THREE.Vector3();
+    this._pivotWorld = new THREE.Vector3();
+  }
+
+  setColliders(objects) { this.colliders = objects; }
+
+  kick(strength = 1) {
+    this.kickV += this.cfg.kickImpulse * strength;
+    this.addShake(this.cfg.kickShake * strength);
+  }
+
+  addShake(amount) { this.trauma = clamp(this.trauma + amount, 0, 1); }
+
+  /** Snap straight to the target (use on spawn/respawn/teleport). */
+  snap(state) { this.initialised = false; this.update(1 / 60, state); }
+
+  update(dtRaw, s) {
+    const c = this.cfg;
+    const dt = Math.min(dtRaw, c.maxDt);
+    this.time += dt;
+
+    const speed = s.speed ?? 0;
+    const steer = clamp(s.steer ?? 0, -1, 1);
+    const turretTurn = clamp(s.turretTurn ?? 0, -1, 1);
+    const speedT = Math.pow(clamp(Math.abs(speed) / c.maxSpeed, 0, 1), c.speedCurve);
+    const reversing = speed < -c.reverseThreshold;
+
+    // ----- initialise -----
+    if (!this.initialised) {
+      this.pivot.copy(s.position);
+      this.yaw = s.heading;
+      this.aimYaw = s.turretYaw ?? s.heading;
+      this.fov = c.fovBase;
+      this.distance = c.distanceMin;
+      this.collisionDist = Infinity;
+      this.initialised = true;
+    }
+
+    // ----- pivot follow (horizontal vs vertical lag separate) -----
+    this.pivot.x = damp(this.pivot.x, s.position.x, c.followLambdaXZ, dt);
+    this.pivot.z = damp(this.pivot.z, s.position.z, c.followLambdaXZ, dt);
+    this.pivot.y = damp(this.pivot.y, s.position.y, c.followLambdaY, dt);
+
+    // ----- yaw: heading blended with turret, lagged, steer-offset -----
+    let baseYaw = s.heading;
+    if (reversing && c.reverseFlip) baseYaw += Math.PI;
+    const turretYaw = s.turretYaw ?? s.heading;
+    let desiredYaw = lerpAngle(baseYaw, turretYaw, c.turretFollowWeight);
+    desiredYaw += -steer * deg(c.steerYawOffsetDeg) * speedT; // swing to outside of turn
+    const yawLambda = lerp(c.yawLambda, c.yawLambdaFast, speedT);
+    this.yaw = dampAngle(this.yaw, desiredYaw, yawLambda, dt);
+    this.aimYaw = dampAngle(this.aimYaw, lerpAngle(baseYaw, turretYaw, c.turretLookWeight), c.turretYawLambda, dt);
+
+    // ----- speed zoom -----
+    const targetFov = lerp(c.fovBase, c.fovMax, speedT);
+    this.fov = damp(this.fov, targetFov, c.fovLambda, dt);
+    const targetDist = lerp(c.distanceMin, c.distanceMax, speedT);
+    this.distance = damp(this.distance, targetDist, c.fovLambda, dt);
+    const height = lerp(c.heightMin, c.heightMax, speedT);
+
+    // ----- kick spring (semi-implicit Euler, substepped for stability) -----
+    const steps = 4, h = dt / steps;
+    for (let i = 0; i < steps; i++) {
+      const a = -c.kickStiffness * this.kickX - c.kickDamping * this.kickV;
+      this.kickV += a * h;
+      this.kickX += this.kickV * h;
+    }
+
+    // ----- roll / lateral / slew -----
+    const rollSign = c.invertRoll ? -1 : 1;
+    const rollSpeedFactor = lerp(c.rollMinSpeedFactor, 1, speedT);
+    const targetRoll = rollSign * (-steer * deg(c.maxRollDeg) * rollSpeedFactor - turretTurn * deg(c.turretSwingRollDeg));
+    this.roll = damp(this.roll, targetRoll, c.rollLambda, dt);
+    this.lateral = damp(this.lateral, steer * c.steerLateralOffset * rollSpeedFactor, c.lateralLambda, dt);
+    this.slew = damp(this.slew, turretTurn, 6, dt);
+    this.pitch = damp(this.pitch, (s.pitch ?? 0) * c.pitchFollowTilt, c.pitchLambda, dt);
+
+    // ----- build desired camera position -----
+    fwd(this.yaw, this._f);
+    right(this.yaw, this._r);
+    const kickBack = this.kickX * c.kickDistance;
+    let dist = this.distance + kickBack;
+
+    const pivotCopy = this._pivotWorld.copy(this.pivot);
+    pivotCopy.y += c.pivotHeight;
+
+    // collision: cast from pivot toward desired position
+    this._desired.copy(pivotCopy)
+      .addScaledVector(this._f, -dist)
+      .addScaledVector(this._r, this.lateral + this.slew * c.turretSwingOffset);
+    this._desired.y += height;
+
+    if (c.collisionEnabled && this.colliders.length) {
+      this._dir.subVectors(this._desired, pivotCopy);
+      const full = this._dir.length();
+      this._dir.normalize();
+      this.raycaster.set(pivotCopy, this._dir);
+      this.raycaster.far = full;
+      const hits = this.raycaster.intersectObjects(this.colliders, true);
+      const allowed = hits.length ? Math.max(c.minDistance, hits[0].distance - c.collisionMargin) : Infinity;
+      const lam = allowed < this.collisionDist ? c.collisionPullInLambda : c.collisionReleaseLambda;
+      this.collisionDist = Number.isFinite(allowed) || Number.isFinite(this.collisionDist)
+        ? damp(Number.isFinite(this.collisionDist) ? this.collisionDist : full, Number.isFinite(allowed) ? allowed : full + 1, lam, dt)
+        : Infinity;
+      if (this.collisionDist < full) {
+        this._desired.copy(pivotCopy).addScaledVector(this._dir, this.collisionDist);
+      }
+    }
+
+    // ----- shake -----
+    const trauma = clamp(this.trauma + c.speedShake * speedT, 0, 1);
+    const shake = trauma * trauma;
+    const t = this.time * c.shakeFrequency;
+    const n1 = Math.sin(t * 1.0) * Math.sin(t * 0.37 + 1.3);
+    const n2 = Math.sin(t * 1.3 + 2.0) * Math.sin(t * 0.53);
+    const n3 = Math.sin(t * 0.9 + 4.0) * Math.sin(t * 0.41 + 0.7);
+    this.trauma = Math.max(0, this.trauma - c.shakeDecay * dt);
+
+    this._desired.x += n1 * shake * c.shakeMaxOffset;
+    this._desired.y += n2 * shake * c.shakeMaxOffset;
+
+    // ----- apply to camera -----
+    this.camera.position.copy(this._desired);
+
+    // look target: ahead along aim direction
+    fwd(this.aimYaw, this._f);
+    const lookAhead = c.lookAheadStatic + Math.abs(speed) * c.lookAheadSpeed;
+    this._look.copy(pivotCopy).addScaledVector(this._f, lookAhead);
+    this._look.y = pivotCopy.y + c.lookAtHeight - this.pitch * lookAhead * 0.5;
+    this.camera.lookAt(this._look);
+
+    // local rotations applied after lookAt: kick pitch, base pitch, shake, roll
+    this.camera.rotateX(this.kickX * deg(c.kickPitchDeg) + deg(c.basePitchDeg) + n3 * shake * deg(c.shakeMaxAngleDeg));
+    this.camera.rotateY(n1 * shake * deg(c.shakeMaxAngleDeg));
+    this.camera.rotateZ(this.roll + n2 * shake * deg(c.shakeMaxAngleDeg));
+
+    // FOV (+ fire punch)
+    const fov = this.fov + this.kickX * c.kickFovDeg;
+    if (Math.abs(this.camera.fov - fov) > 0.001 || this.camera.near !== c.near) {
+      this.camera.fov = fov;
+      this.camera.near = c.near;
+      this.camera.far = c.far;
+      this.camera.updateProjectionMatrix();
+    }
+  }
+}
+
+/* ============================================================
+   OPTIONAL: live tweak panel (npm i lil-gui)
+
+   import GUI from 'lil-gui';
+   const gui = new GUI();
+   for (const [k, v] of Object.entries(tankCam.cfg)) {
+     if (typeof v === 'number') gui.add(tankCam.cfg, k, v * 0 - Math.abs(v) * 2, Math.abs(v) * 3 + 1);
+     if (typeof v === 'boolean') gui.add(tankCam.cfg, k);
+   }
+   // Test fire with a key:
+   addEventListener('keydown', e => { if (e.code === 'Space') tankCam.kick(1); });
+   ============================================================ */
