@@ -1,0 +1,26 @@
+---
+description: This repo is a game demo/prototype, not a Blender project
+alwaysApply: true
+---
+
+# Project focus: game demo / prototype
+
+Despite the folder name (`Blender-Test01`) and leftover `.blend` files, **this project is the interactive game demo/prototype**, not Blender modeling work.
+
+## Primary codebase
+
+- **Official name**: Tank U
+- **Repo**: https://github.com/stellanjoh2/TankU
+- **Main app**: `proto/` — Vite + Three.js + Rapier
+- Gameplay lives in `proto/src/` (tank, planes, terrain, AI, HUD, SFX, etc.)
+- When the user asks to add features, fix bugs, or "work on the project," default to the **proto game**, not Blender scripts or MCP Blender tools
+
+## Assets vs gameplay
+
+- Blender files, `scripts/`, `exports/`, and texture pipelines are **asset/tooling support** for the prototype
+- Only touch Blender/asset pipelines when the user explicitly asks for modeling, export, rigging, or bake work
+
+## Defaults
+
+- Prefer changing `proto/src/` for gameplay, visuals, controls, and systems
+- Do not assume Blender MCP / scene editing unless they clearly want 3D asset work

@@ -1,0 +1,32 @@
+---
+description: When to verify changes yourself vs leave it to the user
+alwaysApply: true
+---
+
+# Test what's hard to see, skip what's obvious
+
+The user plays the game and checks results themselves. Don't spend time verifying changes they can judge at a glance.
+
+## Skip testing
+
+Simple, visible changes the user will spot as soon as they load the game:
+
+- Textures, colours, materials, lighting tweaks
+- Moving, scaling or adding props
+- HUD text and layout
+- Constant or tuning tweaks (speeds, sizes, timings)
+
+No builds, preview servers or screenshots for these.
+
+## Do test
+
+Complex or hard-to-observe behaviour the user can't easily check by playing:
+
+- Physics, collisions, and edge cases (fast movement, tunnelling, flipping)
+- AI, pathfinding, navgrid logic
+- Game state flow (match start/end, restart, respawn, scoring)
+- Performance-sensitive changes (LOD, instancing, shader cost)
+- Refactors touching many files, or anything that might break loading
+- Bugs that are hard to reproduce, or anything the user asks you to verify
+
+Keep tests targeted to the risky part, not the whole feature.

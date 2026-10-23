@@ -4,11 +4,19 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { GrassMaterial } from './GrassMaterial.js';
 import { SIZE, heightAt, isGrassable } from './terrain.js';
+import { pickLod } from './lod.js';
 
-const CHUNK = 32;
-const DENSITY = 0.92; // clumps per m² on meadows (−20%)
-// LOD00 native height ≈ 0.14 m; ~0.45–0.9 m after scale (+50% vs prior 3.6).
-const BASE_SCALE = 5.4;
+// 16 m chunks so LOD bands (measured to the nearest chunk edge) stay meaningful.
+const CHUNK = 16;
+/**
+ * Band edges (m) from camera to chunk edge. Bands 0–2 pick LOD00/01/02 geometry;
+ * the outer bands keep LOD02 and only thin the clump count (BAND_DENSITY).
+ */
+const LOD_EDGES = [25, 50, 85, 120];
+const BAND_DENSITY = [1, 1, 1, 0.85, 0.72];
+const DENSITY = 0.828; // clumps per m² on meadows (−10% vs 0.92)
+// LOD00 native height ≈ 0.14 m; ~0.5–1.0 m after scale (+15% vs prior 5.4).
+const BASE_SCALE = 6.21;
 const HALF = SIZE * 0.5;
 
 function hash2(ix, iz) {
@@ -34,7 +42,7 @@ function seededRand(seed) {
 }
 
 /**
- * @returns {{ root: THREE.Group, update: (t: number) => void }}
+ * @returns {{ root: THREE.Group, update: (t: number) => void, updateLod: (camPos: THREE.Vector3) => void }}
  */
 export async function buildGrass(scene) {
   const loader = new GLTFLoader();
@@ -46,15 +54,14 @@ export async function buildGrass(scene) {
     texLoader.loadAsync('./grass/perlinnoise.webp'),
   ]);
 
-  let geoNear = null;
-  let geoFar = null;
+  const lodGeos = [];
   gltf.scene.traverse((child) => {
     if (!child.isMesh) return;
-    if (child.name.includes('LOD00')) geoNear = child.geometry;
-    if (child.name.includes('LOD01')) geoFar = child.geometry;
+    const m = /LOD(\d+)/.exec(child.name);
+    if (m) lodGeos[Number(m[1])] = child.geometry;
   });
-  if (!geoNear) throw new Error('grassLODs.glb: missing LOD00');
-  if (!geoFar) geoFar = geoNear;
+  if (!lodGeos[0]) throw new Error('grassLODs.glb: missing LOD00');
+  for (let i = 1; i < lodGeos.length; i++) lodGeos[i] ??= lodGeos[i - 1];
 
   const grassMat = new GrassMaterial({
     baseColor: '#354820',
@@ -84,6 +91,7 @@ export async function buildGrass(scene) {
   const nChunks = Math.ceil(SIZE / CHUNK);
   const origin = -HALF;
   let total = 0;
+  const chunks = [];
 
   for (let cz = 0; cz < nChunks; cz++) {
     for (let cx = 0; cx < nChunks; cx++) {
@@ -111,8 +119,7 @@ export async function buildGrass(scene) {
       const capacity = Math.max(0, Math.floor(w * d * dens));
       if (capacity < 8) continue;
 
-      const geo = dist > 70 ? geoFar : geoNear;
-      const mesh = new THREE.InstancedMesh(geo, grassMat.material, capacity);
+      const mesh = new THREE.InstancedMesh(lodGeos[0], grassMat.material, capacity);
       mesh.receiveShadow = true;
       mesh.castShadow = false;
       mesh.frustumCulled = true;
@@ -159,17 +166,39 @@ export async function buildGrass(scene) {
       // Pad so tip height doesn't get frustum-culled at edges
       if (mesh.boundingSphere) mesh.boundingSphere.radius += 1.5;
       root.add(mesh);
+      // Instances are written in random order, so any prefix is an even thinning of the chunk.
+      chunks.push({ mesh, x0, z0, x1, z1, y: heightAt(cxm, czm), full: written, band: -1 });
       total += written;
     }
   }
 
   console.info(`[grass] ${total.toLocaleString()} clumps across ${root.children.length} chunks`);
 
+  let lodScale = 1;
+
+  function updateLod(camPos) {
+    for (const c of chunks) {
+      const dx = Math.max(c.x0 - camPos.x, 0, camPos.x - c.x1);
+      const dz = Math.max(c.z0 - camPos.z, 0, camPos.z - c.z1);
+      const d = Math.hypot(dx, dz, camPos.y - c.y);
+      const band = pickLod(d, LOD_EDGES, lodScale, c.band);
+      if (band === c.band) continue;
+      c.band = band;
+      c.mesh.geometry = lodGeos[Math.min(band, lodGeos.length - 1)];
+      c.mesh.count = Math.max(1, Math.round(c.full * BAND_DENSITY[band]));
+    }
+  }
+
   return {
     root,
     material: grassMat,
     update() {
       grassMat.update();
+    },
+    updateLod,
+    getLodScale: () => lodScale,
+    setLodScale(v) {
+      lodScale = THREE.MathUtils.clamp(v, 0.25, 50);
     },
     setColors({ base, tip1, tip2, intensity } = {}) {
       if (base != null) grassMat.uniforms.uBaseColor.value.set(base);

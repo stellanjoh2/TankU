@@ -2,6 +2,8 @@
 import * as THREE from 'three';
 import { VISUAL_DEFAULTS } from './visualDefaults.js';
 
+const SKY_CLOUD_SPEED = 0.00002; // SkyMesh default cloudSpeed = slider 1×
+
 function hexOf(c) {
   return `#${c.getHexString()}`;
 }
@@ -82,7 +84,7 @@ function hydrate(json) {
 export function createVisualsEditor(ctx) {
   const {
     renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe,
-    terrain, grass, vegetation, post, shadowTint,
+    terrain, grass, vegetation, barrels, post, shadowTint, fx, clouds,
     getEnvIntensity, setEnvIntensity,
     initial = VISUAL_DEFAULTS,
     game = null,
@@ -203,6 +205,7 @@ export function createVisualsEditor(ctx) {
       tip2: s.grassTip2,
       intensity: s.grassIntensity,
     });
+    fx?.setGrassColors?.({ base: s.grassBase, tip1: s.grassTip1, tip2: s.grassTip2 });
     // Grass wind is disabled; slider only drives vegetation lean.
     vegetation?.setWind?.(s.wind);
     vegetation?.setPalmAmount?.(s.palmAmount ?? 1);
@@ -483,6 +486,13 @@ export function createVisualsEditor(ctx) {
       sun.shadow.intensity = v;
     });
     addColor(s, 'Shadow colour', () => hexOf(shadowTint.value), (v) => shadowTint.value.set(v));
+    if (clouds) {
+      addSlider(s, 'Cloud shadow', 0, 1, 0.02, () => clouds.strength, (v) => { clouds.strength = v; });
+      // Drives the sky's cloud drift; shadows follow it.
+      addSlider(s, 'Cloud speed', 0, 10, 0.1, () => sky.cloudSpeed.value / SKY_CLOUD_SPEED, (v) => {
+        sky.cloudSpeed.value = v * SKY_CLOUD_SPEED;
+      });
+    }
   }
 
   // Fill
@@ -520,15 +530,25 @@ export function createVisualsEditor(ctx) {
   // Grass
   {
     const s = addSection('Grass');
-    addColor(s, 'Base', () => hexOf(gU.uBaseColor.value), (v) => grass.setColors({ base: v }));
-    addColor(s, 'Tip A', () => hexOf(gU.uTipColor1.value), (v) => grass.setColors({ tip1: v }));
-    addColor(s, 'Tip B', () => hexOf(gU.uTipColor2.value), (v) => grass.setColors({ tip2: v }));
+    addColor(s, 'Base', () => hexOf(gU.uBaseColor.value), (v) => {
+      grass.setColors({ base: v });
+      fx?.setGrassColors?.({ base: v });
+    });
+    addColor(s, 'Tip A', () => hexOf(gU.uTipColor1.value), (v) => {
+      grass.setColors({ tip1: v });
+      fx?.setGrassColors?.({ tip1: v });
+    });
+    addColor(s, 'Tip B', () => hexOf(gU.uTipColor2.value), (v) => {
+      grass.setColors({ tip2: v });
+      fx?.setGrassColors?.({ tip2: v });
+    });
     addSlider(s, 'Brightness', 0.2, 2.5, 0.05, () => gU.uGrassLightIntensity.value, (v) => {
       grass.setColors({ intensity: v });
     });
     addSlider(s, 'Wind strength', 0, 0.15, 0.005, () => vegetation?.getWind?.() ?? 0, (v) => {
       vegetation?.setWind?.(v);
     });
+    addSlider(s, 'LOD distance ×', 0.25, 4, 0.05, () => grass.getLodScale(), (v) => grass.setLodScale(v));
   }
 
   // Vegetation (palms / tropical pack)
@@ -546,6 +566,13 @@ export function createVisualsEditor(ctx) {
     addSlider(s, 'Foliage brightness', 0.2, 2.5, 0.05, () => vegetation.getFoliageBrightness(), (v) => {
       vegetation.setFoliageBrightness(v);
     });
+    addSlider(s, 'LOD distance ×', 0.25, 4, 0.05, () => vegetation.getLodScale(), (v) => vegetation.setLodScale(v));
+    addSlider(s, 'Plant cull (m)', 10, 400, 5, () => vegetation.getPlantCull(), (v) => vegetation.setPlantCull(v));
+  }
+
+  if (barrels) {
+    const s = addSection('Props');
+    addSlider(s, 'Barrel LOD distance ×', 0.25, 4, 0.05, () => barrels.getLodScale(), (v) => barrels.setLodScale(v));
   }
 
   // Grading — whole-image look

@@ -6,35 +6,40 @@ import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader.js';
 import { LightProbeGenerator } from 'three/examples/jsm/lights/LightProbeGenerator.js';
 import { SkyMesh } from 'three/examples/jsm/objects/SkyMesh.js';
 import { createPost } from './post.js';
-import { buildTerrain, heightAt, isGrassable } from './terrain.js';
+import { buildTerrain, heightAt, isGrassable, PLAYER_SPAWN } from './terrain.js';
 import { buildProps } from './props.js';
 import { buildAirfield } from './airfield.js';
+import { buildPort } from './port.js';
 import { buildGrass } from './grass.js';
 import { buildVegetation } from './vegetation.js';
 import { createVisualsEditor } from './visuals.js';
 import { shadowTint, patchShadowTint } from './shadowTint.js';
+import { createCloudShadows } from './cloudShadows.js';
 import { Input } from './input.js';
-import { Tank, RELOAD, MG_DAMAGE } from './tank.js';
+import { Tank, RELOAD } from './tank.js';
 import { Effects } from './fx.js';
 import { TankCamera } from './TankCamera.js';
-import { Sfx } from './sfx.js';
+import { Sfx, distGain } from './sfx.js';
 import { NavGrid } from './navgrid.js';
 import { TankAI, pickSpawn } from './ai.js';
+import { createMatch, MIN_SPAWN_GAP } from './match.js';
 import { createHud } from './hud.js';
 import { createDebug } from './debug.js';
 import { FreeFlight } from './freeflight.js';
 import { buildPlanes } from './planes.js';
-import { buildSoldiers } from './soldiers.js';
+import { buildShip } from './ship.js';
+import { buildBgIsland } from './bgIsland.js';
+import { buildWaterTower, WATER_TOWER } from './watertower.js';
+import { buildFlag } from './flag.js';
+import { buildBarrels } from './barrels.js';
 import './style.css';
 
 const FIXED_DT = 1 / 120;
+const MAX_SUBSTEPS = 4;
 const sunDir = new THREE.Vector3(-0.45, 0.75, 0.48).normalize();
 const SHADOW_EXTENT = 38;
-const MIN_SPAWN_GAP = 75;        // metres between the two tanks at round start
-const ROUND_RESTART_DELAY = 4;   // seconds the wreck burns before the next round
 const ENEMY_TINT = new THREE.Color(1.0, 0.72, 0.38);     // orange drab (keep channels ≤1 so bloom stays off)
 const IDLE = Object.freeze({ throttle: 0, turn: 0, boost: false });
-const SOLO_KEY = 'sherman.solo';
 const MUSIC_MUTE_KEY = 'sherman.musicMute';
 const MUSIC_VOL_KEY = 'sherman.musicVol';
 
@@ -102,7 +107,7 @@ async function main() {
 
   const sun = new THREE.DirectionalLight(new THREE.Color(1.0, 0.93, 0.82), 3.2);
   sun.castShadow = true;
-  sun.shadow.mapSize.set(4096, 4096);
+  sun.shadow.mapSize.set(2048, 2048);
   Object.assign(sun.shadow.camera, { left: -SHADOW_EXTENT, right: SHADOW_EXTENT, top: SHADOW_EXTENT,
                                      bottom: -SHADOW_EXTENT, near: 1, far: 260 });
   sun.shadow.bias = -0.0004;
@@ -110,10 +115,10 @@ async function main() {
   sun.shadow.radius = 2.5;
   sun.shadow.intensity = 1;
   scene.add(sun, sun.target);
-
   const hemi = new THREE.HemisphereLight(new THREE.Color(0.55, 0.65, 0.85), new THREE.Color(0.32, 0.27, 0.18), 0.85);
   const ambient = new THREE.AmbientLight(0xffffff, 0.12);
   scene.add(hemi, ambient);
+  const clouds = await createCloudShadows([[sun, 1], [hemi, 0.5], [ambient, 0.5]], sky);
 
   const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 2000);
   const post = createPost(renderer, scene, camera);
@@ -122,12 +127,18 @@ async function main() {
   const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
   world.timestep = FIXED_DT;
   const terrain = await buildTerrain(RAPIER, world, scene, { sunDir });
-  const props = buildProps(RAPIER, world, scene);
+  buildBgIsland(scene, terrain);
+  buildProps(RAPIER, world, scene);
   const airfield = buildAirfield(RAPIER, world, scene);
-  const [grass, vegetation, planes] = await Promise.all([
+  const port = buildPort(RAPIER, world, scene);
+  const [grass, vegetation, planes, , waterTower, flag, barrels] = await Promise.all([
     buildGrass(scene),
     buildVegetation(scene, { RAPIER, world }),
     buildPlanes(scene),
+    buildShip(scene),
+    buildWaterTower(scene, { RAPIER, world }),
+    buildFlag(scene, { RAPIER, world }),
+    buildBarrels(scene, { RAPIER, world }),
   ]);
 
   const loader = new GLTFLoader();
@@ -135,14 +146,18 @@ async function main() {
     loader.loadAsync('./models/sherman.glb'),
     loader.loadAsync('./models/sherman.glb'),
   ]);
-  const spawn = { x: -8, y: heightAt(-8, -5) + 0.6, z: -5, yaw: Math.PI / 2 };
+  const { x: sx, z: sz } = PLAYER_SPAWN;
+  const spawn = { x: sx, y: heightAt(sx, sz) + 0.6, z: sz, yaw: Math.atan2(-(WATER_TOWER.z - sz), WATER_TOWER.x - sx) };
   const tank = new Tank(gltf, RAPIER, world, spawn);
   scene.add(tank.model);
-  const fx = new Effects(scene, RAPIER, world, tank.body, props.dynamic);
+  const fx = new Effects(scene, RAPIER, world, tank.body, barrels.dynamic);
+  fx.camera = camera;
 
   const nav = new NavGrid();
-  nav.setObstacles([...vegetation.navObstacles(), ...airfield.navObstacles()]);
-  const soldiers = await buildSoldiers(scene, nav);
+  nav.setObstacles([
+    ...vegetation.navObstacles(), ...airfield.navObstacles(),
+    ...port.navObstacles(), ...waterTower.navObstacles(), ...flag.navObstacles(),
+  ]);
   const enemySpawn = pickSpawn(nav, spawn, MIN_SPAWN_GAP);
   const enemy = new Tank(enemyGltf, RAPIER, world, enemySpawn, { tint: ENEMY_TINT });
   scene.add(enemy.model);
@@ -159,14 +174,21 @@ async function main() {
     if (saved != null) sfx.setMusicVolume(Number(saved));
   }
 
-  // ---------------------------------------------------------------- round state
-  const game = {
-    solo: localStorage.getItem(SOLO_KEY) === '1',
-    showPath: false,
-    debug: false,
-    overT: 0,          // > 0 while a wreck burns before the auto-restart
-    wreck: null,       // the destroyed tank
-  };
+  // ---------------------------------------------------------------- match (round + combat)
+  // onRestart filled in after camera helpers exist (lookYaw / snapCam / fly).
+  let onMatchRestart = () => {};
+  const input = new Input(renderer.domElement);
+  const unlockAudio = () => sfx.unlock();
+  addEventListener('pointerdown', unlockAudio, { once: true });
+  addEventListener('keydown', unlockAudio, { once: true });
+
+  const match = createMatch({
+    tank, enemy, ai, nav, fx, hud, sfx, tankCam, input,
+    vegetation, airfield, port, waterTower, barrels, spawn,
+    onRestart: (opts) => onMatchRestart(opts),
+  });
+  match.wireFx();
+  const { game } = match;
 
   const pathLine = new THREE.Line(
     new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(256 * 3), 3)),
@@ -202,16 +224,12 @@ async function main() {
 
   patchShadowTint(scene);
   const visuals = createVisualsEditor({
-    renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe, terrain, grass, vegetation, post, shadowTint,
+    renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe, terrain, grass, vegetation, barrels, post, shadowTint, fx, clouds,
     getEnvIntensity: () => scene.environmentIntensity,
     setEnvIntensity: (v) => { scene.environmentIntensity = v; },
     game: {
       getSolo: () => game.solo,
-      setSolo: (v) => {
-        game.solo = v;
-        localStorage.setItem(SOLO_KEY, v ? '1' : '0');
-        restartGame({ resetCam: false });
-      },
+      setSolo: (v) => match.setSolo(v),
       getShowPath: () => game.showPath,
       setShowPath: (v) => { game.showPath = v; },
       getDebug: () => game.debug,
@@ -238,83 +256,6 @@ async function main() {
     },
   });
 
-  const input = new Input(renderer.domElement);
-  // unlock audio on first gesture (pointer lock / click / key)
-  const unlockAudio = () => sfx.unlock();
-  addEventListener('pointerdown', unlockAudio, { once: true });
-  addEventListener('keydown', unlockAudio, { once: true });
-  fx.onImpact = (p) => {
-    const d = p.distanceTo(tank.model.position);
-    if (d < 40) {
-      input.rumble(0.6 * (1 - d / 40), 0.3, 160);
-      tankCam.addShake(0.45 * (1 - d / 40));
-    }
-  };
-  fx.onMgShot = ({ owner } = {}) => {
-    if (owner === tank.body) tankCam.pulseMgShake();
-  };
-  const metalBodies = new Set(props.dynamic.map((d) => d.body.handle));
-
-  function onTankDestroyed(victim) {
-    fx.wreck(new THREE.Vector3().copy(victim.body.translation()).add(new THREE.Vector3(0, 1.2, 0)));
-    tankCam.addShake(victim === tank ? 1 : 0.4);
-    game.overT = ROUND_RESTART_DELAY;
-    game.wreck = victim;
-    hud.banner(victim === tank ? 'YOU WERE DESTROYED' : 'ENEMY DESTROYED', 'next round in a moment…');
-  }
-
-  fx.onShellHit = ({ collider, owner, point, dir }) => {
-    const body = collider?.parent();
-    if (!body || game.overT > 0) return;
-    const victim = [tank, enemy].find((t) => t.body.handle === body.handle);
-    if (!victim || victim.body === owner || !victim.alive) return;
-    victim.hp -= 1;
-    // Clank at the impact (player hits = full volume; distant enemy hits fall off)
-    {
-      const d = (point ?? victim.model.position).distanceTo(tank.model.position);
-      sfx.hit(THREE.MathUtils.clamp(1 - d / 220, 0.15, 1));
-    }
-    if (victim === tank) {
-      hud.flash();
-      if (owner) hud.hitFrom(owner.translation());
-      if (owner === enemy.body) ai.onScored();
-      input.rumble(1, 1, 450);
-      // Same fire-kick envelope, shoved along the shell's travel (away from where it came)
-      tankCam.kick(1.0, RELOAD, dir);
-    } else {
-      victim.flashHit();
-      ai.onHit();
-    }
-    hud.setHealth(tank.hp / tank.maxHp, enemy.hp / enemy.maxHp);
-    if (!victim.alive) onTankDestroyed(victim);
-  };
-
-  // Traced .50 hits: metal ricochet SFX + tiny chip damage on tanks / barrels.
-  fx.onMgHit = ({ collider, owner, point }) => {
-    const body = collider?.parent();
-    if (!body || game.overT > 0) return;
-    const victim = [tank, enemy].find((t) => t.body.handle === body.handle);
-    const isTank = !!victim && victim.body !== owner && victim.alive;
-    const isBarrel = metalBodies.has(body.handle);
-    if (!isTank && !isBarrel) return;
-
-    const d = point.distanceTo(tank.model.position);
-    sfx.ricochet(THREE.MathUtils.clamp(1 - d / 180, 0.12, 1));
-
-    if (!isTank) return;
-    const wasAlive = victim.alive;
-    victim.hp = Math.max(0, victim.hp - MG_DAMAGE);
-    if (victim === tank) {
-      if (owner) hud.hitFrom(owner.translation());
-      input.rumble(0.08, 0.18, 40);
-    }
-    hud.setHealth(tank.hp / tank.maxHp, enemy.hp / enemy.maxHp);
-    if (wasAlive && !victim.alive) {
-      if (victim === tank && owner === enemy.body) ai.onScored();
-      if (victim === enemy) ai.onHit();
-      onTankDestroyed(victim);
-    }
-  };
   // ---------------------------------------------------------------- resize
   addEventListener('resize', () => {
     renderer.setSize(innerWidth, innerHeight);
@@ -372,21 +313,7 @@ async function main() {
     snapCam();
   }
 
-  function restartGame({ resetCam = true } = {}) {
-    tank.respawn(spawn);
-    fx.clearShells();
-    nav.setObstacles([...vegetation.navObstacles(), ...airfield.navObstacles()]);   // palm slider may have changed
-    enemy.setActive(!game.solo);
-    if (!game.solo) {
-      enemy.respawn(pickSpawn(nav, spawn, MIN_SPAWN_GAP));
-      ai.reset();
-    }
-    game.overT = 0;
-    game.wreck = null;
-    hud.banner(null);
-    hud.clearHits();
-    hud.showEnemy(!game.solo);
-    hud.setHealth(1, 1);
+  onMatchRestart = ({ resetCam = true } = {}) => {
     lookYaw = spawn.yaw;
     lookPitch = -0.08;
     prevLookYaw = lookYaw;
@@ -394,7 +321,7 @@ async function main() {
     if (resetCam) tankCam.resetDefaults();
     snapCam();
     updatePathLine();
-  }
+  };
 
   $('reset-cam').addEventListener('click', (e) => {
     e.stopPropagation();
@@ -402,7 +329,7 @@ async function main() {
   });
   $('restart-game').addEventListener('click', (e) => {
     e.stopPropagation();
-    restartGame();
+    match.restart();
   });
 
   function setDebug(on) {
@@ -501,12 +428,13 @@ async function main() {
           `translate(${(projected.x * 0.5 + 0.5) * innerWidth}px, ${(-projected.y * 0.5 + 0.5) * innerHeight}px)`;
       }
     }
+    hud.setNitro(tank.nitroCharge, tank.nitroActive);
     // Hide while driving, on gamepad, or while the visuals editor has the cursor
     $('overlay').classList.toggle('hidden', input.locked || !!inp.pad || visuals.open);
   }
 
   // ---------------------------------------------------------------- loop
-  restartGame();
+  match.restart();
   let acc = 0;
   let last = performance.now();
   let elapsed = 0;
@@ -525,14 +453,19 @@ async function main() {
   /** Track dust, diesel exhaust and track kick for one tank; damaged tanks burn, wrecks smoke. */
   function tankFx(t, dt) {
     const mw = t.model.matrixWorld;
-    if (t.hp < t.maxHp) fx.burn(burnPoint.copy(BURN_LOCAL).applyMatrix4(mw), dt, t.alive ? 1 : 1.6);
     if (!t.alive) {
-      exhaustPoint.copy(WRECK_LOCAL).applyMatrix4(mw);
+      // Hull is gone after obliterate — plume from the kill pose (body stays where it died).
+      const p = t.body.translation();
+      burnPoint.set(p.x - 0.4, p.y + 1.8, p.z);
+      fx.burn(burnPoint, dt, 1.6);
+      exhaustPoint.set(p.x, p.y + 2.4, p.z);
       exhaustUp.set(0, 1, 0);
       exhaustBack.set(-1, 0, 0).transformDirection(mw);
+      if (exhaustBack.lengthSq() < 1e-6) exhaustBack.set(0, 0, 1);
       fx.engineSmoke(exhaustPoint, 1, exhaustBack, exhaustUp);
       return;
     }
+    if (t.hp < t.maxHp) fx.burn(burnPoint.copy(BURN_LOCAL).applyMatrix4(mw), dt, 1);
     for (const s of t.sides) {
       const amount = Math.min(1, Math.abs(s.speed) / 8) * 0.5;
       if (t.grounded && amount > 0.05) {
@@ -540,14 +473,39 @@ async function main() {
         fx.dust(dustPoint, amount);
       }
     }
-    // Diesel exhaust + track dust/grass while accelerating (throttle on, speed catching up)
+    // Rip yellow grass behind the hull while driving on meadows
+    if (t.grounded) {
+      const grassAmt = Math.min(1, Math.abs(t.forwardSpeed()) / 7);
+      if (grassAmt > 0.1) {
+        const sign = Math.sign(t.forwardSpeed() || t.cmd.throttle || 1);
+        kickBack.set(-sign, 0, 0).transformDirection(mw);
+        for (const s of t.sides) {
+          dustPoint.set(-2.5 * sign, 0.08, s.z).applyMatrix4(mw);
+          if (!isGrassable(dustPoint.x, dustPoint.z)) continue;
+          kickOut.set(0, 0, Math.sign(s.z || 1)).transformDirection(mw);
+          fx.grassRip(dustPoint, grassAmt, { back: kickBack, out: kickOut });
+        }
+      }
+    }
+    // Nitro: thick diesel belch that follows the rev envelope
+    const nitroP = t.nitro?.power ?? 0;
+    if (nitroP > 0.04) {
+      exhaustPoint.copy(EXHAUST_LOCAL).applyMatrix4(mw);
+      exhaustBack.set(-1, 0, 0).transformDirection(mw);
+      exhaustUp.set(0, 1, 0).transformDirection(mw);
+      const nAmt = (0.45 + nitroP * 1.25) * 1.5;
+      fx.engineSmoke(exhaustPoint, nAmt, exhaustBack, exhaustUp);
+      if (nitroP > 0.55) fx.engineSmoke(exhaustPoint, nAmt * 0.9, exhaustBack, exhaustUp);
+    }
+
+    // Diesel exhaust + track dust while accelerating (throttle on, speed catching up)
     const thr = Math.abs(t.cmd.throttle);
     if (thr <= 0.08) return;
     const spd = Math.abs(t.forwardSpeed());
     const top = t.cmd.throttle >= 0 ? 12.5 : 4.0;
     const deficit = Math.max(0, thr * top - spd);
     const accel = thr * (0.25 + 0.75 * Math.min(1, deficit / 5));
-    if (accel > 0.05) {
+    if (accel > 0.05 && nitroP < 0.35) {
       exhaustPoint.copy(EXHAUST_LOCAL).applyMatrix4(mw);
       exhaustBack.set(-1, 0, 0).transformDirection(mw);
       exhaustUp.set(0, 1, 0).transformDirection(mw);
@@ -559,11 +517,7 @@ async function main() {
       for (const s of t.sides) {
         dustPoint.set(-2.35 * sign, 0.1, s.z).applyMatrix4(mw);
         kickOut.set(0, 0, Math.sign(s.z || 1)).transformDirection(mw);
-        fx.trackKick(dustPoint, accel, {
-          back: kickBack,
-          out: kickOut,
-          grassy: isGrassable(dustPoint.x, dustPoint.z),
-        });
+        fx.trackKick(dustPoint, accel, { back: kickBack, out: kickOut });
       }
     }
   }
@@ -585,19 +539,44 @@ async function main() {
     const playerDrive = (!flying && tank.alive) ? inp : IDLE;
     const enemyDrive = (!paused && enemy.alive) ? ai.drive : IDLE;
 
+    if (!paused && tank.alive && !flying) {
+      tank.updateNitro(dt, playerDrive.boost);
+      if (tank.nitro.justStarted) {
+        sfx.nitro();
+        tankCam.nitroFov();
+        input.rumble(0.35, 0.55, 180);
+        // Initial diesel cough from the exhaust stack
+        tank.model.updateMatrixWorld(true);
+        const mw = tank.model.matrixWorld;
+        exhaustPoint.copy(EXHAUST_LOCAL).applyMatrix4(mw);
+        exhaustBack.set(-1, 0, 0).transformDirection(mw);
+        exhaustUp.set(0, 1, 0).transformDirection(mw);
+        for (let i = 0; i < 8; i++) fx.engineSmoke(exhaustPoint, 1.15 * 1.5, exhaustBack, exhaustUp);
+      }
+    } else if (!paused) {
+      tank.updateNitro(dt, false);
+    }
+    if (versus && !paused && enemy.alive) {
+      enemy.updateNitro(dt, enemyDrive.boost);
+    }
+
     if (!paused) {
       acc += dt;
-      while (acc >= FIXED_DT) {
+      let steps = 0;
+      while (acc >= FIXED_DT && steps < MAX_SUBSTEPS) {
         tank.physicsStep(FIXED_DT, playerDrive);
         if (versus) enemy.physicsStep(FIXED_DT, enemyDrive);
         world.step();
         acc -= FIXED_DT;
+        steps++;
       }
+      // Drop the backlog instead of spiralling: a slow frame shouldn't make the next one slower.
+      if (steps === MAX_SUBSTEPS) acc = Math.min(acc, FIXED_DT);
     }
-    props.sync();
+    barrels.sync();
+    clouds.update(dt);
     if (!paused) {
       planes.update(dt);
-      soldiers.update(dt);
     }
 
     updateCamera(dt, inp);
@@ -627,8 +606,7 @@ async function main() {
           fx.fire({ ...shot, owner: enemy.body });
           fx.muzzleFlash(shot.pos, shot.dir);
           ai.onFired();
-          const d = shot.pos.distanceTo(tank.model.position);
-          sfx.fire(0.9 * THREE.MathUtils.clamp(1 - d / 220, 0.2, 1));
+          sfx.fire(0.9 * distGain(shot.pos.distanceTo(tank.model.position), 160));
         }
       }
       tankFx(enemy, dt);
@@ -648,16 +626,18 @@ async function main() {
     else fx.setMgFlash(null, null, 'enemy');
     if (!paused) tankFx(tank, dt);
 
-    if (!paused && game.overT > 0) {
-      game.overT -= dt;
-      if (game.overT <= 0) restartGame({ resetCam: false });
-    }
+    if (!paused) match.tick(dt);
     updatePathLine();
     debug.update();
+    grass.updateLod(camera.position);
+    vegetation?.updateLod?.(camera.position);
+    barrels.updateLod(camera.position);
     if (!paused) {
       fx.update(dt, heightAt);
+      barrels.update(dt, fx);
       grass.update(elapsed);
       vegetation?.update?.(elapsed);
+      flag.update(elapsed, vegetation?.getWind?.());
       sfx.update(dt, {
         speed: tank.forwardSpeed(),
         throttle: tank.cmd.throttle,
@@ -675,7 +655,7 @@ async function main() {
   }
   requestAnimationFrame(frame);
   $('loading').remove();
-  window.__sherman = { tank, enemy, ai, nav, game, input, fx, tankCam, sfx, world, grass, vegetation, terrain, visuals, debug, fly, lightProbe, sky, planes, soldiers };
+  window.__sherman = { renderer, tank, enemy, ai, nav, game, match, input, fx, tankCam, sfx, world, grass, vegetation, terrain, visuals, debug, fly, lightProbe, sky, planes, flag, barrels, clouds };
 }
 
 main().catch((e) => {

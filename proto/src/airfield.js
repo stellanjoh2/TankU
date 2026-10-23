@@ -2,6 +2,7 @@
 // Door clear opening is sized so a Sherman (~3.3 m wide × ~2.8 m tall) just fits.
 import * as THREE from 'three';
 import { AIRFIELD, AIRFIELD_Y, heightAt } from './terrain.js';
+import { concreteSlabMap } from './concreteTex.js';
 
 // Sherman hull ≈ 3.24 m track-outer width, turret roof ≈ 2.81 m — leave a few cm.
 export const DOOR_W = 4.0;
@@ -23,6 +24,9 @@ export const HANGAR = {
   z: AIRFIELD.cz,
   yaw: 0, // local +X = into hangar (east); doors face −X toward spawn
 };
+
+/** Free spot on the apron by the hangar's south-west corner (a drum stands here, see barrels.js). */
+export const HANGAR_PROP_SPOT = { x: HANGAR.x - 6, z: HANGAR.z + BUILD_W * 0.5 + 1.2 };
 
 function mat(color, { metal = 0, rough = 0.85, flat = false } = {}) {
   return new THREE.MeshStandardMaterial({
@@ -88,8 +92,10 @@ export function buildAirfield(RAPIER, world, scene) {
   glass.transparent = true;
   glass.opacity = 0.45;
   const rust = mat(0x6b3a22, { metal: 0.3, rough: 0.85 });
-  const concrete = mat(0xc8c0a8, { rough: 0.95 });
-  const concreteDark = mat(0xb0a890, { rough: 0.97 });
+  const concrete = mat(0xffffff, { rough: 0.95 });
+  concrete.map = concreteSlabMap();
+  const concreteDark = mat(0xe2ddd4, { rough: 0.97 });
+  concreteDark.map = concrete.map;
   const interior = mat(0x2a2c2e, { rough: 0.95 });
 
   const unit = new THREE.BoxGeometry(1, 1, 1);
@@ -104,7 +110,9 @@ export function buildAirfield(RAPIER, world, scene) {
   const body = world.createRigidBody(
     RAPIER.RigidBodyDesc.fixed()
       .setTranslation(HANGAR.x, y0, HANGAR.z)
-      .setRotation(q),
+      .setRotation(q)
+      // Metal warehouse — MG hits play ricochet clank (see match.js / metal-hit-sfx rule).
+      .setUserData({ mat: 'metal' }),
   );
 
   const hw = BUILD_W * 0.5;
@@ -261,13 +269,6 @@ export function buildAirfield(RAPIER, world, scene) {
       slabs.add(m);
     }
   }
-
-  // Green barrel near corner (scale prop like the reference)
-  const barrelMat = mat(0x3a5a32, { metal: 0.4, rough: 0.55 });
-  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.3, 0.9, 14), barrelMat);
-  barrel.position.set(HANGAR.x - 6, y0 + SLAB_T + 0.45, HANGAR.z + hw + 1.2);
-  barrel.castShadow = barrel.receiveShadow = true;
-  root.add(barrel);
 
   /** Wall / shed footprints for AI — door mouth left open. */
   function navObstacles() {

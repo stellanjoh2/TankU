@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { WaterMesh } from 'three/examples/jsm/objects/WaterMesh.js';
+import { WaterMesh } from './WaterMesh.js';
 
 export const SIZE = 250;
 export const WATER_Y = 0.2;
@@ -38,6 +38,30 @@ export const AIRFIELD = {
   edge: 5,  // soft blend outside the hard pad
 };
 
+/**
+ * Small working quay east of the hangar apron — hard port deck instead of beach,
+ * with a vertical face at x1 where the wooden walkway sits.
+ */
+export const PORT = {
+  x0: 12,    // meets airfield east edge (~16)
+  x1: 26.5,  // quay face (ships dock east of this)
+  z0: -20,
+  z1: 1,
+  edge: 3.5,
+  wall: 2.8, // metres of horizontal drop for the quay face
+};
+
+/** Player spawn: meadow between the two southern hills, looking at the port. Flattened so the tank doesn't creep. */
+export const PLAYER_SPAWN = { x: -40, z: -62, padR: 5, padEdge: 7 };
+
+/** Concrete yard on dry land south of the quay deck (water tower stands here). */
+export const PORT_YARD = {
+  x0: 16.4,  // east of the airfield slabs (x ≤ 15.5)
+  x1: 24,
+  z0: -33,
+  z1: PORT.z0,
+};
+
 const smooth = (x, a, b) => THREE.MathUtils.smoothstep(x, a, b);
 const clamp01 = (v) => Math.min(1, Math.max(0, v));
 
@@ -53,6 +77,32 @@ export function airfieldFactor(x, z) {
 
 export function isAirfield(x, z) {
   return airfieldFactor(x, z) > 0.4;
+}
+
+function rectFactor(r, x, z, edge) {
+  const dx = Math.max(r.x0 - x, x - r.x1);
+  const dz = Math.max(r.z0 - z, z - r.z1);
+  const outside = Math.max(dx, dz);
+  if (outside <= 0) return 1;
+  if (outside >= edge) return 0;
+  return 1 - smooth(outside, 0, edge);
+}
+
+/** Soft 0..1 mask for the port deck (west of the quay face) + the yard south of it. */
+export function portFactor(x, z) {
+  return Math.max(rectFactor(PORT, x, z, PORT.edge), rectFactor(PORT_YARD, x, z, PORT.edge));
+}
+
+export function isPort(x, z) {
+  return portFactor(x, z) > 0.4;
+}
+
+/** Soft corridor along the quay Z range (for the vertical wall drop). */
+function portCorridor(z) {
+  if (z >= PORT.z0 && z <= PORT.z1) return 1;
+  const d = z < PORT.z0 ? PORT.z0 - z : z - PORT.z1;
+  if (d >= PORT.edge) return 0;
+  return 1 - smooth(d, 0, PORT.edge);
 }
 
 function distPointSeg(px, pz, ax, az, bx, bz) {
@@ -216,19 +266,37 @@ function naturalHeightAt(x, z) {
 /** Pad height locked to the meadow at the airfield centre. */
 export const AIRFIELD_Y = naturalHeightAt(AIRFIELD.cx, AIRFIELD.cz);
 
+const SPAWN_PAD_Y = naturalHeightAt(PLAYER_SPAWN.x, PLAYER_SPAWN.z);
+
 /**
- * Terrain height in metres (airfield pad flattened for the apron).
+ * Terrain height in metres (airfield + port deck flattened; sharp quay drop seaward).
  */
 export function heightAt(x, z) {
-  const h = naturalHeightAt(x, z);
-  const f = airfieldFactor(x, z);
-  if (f <= 0) return h;
-  return THREE.MathUtils.lerp(h, AIRFIELD_Y, f);
+  let h = naturalHeightAt(x, z);
+  const pad = Math.max(airfieldFactor(x, z), portFactor(x, z));
+  if (pad > 0) h = THREE.MathUtils.lerp(h, AIRFIELD_Y, pad);
+
+  const { padR, padEdge } = PLAYER_SPAWN;
+  const spawnD = Math.hypot(x - PLAYER_SPAWN.x, z - PLAYER_SPAWN.z);
+  if (spawnD < padR + padEdge) h = THREE.MathUtils.lerp(SPAWN_PAD_Y, h, smooth(spawnD, padR, padR + padEdge));
+
+  // Vertical-ish quay face: slam from deck height down to seabed just east of x1.
+  const corridor = portCorridor(z);
+  if (corridor > 0.01 && x > PORT.x1) {
+    const past = x - PORT.x1;
+    if (past < PORT.wall + 1.5) {
+      const drop = smooth(past, 0.15, PORT.wall);
+      const seabed = WATER_Y - 0.9 - Math.min(5, past * 0.35);
+      const wallH = THREE.MathUtils.lerp(AIRFIELD_Y, seabed, drop);
+      h = THREE.MathUtils.lerp(h, wallH, corridor);
+    }
+  }
+  return h;
 }
 
-/** Meadow mask: grass ground inland, not beach / hill rock / road / airfield. */
+/** Meadow mask: grass ground inland, not beach / hill rock / road / airfield / port. */
 export function isGrassable(x, z) {
-  if (isAirfield(x, z)) return false;
+  if (isAirfield(x, z) || isPort(x, z)) return false;
   if (shoreSigned(x, z) < 12) return false; // beach stays sand
   if (heightAt(x, z) < WATER_Y + 1.6) return false;
   if (isOnRoad(x, z, 0.8)) return false;
@@ -327,14 +395,14 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
       const ridge = ridgeHeight(x, z);
       const hills = hillStrength(x, z);
       const road = roadFactor(x, z);
-      const apron = airfieldFactor(x, z);
+      const apron = Math.max(airfieldFactor(x, z), portFactor(x, z));
 
       // --- Biomes (intentional, little cross-bleed) ---
       if (y < WATER_Y + 0.05 || signed < 0) {
         // Intertidal / seabed
         c.copy(wetSand).lerp(sand, clamp01((y - (WATER_Y - 1)) / 1.5));
-      } else if (signed < 12) {
-        // Beach: sand only (wet → dry as you leave the water)
+      } else if (signed < 12 && apron < 0.35) {
+        // Beach: sand only (wet → dry as you leave the water) — skipped under port
         const t = clamp01(signed / 12);
         c.copy(wetSand).lerp(sand, 0.35 + 0.65 * t);
       } else {
@@ -359,7 +427,7 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
         c.lerp(mud, road * rut);
         c.lerp(dirt, road * 0.3 * (1 - rut));
       }
-      // Beige concrete apron under the hangar / refuel pad
+      // Beige concrete under hangar apron + port deck
       if (apron > 0.02) {
         const slab = 0.92 + 0.08 * Math.sin(x * 1.1) * Math.cos(z * 1.05);
         c.lerp(concrete, apron * slab);
@@ -383,14 +451,15 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   const waterNormals = await new THREE.TextureLoader().loadAsync('./textures/waternormals.jpg');
   waterNormals.wrapS = waterNormals.wrapT = THREE.RepeatWrapping;
   const water = new WaterMesh(
-    new THREE.PlaneGeometry(SIZE * 1.6, SIZE * 1.6),
+    new THREE.PlaneGeometry(SIZE * 6, SIZE * 6), // reaches past the backdrop islands (bgIsland.js)
     {
       waterNormals,
       sunDirection: (sunDir || new THREE.Vector3(0.70707, 0.70707, 0)).clone().normalize(),
       sunColor: 0xffffff,
       waterColor: palette.water,
       distortionScale: 3.7,
-      size: 1.0,
+      size: 2.0, // world→UV multiplier: higher = smaller ripples
+      timeScale: 0.5,
       resolutionScale: 0.5,
     },
   );
@@ -405,6 +474,8 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   const idx = new Uint32Array(geo.index.array);
   world.createCollider(RAPIER.ColliderDesc.trimesh(verts, idx).setFriction(0.9), body);
 
+  const paletteListeners = [];
+
   return {
     mesh,
     water,
@@ -416,6 +487,10 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
         if (k === 'water') water.waterColor.value.copy(palette.water);
       }
       applyPalette();
+      for (const fn of paletteListeners) fn();
+    },
+    onPaletteChange(fn) {
+      paletteListeners.push(fn);
     },
   };
 }

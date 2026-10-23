@@ -4,6 +4,7 @@ export function createHud() {
   root.id = 'hud';
   root.innerHTML = `
     <div class="hp" data-who="player"><span>YOU</span><div class="hp-bar"><i></i></div><b>100%</b></div>
+    <div class="nitro" data-who="nitro"><span>NITRO</span><div class="nitro-bar"><i></i></div><b>100%</b></div>
     <div class="hp enemy" data-who="enemy"><span>ENEMY</span><div class="hp-bar"><i></i></div><b>100%</b></div>
     <div class="ai-debug hidden"></div>`;
   const banner = document.createElement('div');
@@ -29,6 +30,7 @@ export function createHud() {
   const rows = {
     player: root.querySelector('[data-who="player"]'),
     enemy: root.querySelector('[data-who="enemy"]'),
+    nitro: root.querySelector('[data-who="nitro"]'),
   };
   const debug = root.querySelector('.ai-debug');
 
@@ -45,10 +47,26 @@ export function createHud() {
       setBar(rows.player, player);
       if (enemy != null) setBar(rows.enemy, enemy);
     },
+    setNitro(frac, active = false) {
+      const pct = Math.round(Math.max(0, Math.min(1, frac)) * 100);
+      rows.nitro.querySelector('i').style.width = `${pct}%`;
+      rows.nitro.querySelector('b').textContent = `${pct}%`;
+      rows.nitro.classList.toggle('empty', pct <= 0);
+      rows.nitro.classList.toggle('active', !!active);
+    },
     showEnemy(on) { rows.enemy.classList.toggle('hidden', !on); },
-    banner(title, sub = '') {
-      banner.classList.toggle('hidden', !title);
-      banner.innerHTML = title ? `<strong>${title}</strong><span>${sub}</span>` : '';
+    banner(title, sub = '', tone = 'win') {
+      banner.classList.remove('in', 'win', 'lose');
+      if (!title) {
+        banner.classList.add('hidden');
+        banner.innerHTML = '';
+        return;
+      }
+      banner.classList.remove('hidden');
+      banner.classList.add(tone === 'lose' ? 'lose' : 'win');
+      banner.innerHTML = `<div class="banner-inner"><strong>${title}</strong>${sub ? `<span>${sub}</span>` : ''}</div>`;
+      void banner.offsetWidth;
+      banner.classList.add('in');
     },
     flash() {
       flash.classList.remove('on');

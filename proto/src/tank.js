@@ -9,8 +9,24 @@ const SAG = 0.10;            // static spring compression (softer = more bounce)
 const MU_LONG = 1.14;        // longitudinal grip; higher = harder launch
 const MU_SIDE = 0.75;
 const SPEED = { cruise: 9.5, boost: 14.0, reverse: 4.5, pivot: 4.6875, turn: 3.90625 };   // m/s
+// Nitro: 2 charges, then must fully refill. Envelope matches nitro_rev.wav (~2.31s, peak ~1s).
+const NITRO = {
+  duration: 2.313,
+  cost: 0.5,
+  rechargePerSec: 1 / 6.5,
+  peakAt: 1.0,
+  holdEnd: 1.45,
+};
 const DAMP_RATIO = 0.28;     // fraction of critical; lower = bouncier rebound
 const BRAKE_DIVE = 0.75;     // keep this fraction of nose-dive pitch under hard braking
+// Side bumps spin the long axis easily. Stiffen roll inertia, and past a small lean
+// push the hull back toward its tracks. Under UPRIGHT_FREE, jumps and nose-lift are left alone.
+const ROLL_I_SCALE = 2.4;
+const UPRIGHT_FREE = THREE.MathUtils.degToRad(24);
+const ROLL_SPRING = 480000;  // N·m, full at sideways
+const PITCH_SPRING = 220000;
+const ROLL_DAMP = 340000;    // N·m·s, opposes roll rate
+const PITCH_DAMP = 220000;
 const TRAVERSE = THREE.MathUtils.degToRad(42);      // turret deg/s
 const ELEVATE = THREE.MathUtils.degToRad(28);
 const ELEV_MIN = THREE.MathUtils.degToRad(-10);
@@ -21,7 +37,7 @@ const MG_ELEV_MIN = THREE.MathUtils.degToRad(-20);
 const MG_ELEV_MAX = THREE.MathUtils.degToRad(70);
 export const RELOAD = 2.0;
 export const SHELL_SPEED = 260;
-export const MAX_HP = 2;     // main-gun hits to destroy
+export const MAX_HP = 4;     // main-gun hits to destroy
 export const MG_DAMAGE = 0.01; // .50 cal chip damage (−80%; ~100 rounds / full bar)
 const RECOIL_IMPULSE = 9000;  // N*s on the hull
 // MG50 mesh tip (Blender build: brake cyl at x=1.24, len 0.08 → tip ~1.28; z=0.43)
@@ -50,6 +66,50 @@ const ANT_ACCEL_SMOOTH = 25; // 1/s, low-pass on the measured acceleration
 
 const _v = new THREE.Vector3();
 const _q = new THREE.Quaternion();
+const _box = new THREE.Box3();
+const _size = new THREE.Vector3();
+const _center = new THREE.Vector3();
+const _inv = new THREE.Matrix4();
+const _m = new THREE.Matrix4();
+
+/**
+ * Kill-shot breakup: each `root` becomes one Rapier body. `attach` nodes are
+ * reparented onto it (world transform kept) so they fly with the chunk.
+ * `shapes` are the sub-nodes whose bounds become that body's box colliders.
+ */
+const DEBRIS_CHUNKS = [
+  { root: 'Hull', attach: ['RunningGear_L', 'RunningGear_R'], shapes: ['Hull_Body'] },
+  { root: 'Turret', shapes: ['Turret_Body'] },
+];
+
+/** High-poly extras hidden on the wreck (tracks, fittings, MG, antenna). */
+function isWreckDetail(name) {
+  return name === 'Hull_Details' || name === 'Turret_Details'
+    || name === 'Antenna_Rig' || name === 'MG50_Mount'
+    || name === 'Track_L' || name === 'Track_R'
+    || name.startsWith('ReturnRoller_');
+}
+
+// Rapier groups = (membership << 16) | filter: debris is in group 2 and ignores group 2.
+const DEBRIS_GROUPS = (0x0002 << 16) | 0xfffd;
+
+/** Axis-aligned bounds of `root` and its mesh descendants, in `frame` local space. */
+function localAabb(root, frame = root) {
+  _box.makeEmpty();
+  frame.updateWorldMatrix(true, true);
+  root.updateWorldMatrix(true, true);
+  _inv.copy(frame.matrixWorld).invert();
+  root.traverse((c) => {
+    if (!c.isMesh || !c.geometry?.attributes?.position) return;
+    const pos = c.geometry.attributes.position;
+    _m.multiplyMatrices(_inv, c.matrixWorld);
+    for (let i = 0; i < pos.count; i++) {
+      _v.fromBufferAttribute(pos, i).applyMatrix4(_m);
+      _box.expandByPoint(_v);
+    }
+  });
+  return _box;
+}
 
 function loopSegments(flat) {
   const pts = [];
@@ -80,6 +140,57 @@ function pointOnLoop({ segs, L }, d, outP) {
 function approachAngle(cur, target, maxStep) {
   let d = Math.atan2(Math.sin(target - cur), Math.cos(target - cur));
   return cur + THREE.MathUtils.clamp(d, -maxStep, maxStep);
+}
+
+function smooth01(t) {
+  const u = THREE.MathUtils.clamp(t, 0, 1);
+  return u * u * (3 - 2 * u);
+}
+
+/**
+ * World torque (N·m) that resists falling onto a side or roof.
+ * Lets go once the hull is on its side, so a completed flip stays put.
+ * `side` is the body lateral axis (local +Z), the pitch axis.
+ */
+function uprightAssist(up, fwd, side, angvel, grounded) {
+  const ax = -up.z;
+  const az = up.x;
+  const sinTilt = Math.hypot(ax, az);
+  // Full while a tip can still be saved. Lets go near sideways so a real flip stays put.
+  const commit = smooth01((up.y - 0.08) / 0.32);
+  // Damping lingers a little past sideways so a tumble stops on its side instead of spinning onto the roof.
+  const dampHold = Math.max(commit, smooth01((up.y + 0.35) / 0.7));
+  const freeSin = Math.sin(UPRIGHT_FREE);
+  const excess = Math.max(0, sinTilt - freeSin) / (1 - freeSin);
+  const shaped = excess * excess;
+  const air = grounded ? 1 : 0.8;
+  const invSin = sinTilt > 1e-4 ? 1 / sinTilt : 0;
+  const rollAlign = (ax * fwd.x + az * fwd.z) * invSin;
+  const pitchAlign = (ax * side.x + az * side.z) * invSin;
+  const rollRate = angvel.x * fwd.x + angvel.y * fwd.y + angvel.z * fwd.z;
+  const pitchRate = angvel.x * side.x + angvel.y * side.y + angvel.z * side.z;
+  const tiltFrac = Math.min(1, sinTilt / freeSin);
+  const rollDampScale = (0.35 + 0.65 * tiltFrac) * (grounded ? 1 : 0.7);
+  const pitchDampScale = (0.06 + 0.94 * excess) * (grounded ? 1 : 0.7);
+  const rollT = commit * ROLL_SPRING * shaped * air * rollAlign - dampHold * ROLL_DAMP * rollDampScale * rollRate;
+  const pitchT = commit * PITCH_SPRING * shaped * air * pitchAlign - dampHold * PITCH_DAMP * pitchDampScale * pitchRate;
+  return {
+    x: fwd.x * rollT + side.x * pitchT,
+    y: fwd.y * rollT + side.y * pitchT,
+    z: fwd.z * rollT + side.z * pitchT,
+  };
+}
+
+/** Speed blend 0..1 over a nitro burst — soft wind-up into the rev peak, then decay. */
+function nitroEnvelope(age) {
+  if (age <= 0 || age >= NITRO.duration) return 0;
+  if (age < NITRO.peakAt) {
+    const u = age / NITRO.peakAt;
+    return u * u; // slow start → full thrust ~1s with the audio peak
+  }
+  if (age < NITRO.holdEnd) return 1;
+  const u = (age - NITRO.holdEnd) / (NITRO.duration - NITRO.holdEnd);
+  return Math.max(0, 1 - u * u);
 }
 
 /** Damped spring on a 2D value (pos, vel: Vector2) towards target, semi-implicit Euler. */
@@ -175,7 +286,7 @@ export class Tank {
     world.createCollider(RAPIER.ColliderDesc.cuboid(hx, hy, hz).setTranslation(0, 1.25, 0)
       .setFriction(0.5)
       .setMassProperties(MASS, { x: -0.28, y: 0.45, z: 0 },
-        { x: I(2 * hy, 2 * hz), y: I(2 * hx, 2 * hz), z: I(2 * hx, 2 * hy) * 0.88 }, { x: 0, y: 0, z: 0, w: 1 }), this.body);
+        { x: I(2 * hy, 2 * hz) * ROLL_I_SCALE, y: I(2 * hx, 2 * hz), z: I(2 * hx, 2 * hy) * 0.88 }, { x: 0, y: 0, z: 0, w: 1 }), this.body);
     world.createCollider(RAPIER.ColliderDesc.cylinder(0.45, 1.05).setTranslation(-0.16, 2.4, 0)
       .setDensity(0).setFriction(0.5), this.body);
 
@@ -210,6 +321,66 @@ export class Tank {
     this.yawAim = 0;
     this.elevAim = 0;
     this.turretSlew = 0;     // rad/s, + = left (CCW from above)
+    this.debris = [];         // { obj, body, parent, localPos, localQuat, localScale }
+    // Part-local bounds measured once here, so the kill frame doesn't walk every vertex.
+    this.debrisChunks = [];
+    this.debrisHidden = [];
+    for (const { root, attach = [], shapes } of DEBRIS_CHUNKS) {
+      const obj = this.model.getObjectByName(root);
+      if (!obj) continue;
+      const extras = attach.map((n) => this.model.getObjectByName(n)).filter(Boolean);
+      const boxes = [];
+      for (const name of shapes) {
+        const sub = obj.getObjectByName(name);
+        const box = sub && localAabb(sub, obj);
+        if (box && !box.isEmpty()) boxes.push(box.clone());
+      }
+      if (boxes.length) this.debrisChunks.push({ obj, extras, boxes });
+    }
+    // charge 0..1 (two 0.5 hits); needFull = spent both, wait for 100% before next use
+    this.nitro = { charge: 1, t: 0, power: 0, held: false, needFull: false, justStarted: false };
+  }
+
+  get nitroCharge() { return this.nitro.charge; }
+  get nitroActive() { return this.nitro.t > 0; }
+
+  /** Rising-edge Shift/L1: spend half a bar if available. Returns true when a burst starts. */
+  tryNitro() {
+    const n = this.nitro;
+    if (n.t > 0) return false;
+    if (n.needFull && n.charge < 1 - 1e-4) return false;
+    if (n.charge < NITRO.cost - 1e-4) return false;
+    n.charge = Math.max(0, n.charge - NITRO.cost);
+    if (n.charge < 0.02) n.needFull = true;
+    n.t = NITRO.duration;
+    n.power = 0;
+    return true;
+  }
+
+  /**
+   * Edge-trigger nitro from held boost, advance envelope / recharge.
+   * Call once per frame (variable dt) before physics steps.
+   */
+  updateNitro(dt, wantBoost) {
+    const n = this.nitro;
+    const pressed = !!wantBoost;
+    n.justStarted = false;
+    if (pressed && !n.held) n.justStarted = this.tryNitro();
+    n.held = pressed;
+
+    if (n.t > 0) {
+      n.t = Math.max(0, n.t - dt);
+      n.power = nitroEnvelope(NITRO.duration - n.t);
+    } else {
+      n.power = 0;
+      if (n.charge < 1) {
+        n.charge = Math.min(1, n.charge + NITRO.rechargePerSec * dt);
+        if (n.charge >= 1 - 1e-4) {
+          n.charge = 1;
+          n.needFull = false;
+        }
+      }
+    }
   }
 
   get position() { return this.body.translation(); }
@@ -217,8 +388,143 @@ export class Tank {
 
   /** Remove from (or return to) the world without destroying it — used by solo mode. */
   setActive(on) {
+    if (!on) this.restoreDebris();
     this.body.setEnabled(on);
     this.model.visible = on;
+  }
+
+  /**
+   * Kill-shot breakup: detach major meshes into Rapier dynamics and blast them apart.
+   * @param {{ point?: THREE.Vector3, dir?: THREE.Vector3 }} hit  shell impact (world)
+   */
+  obliterate({ point, dir } = {}) {
+    if (this.debris.length) return;
+    const R = this.RAPIER;
+    const scene = this.model.parent;
+    if (!scene) return;
+
+    this.model.updateMatrixWorld(true);
+    const hullT = this.body.translation();
+    const hullV = this.body.linvel();
+    const blast = point
+      ? point.clone()
+      : new THREE.Vector3(hullT.x, hullT.y + 1.2, hullT.z);
+    const shove = dir ? dir.clone().normalize() : new THREE.Vector3(0, 1, 0);
+
+    for (const { obj, extras, boxes } of this.debrisChunks) {
+      if (obj.parent == null) continue;
+      const parent = obj.parent;
+      const localPos = obj.position.clone();
+      const localQuat = obj.quaternion.clone();
+      const localScale = obj.scale.clone();
+
+      const attached = [];
+      for (const extra of extras) {
+        if (!extra.parent || extra === obj) continue;
+        attached.push({
+          obj: extra,
+          parent: extra.parent,
+          localPos: extra.position.clone(),
+          localQuat: extra.quaternion.clone(),
+          localScale: extra.scale.clone(),
+        });
+        obj.attach(extra);
+      }
+
+      obj.traverse((c) => {
+        if (c.isMesh) c.castShadow = false;
+        if (c.visible && isWreckDetail(c.name)) {
+          this.debrisHidden.push(c);
+          c.visible = false;
+        }
+      });
+
+      const pos = new THREE.Vector3();
+      const quat = new THREE.Quaternion();
+      const scl = new THREE.Vector3();
+      obj.matrixWorld.decompose(pos, quat, scl);
+
+      parent.remove(obj);
+      scene.add(obj);
+      obj.position.copy(pos);
+      obj.quaternion.copy(quat);
+      obj.scale.copy(scl);
+
+      boxes[0].getSize(_size);
+      boxes[0].getCenter(_center);
+      const hx = Math.max(0.08, _size.x * 0.5);
+      const hy = Math.max(0.08, _size.y * 0.5);
+      const hz = Math.max(0.08, _size.z * 0.5);
+      const mass = THREE.MathUtils.clamp(8 * hx * hy * hz * 280, 40, 6000);
+
+      const body = this.world.createRigidBody(
+        R.RigidBodyDesc.dynamic()
+          .setTranslation(pos.x, pos.y, pos.z)
+          .setRotation(quat)
+          .setLinvel(hullV.x, hullV.y, hullV.z)
+          .setLinearDamping(0.15)
+          .setAngularDamping(0.4)
+          .setUserData({ mat: 'metal' }),
+      );
+      this.world.createCollider(
+        R.ColliderDesc.cuboid(hx, hy, hz)
+          .setTranslation(_center.x, _center.y, _center.z)
+          .setMass(mass)
+          .setFriction(0.75)
+          .setRestitution(0.15)
+          .setCollisionGroups(DEBRIS_GROUPS),
+        body,
+      );
+
+      // Outward blast from the chunk's box centre, plus a lift so chunks clear the hull.
+      _center.applyMatrix4(obj.matrixWorld);
+      const away = _center.clone().sub(blast);
+      if (away.lengthSq() < 1e-4) away.set(Math.random() - 0.5, 1, Math.random() - 0.5);
+      away.normalize();
+      const kick = 6 + Math.random() * 10;
+      const lift = 5 + Math.random() * 9;
+      body.applyImpulse({
+        x: (away.x * kick + shove.x * 4) * mass,
+        y: (away.y * kick * 0.35 + lift + shove.y * 2) * mass,
+        z: (away.z * kick + shove.z * 4) * mass,
+      }, true);
+      body.applyTorqueImpulse({
+        x: (Math.random() - 0.5) * mass * 3.5,
+        y: (Math.random() - 0.5) * mass * 3.5,
+        z: (Math.random() - 0.5) * mass * 3.5,
+      }, true);
+
+      this.debris.push({ obj, body, parent, localPos, localQuat, localScale, attached });
+    }
+
+    this.body.setEnabled(false);
+    this.model.visible = false;
+  }
+
+  /** Reassemble the tank hierarchy and drop debris bodies (round restart). */
+  restoreDebris() {
+    if (!this.debris.length) return;
+    for (const d of this.debris) {
+      this.world.removeRigidBody(d.body);
+      d.obj.removeFromParent();
+      d.parent.add(d.obj);
+      d.obj.position.copy(d.localPos);
+      d.obj.quaternion.copy(d.localQuat);
+      d.obj.scale.copy(d.localScale);
+      d.obj.traverse((c) => { if (c.isMesh) c.castShadow = true; });
+      for (const a of d.attached) {
+        a.obj.removeFromParent();
+        a.parent.add(a.obj);
+        a.obj.position.copy(a.localPos);
+        a.obj.quaternion.copy(a.localQuat);
+        a.obj.scale.copy(a.localScale);
+      }
+    }
+    for (const o of this.debrisHidden) o.visible = true;
+    this.debrisHidden.length = 0;
+    this.debris.length = 0;
+    this.body.setEnabled(true);
+    this.model.visible = true;
   }
 
   forwardSpeed() {
@@ -229,12 +535,20 @@ export class Tank {
 
   /** One fixed physics step: suspension, traction, drive. */
   physicsStep(dt, input) {
+    if (!this.body.isEnabled() || this.debris.length) return;
     const R = this.RAPIER;
     const ramp = (cur, tgt, rate) => cur + THREE.MathUtils.clamp(tgt - cur, -rate * dt, rate * dt);
-    this.cmd.throttle = ramp(this.cmd.throttle, input.throttle, input.throttle === 0 ? 3.5 : 2.4);
+    let throttleTgt = input.throttle;
+    // Nitro pulls you forward even if you're not holding W (arcade burst).
+    if (this.nitro.power > 0.05 && throttleTgt >= 0) {
+      throttleTgt = Math.max(throttleTgt, 0.55 + this.nitro.power * 0.45);
+    }
+    this.cmd.throttle = ramp(this.cmd.throttle, throttleTgt, throttleTgt === 0 ? 3.5 : 2.4);
     this.cmd.turn = ramp(this.cmd.turn, input.turn, 6.25);
 
-    const top = this.cmd.throttle >= 0 ? (input.boost ? SPEED.boost : SPEED.cruise) : SPEED.reverse;
+    const top = this.cmd.throttle >= 0
+      ? THREE.MathUtils.lerp(SPEED.cruise, SPEED.boost, this.nitro.power)
+      : SPEED.reverse;
     const v = this.cmd.throttle * top;
     const steer = this.cmd.turn * THREE.MathUtils.lerp(SPEED.pivot, SPEED.turn, Math.min(1, Math.abs(v) / 4));
     const target = { L: v + steer, R: v - steer };   // D (turn > 0) = right: left track runs faster
@@ -301,6 +615,14 @@ export class Tank {
     }
     this.grounded = grounded;
 
+    // Keep small leans. Bleed off roll speed, and shove back once a tip is actually underway.
+    {
+      const side = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
+      const av = this.body.angvel();
+      const torque = uprightAssist(up, fwd, side, av, grounded > 0);
+      this.body.applyTorqueImpulse({ x: torque.x * dt, y: torque.y * dt, z: torque.z * dt }, true);
+    }
+
     // track surface speed for the visuals: ground speed when touching, commanded when spinning free
     for (const s of this.sides) {
       const [sum, cnt] = sideLong[s.side];
@@ -342,6 +664,13 @@ export class Tank {
 
   /** Sync the model to the body, animate the running gear, aim, recoil. */
   update(dt, aimPoint) {
+    if (this.debris.length) {
+      for (const d of this.debris) {
+        d.obj.position.copy(d.body.translation());
+        d.obj.quaternion.copy(d.body.rotation());
+      }
+      return;
+    }
     this.model.position.copy(this.body.translation());
     this.model.quaternion.copy(this.body.rotation());
     this.model.updateMatrixWorld();
@@ -500,6 +829,7 @@ export class Tank {
 
   /** Full restart at the original spawn pose. */
   respawn(spawn) {
+    this.restoreDebris();
     this.body.setTranslation({ x: spawn.x, y: spawn.y, z: spawn.z }, true);
     this.body.setRotation(
       new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), spawn.yaw ?? 0),
@@ -514,6 +844,7 @@ export class Tank {
     this.hitFlashFrames = 0;
     this._applyHitFlash(false);
     this.cmd.throttle = this.cmd.turn = 0;
+    Object.assign(this.nitro, { charge: 1, t: 0, power: 0, held: false, needFull: false, justStarted: false });
   }
 
   get reloadFraction() { return 1 - this.reload / RELOAD; }

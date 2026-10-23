@@ -1,0 +1,27 @@
+---
+description: Metal props/buildings must use mat:'metal' for MG clank SFX
+globs: proto/src/**/*.js
+alwaysApply: false
+---
+
+# Metal hit SFX (MG clank)
+
+When adding **metal** collidable objects (buildings, props, wreckage, railings, etc.), tag the Rapier rigid body so MG hits play the metal clank:
+
+```js
+RAPIER.RigidBodyDesc.fixed() // or .dynamic()
+  .setTranslation(...)
+  .setUserData({ mat: 'metal' })
+```
+
+`match.js` `onMgHit` reads `body.userData?.mat === 'metal'` and calls `sfx.ricochet()`. Tanks clank via their own path (damage); do not rely on omitting the tag for tanks.
+
+## Do
+
+- Tag hangars, warehouses, barrels, ships, ironwork — any surface that should clang
+- Use the exact string `'metal'` (not `Metal` / `steel`)
+
+## Don't
+
+- Hardcode body handles in a Set for metal SFX
+- Assume visual metalness alone triggers the sound — only `userData.mat`

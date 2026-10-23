@@ -56,6 +56,11 @@ export const CAMERA_CONFIG = {
   maxSpeed: 12.5,            // m/s that counts as "100% speed" (Sherman boost top speed)
   brakeThrottle: 0.08,       // throttle below this while moving = braking (matches taillights)
 
+  // ---------- Nitro FOV punch ----------
+  nitroFovDeg: 10,           // extra degrees at peak
+  nitroFovDuration: 2.0,     // total widen→settle window
+  nitroFovPeakAt: 1.0,       // seconds in when FOV is widest
+
   // ---------- Fire kick-back ----------
   // Timed shove to peak, then ease-out return. Total window = kickReturnDuration
   // (keep in sync with tank RELOAD so the cam lands as the next shot is ready).
@@ -163,6 +168,11 @@ export class TankCamera {
     this.kickDirectional = false;
     this.kickPush = new THREE.Vector3(); // world XZ shove (hit impulse); fire kick leaves this unused
 
+    // nitro FOV: timed ease to peak then settle (independent of fire kick)
+    this.nitroFovT = 0;
+    this.nitroFovAmt = 0; // 0..1 envelope
+    this.nitroFovOn = false;
+
     this.trauma = 0;
     this.time = 0;
 
@@ -212,6 +222,13 @@ export class TankCamera {
     this.trauma = Math.max(this.trauma, this.cfg.mgShake);
   }
 
+  /** Nitro FOV widen: ease to +nitroFovDeg at peakAt, settle by duration. Retriggers restart the curve. */
+  nitroFov() {
+    this.nitroFovOn = true;
+    this.nitroFovT = 0;
+    this.nitroFovAmt = 0;
+  }
+
   /** Restore cfg (incl. wheel-zoom distances) and runtime camera state to defaults. */
   resetDefaults() {
     Object.assign(this.cfg, CAMERA_CONFIG);
@@ -227,6 +244,9 @@ export class TankCamera {
     this.kickReturnLen = 0;
     this.kickDirectional = false;
     this.kickPush.set(0, 0, 0);
+    this.nitroFovOn = false;
+    this.nitroFovT = 0;
+    this.nitroFovAmt = 0;
     this.trauma = 0;
     this.collisionDist = Infinity;
     this.roll = 0;
@@ -406,8 +426,25 @@ export class TankCamera {
       + n2 * shake * deg(c.shakeMaxAngleDeg),
     );
 
-    // FOV (+ fire punch)
-    const fov = this.fov + this.kickX * c.kickFovDeg;
+    // Nitro FOV: soft ease up to peak, soft ease back (default 2s, peak 1s, +10°)
+    if (this.nitroFovOn) {
+      this.nitroFovT += dt;
+      const peak = Math.max(1e-4, c.nitroFovPeakAt);
+      const dur = Math.max(peak + 1e-4, c.nitroFovDuration);
+      if (this.nitroFovT >= dur) {
+        this.nitroFovOn = false;
+        this.nitroFovAmt = 0;
+      } else if (this.nitroFovT < peak) {
+        const u = this.nitroFovT / peak;
+        this.nitroFovAmt = u * u;
+      } else {
+        const u = (this.nitroFovT - peak) / (dur - peak);
+        this.nitroFovAmt = Math.max(0, 1 - u * u);
+      }
+    }
+
+    // FOV (+ fire punch + nitro widen)
+    const fov = this.fov + this.kickX * c.kickFovDeg + this.nitroFovAmt * c.nitroFovDeg;
     if (Math.abs(this.camera.fov - fov) > 0.001 || this.camera.near !== c.near) {
       this.camera.fov = fov;
       this.camera.near = c.near;

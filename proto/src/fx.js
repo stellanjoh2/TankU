@@ -3,6 +3,8 @@
 import * as THREE from 'three/webgpu';
 import { texture, uniform } from 'three/tsl';
 import { heightAt as terrainHeightAt } from './terrain.js';
+import { VISUAL_DEFAULTS } from './visualDefaults.js';
+import { decodeGif } from './gif.js';
 
 /** Sprite that writes HDR into the emissive MRT (beauty via emissive add, not diffuse color). */
 function emissiveSpriteMat(map, hdr, opts = {}) {
@@ -16,6 +18,7 @@ function emissiveSpriteMat(map, hdr, opts = {}) {
     depthTest: opts.depthTest !== false,
     blending: opts.additive ? THREE.AdditiveBlending : THREE.NormalBlending,
     opacity: opts.opacity ?? 1,
+    sizeAttenuation: opts.sizeAttenuation !== false,
   });
   mat.emissiveNode = map ? texture(map).rgb.mul(uEm) : uEm;
   mat.userData.emissiveUniform = uEm;
@@ -101,6 +104,81 @@ function radialTexture(stops) {
   return t;
 }
 
+/** Thin vertical streak: hot head at the top (uv v=1), fading tail toward the bottom. */
+function streakTexture() {
+  const w = 32, h = 128;
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const g = c.getContext('2d');
+  const across = g.createLinearGradient(0, 0, w, 0);
+  across.addColorStop(0, 'rgba(255,255,255,0)');
+  across.addColorStop(0.35, 'rgba(255,220,150,0.5)');
+  across.addColorStop(0.5, 'rgba(255,255,255,1)');
+  across.addColorStop(0.65, 'rgba(255,220,150,0.5)');
+  across.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = across;
+  g.fillRect(0, 0, w, h);
+  g.globalCompositeOperation = 'destination-in';
+  const along = g.createLinearGradient(0, 0, 0, h);
+  along.addColorStop(0, 'rgba(0,0,0,0)');
+  along.addColorStop(0.08, 'rgba(0,0,0,1)');
+  along.addColorStop(0.35, 'rgba(0,0,0,0.75)');
+  along.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = along;
+  g.fillRect(0, 0, w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+/** Spark-spray burst: streaks fan out from an origin on the left toward +X, plus a few strays. */
+const BURST_ORIGIN_U = 0.16;
+function sparkBurstTexture(seed) {
+  const w = 256, h = 128;
+  const ox = w * BURST_ORIGIN_U, oy = h / 2;
+  let s = seed;
+  const rnd = () => ((s = (s * 16807) % 2147483647) / 2147483647);
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const g = c.getContext('2d');
+  g.globalCompositeOperation = 'lighter';
+  g.lineCap = 'round';
+  const glow = g.createRadialGradient(ox, oy, 0, ox, oy, 26);
+  glow.addColorStop(0, 'rgba(255,240,200,0.9)');
+  glow.addColorStop(0.4, 'rgba(255,170,60,0.35)');
+  glow.addColorStop(1, 'rgba(255,120,20,0)');
+  g.fillStyle = glow;
+  g.fillRect(0, 0, w, h);
+  const streak = (ang, r0, r1, width) => {
+    const x0 = ox + Math.cos(ang) * r0, y0 = oy + Math.sin(ang) * r0;
+    const x1 = ox + Math.cos(ang) * r1, y1 = oy + Math.sin(ang) * r1;
+    const grad = g.createLinearGradient(x0, y0, x1, y1);
+    grad.addColorStop(0, 'rgba(255,150,40,0)');
+    grad.addColorStop(0.6, 'rgba(255,190,80,0.8)');
+    grad.addColorStop(1, 'rgba(255,245,210,1)');
+    g.strokeStyle = grad;
+    g.lineWidth = width;
+    g.beginPath();
+    g.moveTo(x0, y0);
+    g.lineTo(x1, y1);
+    g.stroke();
+  };
+  for (let i = 0; i < 34; i++) {
+    const ang = (rnd() - 0.5) * (rnd() < 0.7 ? 0.7 : 1.5);
+    const r0 = 6 + rnd() * 70;
+    const r1 = Math.min(r0 + 12 + rnd() * 70, w - ox - 4);
+    streak(ang, r0, r1, 1 + rnd() * 2.6);
+  }
+  for (let i = 0; i < 7; i++) {
+    streak(rnd() * Math.PI * 2, 8 + rnd() * 10, 24 + rnd() * 26, 1 + rnd() * 1.4);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
 /** Blit one atlas cell into a canvas texture — reliable flipbook on WebGPU (offset/repeat is flaky). */
 function blitFlipbookFrame(fb, frame) {
   if (frame === fb.frame) return;
@@ -130,6 +208,12 @@ export class Effects {
     this.impactGlowTex = null;
 
     this.flashTex = radialTexture([[0, '#ffffff'], [0.25, '#ffd28a'], [0.6, 'rgba(255,120,30,0.35)'], [1, 'rgba(255,80,0,0)']]);
+    this.streakTex = streakTexture();
+    this.burstTexs = [11, 4271, 90913].map(sparkBurstTexture);
+    // Set from main.js — metal-hit sparks orient their streaks in screen space.
+    this.camera = null;
+    this._camQInv = new THREE.Quaternion();
+    this._streakV = new THREE.Vector3();
     this.smokeTex = radialTexture([[0, 'rgba(255,255,255,0.9)'], [0.5, 'rgba(255,255,255,0.35)'], [1, 'rgba(255,255,255,0)']]);
     this.shellGeo = new THREE.CylinderGeometry(0.05, 0.05, 1.6, 6).rotateZ(Math.PI / 2);
     // WebGL look: unlit HDR streak so beauty-buffer bloom picks it up (emissive-only was invisible).
@@ -139,15 +223,20 @@ export class Effects {
     });
     this.debrisGeo = new THREE.BoxGeometry(0.15, 0.15, 0.15);
     this.debrisMat = new THREE.MeshStandardMaterial({ color: 0x2b2418, roughness: 1 });
-    // Tiny torn blades kicked up by tracks on meadows
+    // Tiny torn blades kicked up by tracks on yellow meadows (match primary grass)
     this.grassBitGeo = new THREE.PlaneGeometry(0.05, 0.16);
     this.grassBitMat = new THREE.MeshBasicMaterial({
-      color: 0x5a8a32,
+      color: new THREE.Color(VISUAL_DEFAULTS.grassBase),
       side: THREE.DoubleSide,
       depthWrite: false,
     });
     this.grassBitMatB = new THREE.MeshBasicMaterial({
-      color: 0x8aad45,
+      color: new THREE.Color(VISUAL_DEFAULTS.grassTip1),
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    this.grassBitMatC = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(VISUAL_DEFAULTS.grassTip2),
       side: THREE.DoubleSide,
       depthWrite: false,
     });
@@ -369,18 +458,22 @@ export class Effects {
       { color: dirt ? 0x8a6230 : 0xffb060, distance: dirt ? 8 : 14 },
     );
 
+    if (!dirt) this._mgSparkBurst(point, normal, bounce);
+
     const n = dirt
       ? 6 + Math.floor(Math.random() * 3)   // ~50% of metal count
       : 12 + Math.floor(Math.random() * 6);
     for (let i = 0; i < n; i++) {
-      const size = dirt ? 0.14 + Math.random() * 0.2 : 0.18 + Math.random() * 0.28;
+      const size = dirt ? 0.14 + Math.random() * 0.2 : 0.0675 + Math.random() * 0.105;
       const mat = emissiveSpriteMat(
-        this.flashTex,
-        dirt ? new THREE.Color(2.2, 1.2, 0.45) : new THREE.Color(14, 12, 6),
+        dirt ? this.flashTex : this.streakTex,
+        dirt ? new THREE.Color(2.2, 1.2, 0.45) : new THREE.Color(20, 13, 5),
         { additive: true },
       );
       const spark = new THREE.Sprite(mat);
       spark.scale.setScalar(size);
+      // Pivot near the hot head so the tail trails behind the direction of travel.
+      if (!dirt) spark.center.set(0.5, 0.9);
       spark.position.copy(point).addScaledVector(normal, 0.04 + Math.random() * 0.08);
       this.scene.add(spark);
       const along = dirt ? 5 + Math.random() * 9 : 10 + Math.random() * 18;
@@ -395,11 +488,38 @@ export class Effects {
         vel: v,
         size,
         spark: true,
-        // Dirt: brown → darker earth; metal keeps the default white→red fade in update()
-        sparkFrom: dirt ? [2.4, 1.25, 0.4] : null,
-        sparkTo: dirt ? [0.45, 0.22, 0.08] : null,
+        streak: !dirt,
+        // Dirt: brown → darker earth; metal: hot gold → deep orange
+        sparkFrom: dirt ? [2.4, 1.25, 0.4] : [20, 13, 5],
+        sparkTo: dirt ? [0.45, 0.22, 0.08] : [10, 1.8, 0.2],
       });
     }
+  }
+
+  /** Brief spray-shaped flash at a metal hit, fanned along the on-screen ricochet direction. */
+  _mgSparkBurst(point, normal, bounce) {
+    const tex = this.burstTexs[Math.floor(Math.random() * this.burstTexs.length)];
+    const mat = emissiveSpriteMat(tex, new THREE.Color(12, 7, 2.2), { additive: true });
+    let ang = Math.random() * Math.PI * 2;
+    if (this.camera) {
+      const v = this._streakV.copy(bounce)
+        .applyQuaternion(this.camera.getWorldQuaternion(this._camQInv).invert());
+      if (Math.hypot(v.x, v.y) > 0.15) ang = Math.atan2(v.y, v.x);
+    }
+    mat.rotation = ang + (Math.random() - 0.5) * 0.3;
+    const burst = new THREE.Sprite(mat);
+    burst.center.set(BURST_ORIGIN_U, 0.5);
+    burst.position.copy(point).addScaledVector(normal, 0.06);
+    const size = 1.1 + Math.random() * 0.5;
+    burst.scale.set(size, size * 0.5, 1);
+    this.scene.add(burst);
+    this.particles.push({
+      obj: burst,
+      life: 0.09 + Math.random() * 0.05,
+      age: 0,
+      size,
+      burst: true,
+    });
   }
 
   _triggerMgShot(stream) {
@@ -557,8 +677,15 @@ export class Effects {
   /** Destroyed-tank blast: a big flipbook burst plus a second, delayed-looking one above the hull. */
   wreck(pos) {
     const up = new THREE.Vector3(0, 1, 0);
+    // No glow ball / sparks here: each spark builds its own node material and the burst hitches the kill frame.
+    this._explode(pos.clone(), up, up.clone().negate(), null, { emissive: false });
+    this._explode(pos.clone().addScaledVector(up, 1.6), up, up.clone().negate(), null, { emissive: false });
+  }
+
+  /** Single free-standing blast (fuel drum): flipbook, sparks, debris, impulse on nearby props. */
+  blast(pos) {
+    const up = new THREE.Vector3(0, 1, 0);
     this._explode(pos.clone(), up, up.clone().negate(), null);
-    this._explode(pos.clone().addScaledVector(up, 1.6), up, up.clone().negate(), null);
   }
 
   dust(pos, amount) {
@@ -569,8 +696,50 @@ export class Effects {
     });
   }
 
+  /** Keep torn-blade colours in sync with the primary FluffyGrass palette. */
+  setGrassColors({ base, tip1, tip2 } = {}) {
+    if (base != null) this.grassBitMat.color.set(base);
+    if (tip1 != null) this.grassBitMatB.color.set(tip1);
+    if (tip2 != null) this.grassBitMatC.color.set(tip2);
+  }
+
   /**
-   * Acceleration kick from a track: rearward dust + optional torn grass bits.
+   * Torn meadow blades ripped up behind the tracks (yellow grass only — caller gates).
+   * Amount and size are +50% vs the original track-kick bits.
+   * @param {THREE.Vector3} pos world origin at the track / ground
+   * @param {number} amount 0..1
+   * @param {{ back: THREE.Vector3, out: THREE.Vector3 }} dirs
+   */
+  grassRip(pos, amount, { back, out } = {}) {
+    if (amount < 0.08 || Math.random() > amount * 0.85) return;
+    const baseN = 1 + (Math.random() < amount * 0.7 ? 1 : 0);
+    const n = Math.max(1, Math.round(baseN * 1.5));
+    const mats = [this.grassBitMat, this.grassBitMatB, this.grassBitMatC];
+    for (let i = 0; i < n; i++) {
+      const mat = mats[(Math.random() * mats.length) | 0];
+      const m = new THREE.Mesh(this.grassBitGeo, mat);
+      m.position.copy(pos).addScaledVector(out, (Math.random() - 0.5) * 0.25);
+      m.position.y += 0.06;
+      m.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+      const s = (0.65 + Math.random() * 0.7) * 1.5;
+      m.scale.set(s * (0.7 + Math.random() * 0.5), s, 1);
+      this.scene.add(m);
+      const v = back.clone().multiplyScalar(2.2 + Math.random() * 4.5)
+        .addScaledVector(out, 0.6 + Math.random() * 2.8)
+        .add(new THREE.Vector3(0, 2.2 + Math.random() * 3.5, 0));
+      this.particles.push({
+        obj: m,
+        life: 1.0 + Math.random() * 0.9,
+        age: 0,
+        vel: v,
+        debris: true,
+        spin: new THREE.Vector3().randomDirection().multiplyScalar(10 + Math.random() * 14),
+      });
+    }
+  }
+
+  /**
+   * Acceleration kick from a track: rearward dust (+ optional torn grass).
    * @param {THREE.Vector3} pos world origin at the track / ground
    * @param {number} amount 0..1
    * @param {{ back: THREE.Vector3, out: THREE.Vector3, grassy?: boolean }} dirs
@@ -592,29 +761,7 @@ export class Effects {
         { vel: v, grow: 3.2, opacity: 0.38 + amount * 0.12, drag: 1.35, rise: 0.25 },
       );
     }
-    if (!grassy || Math.random() > amount * 0.85) return;
-    const n = 1 + (Math.random() < amount * 0.7 ? 1 : 0);
-    for (let i = 0; i < n; i++) {
-      const mat = Math.random() < 0.45 ? this.grassBitMatB : this.grassBitMat;
-      const m = new THREE.Mesh(this.grassBitGeo, mat);
-      m.position.copy(pos).addScaledVector(out, (Math.random() - 0.5) * 0.25);
-      m.position.y += 0.06;
-      m.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
-      const s = 0.65 + Math.random() * 0.7;
-      m.scale.set(s * (0.7 + Math.random() * 0.5), s, 1);
-      this.scene.add(m);
-      const v = back.clone().multiplyScalar(2.2 + Math.random() * 4.5)
-        .addScaledVector(out, 0.6 + Math.random() * 2.8)
-        .add(new THREE.Vector3(0, 2.2 + Math.random() * 3.5, 0));
-      this.particles.push({
-        obj: m,
-        life: 1.0 + Math.random() * 0.9,
-        age: 0,
-        vel: v,
-        debris: true,
-        spin: new THREE.Vector3().randomDirection().multiplyScalar(10 + Math.random() * 14),
-      });
-    }
+    if (grassy) this.grassRip(pos, amount, { back, out });
   }
 
   /**
@@ -739,11 +886,11 @@ export class Effects {
     });
   }
 
-  _explode(point, normal, dir, collider) {
+  _explode(point, normal, dir, collider, { emissive = true } = {}) {
     // Test: ground-explosion flipbook as the main impact read (kept large).
     this._groundExplosion(point);
     // Quick emissive glow-ball flash (placeholder texture, additive, fades over glowLife).
-    if (this.impactGlowTex) {
+    if (emissive && this.impactGlowTex) {
       const glowSize = GROUND_EXPLOSION.glowSize;
       const mat = emissiveSpriteMat(this.impactGlowTex, new THREE.Color(21, 10.5, 2.4), {
         additive: true, depthTest: false,
@@ -771,7 +918,7 @@ export class Effects {
     this._flashLight(point.clone().addScaledVector(normal, 1.5), 220);
 
     // Emissive sparks: fly out from center, bounce, white → red as they die.
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; emissive && i < 60; i++) {
       const size = (0.45 + Math.random() * 0.55) * 0.5;
       const mat = emissiveSpriteMat(this.flashTex, new THREE.Color(10, 10, 10), { additive: true });
       const spark = new THREE.Sprite(mat);
@@ -815,6 +962,7 @@ export class Effects {
 
   update(dt, heightAt) {
     const R = this.RAPIER;
+    if (this.camera) this.camera.getWorldQuaternion(this._camQInv).invert();
     for (let i = this.shells.length - 1; i >= 0; i--) {
       const s = this.shells[i];
       s.age += dt;
@@ -850,6 +998,7 @@ export class Effects {
           && p.obj.material !== this.brassMat
           && p.obj.material !== this.grassBitMat
           && p.obj.material !== this.grassBitMatB
+          && p.obj.material !== this.grassBitMatC
         ) {
           // Flipbook uses a per-burst CanvasTexture — dispose it. Shared atlas stays alive.
           if (p.flipbook) p.flipbook.map.dispose();
@@ -894,7 +1043,22 @@ export class Effects {
         if (em) em.value.setRGB(r, gC, b);
         else p.obj.material.color.setRGB(r, gC, b);
         p.obj.material.opacity = (1 - k) * (1 - k);
-        p.obj.scale.setScalar(p.size * (1 - k * 0.65));
+        const w = p.size * (1 - k * 0.65);
+        if (p.streak && this.camera) {
+          // Velocity in camera space: x/y give the on-screen direction and the speed across the view.
+          const v = this._streakV.copy(p.vel).applyQuaternion(this._camQInv);
+          const across = Math.hypot(v.x, v.y);
+          p.obj.material.rotation = Math.atan2(v.y, v.x) - Math.PI / 2;
+          p.obj.scale.set(w, w * 2.5 + across * 0.044, 1);
+        } else {
+          p.obj.scale.setScalar(w);
+        }
+        continue;
+      }
+      if (p.burst) {
+        const s = p.size * (1 + 0.6 * Math.sqrt(k));
+        p.obj.scale.set(s, s * 0.5, 1);
+        p.obj.material.opacity = 1 - k * k;
         continue;
       }
       if (p.flipbook) {

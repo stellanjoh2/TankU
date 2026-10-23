@@ -1,9 +1,11 @@
 // Stylized tropical vegetation pack (Serhii3D) — clustered along beaches / land.
-// LODs intentionally deferred.
+// Distance LODs come from vegetation_lods.glb (scripts/build_vegetation_lods.py).
 import * as THREE from 'three';
 import { PropertyBinding } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { SIZE, WATER_Y, heightAt, shoreSigned, isOnRoad, isAirfield } from './terrain.js';
+import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
+import { SIZE, WATER_Y, heightAt, shoreSigned, isOnRoad, isAirfield, isPort } from './terrain.js';
+import { pickLod } from './lod.js';
 
 const PREFABS = {
   Palm_01: { kind: 'tree', weight: 1.0 },
@@ -34,11 +36,15 @@ const PREFABS = {
 };
 
 const GLOBAL_SCALE = 1.0;
-const TREE_SCALE = 1.25; // 25% taller/larger palms
+const TREE_SCALE = 1.375; // +10% vs prior 1.25
 const ROCK_SCALE = 1.5; // 50% larger than previous rock scales
 const SPAWN = { x: -8, z: -5 };
 const SPAWN_CLEAR = 14;
 const HALF = SIZE * 0.5;
+
+/** Palm wind joints: bone 0 = foot (never rotates); shares sum to 1 for upper joints. */
+const PALM_BONE_COUNT = 4;
+const PALM_BONE_SHARE = [0, 0.22, 0.33, 0.45];
 
 const CLUSTER_COUNT = 32;
 // Gray-rock piles: few sites, many stones packed tight (reads as intentional outcrops).
@@ -72,10 +78,21 @@ export const FOLIAGE_BRIGHTNESS_DEFAULT = 1;
 export const PALM_BRIGHTNESS_DEFAULT = 1;
 /** Units match visuals Wind strength (grass sway is off). */
 export const WIND_DEFAULT = 0.085;
-/** Radians of whole-tree lean per unit of wind amp. */
+/** Radians of total palm lean per unit of wind amp (distributed across upper bones). */
 const PALM_WIND_LEAN = 1.35;
 /** Radians of big-leaf / bush lean per unit of wind amp (shorter plants → less lean). */
 const PLANT_WIND_LEAN = 0.7;
+
+/**
+ * Camera-distance band edges (m): LOD0 < 25, LOD1 < 45, LOD2 < 70, LOD3 beyond.
+ * The chase cam sits 7–10 m behind the tank, so LOD0 must cover the player's surroundings.
+ */
+const LOD_EDGES = [25, 45, 70];
+const LOD_LEVELS = LOD_EDGES.length + 1;
+/** Big cover boulders are 3–5 m tall, so they step down at twice the distance. */
+const COVER_LOD_MUL = 2;
+/** Ground plants are fully hidden past this (palms and rocks never cull). */
+export const PLANT_CULL_DEFAULT = 120;
 
 function seededRand(seed) {
   let s = seed >>> 0;
@@ -138,11 +155,16 @@ function setupCutoutMaterial(m) {
   m.needsUpdate = true;
 }
 
-/** Bake a Sketchfab prefab (incl. FBX 0.01 parent scale) into a grounded group at origin. */
-function extractPrefab(src, foliageMats, palmLeafMats) {
+/**
+ * Bake a Sketchfab prefab (incl. FBX 0.01 parent scale) into a grounded group at origin.
+ * `lodNodes` maps `<mesh>_LOD<n>` → node from vegetation_lods.glb (world transforms match the source).
+ * Every mesh gets `userData.lodRange = [min, max]`: it shows while the instance's LOD level is in range.
+ */
+function extractPrefab(src, foliageMats, palmLeafMats, lodNodes) {
   src.updateWorldMatrix(true, true);
   const group = new THREE.Group();
   group.name = src.name;
+  const lodMeshes = [];
 
   src.traverse((child) => {
     if (!child.isMesh) return;
@@ -170,8 +192,26 @@ function extractPrefab(src, foliageMats, palmLeafMats) {
       }
     }
     group.add(mesh);
+
+    let prevLevel = 0;
+    let prev = mesh;
+    for (let lvl = 1; lvl < LOD_LEVELS; lvl++) {
+      const node = lodNodes.get(`${child.name}_LOD${lvl}`);
+      if (!node) continue;
+      prev.userData.lodRange = [prevLevel, lvl - 1];
+      const lod = new THREE.Mesh(node.geometry, mesh.material);
+      lod.name = node.name;
+      lod.castShadow = true;
+      lod.receiveShadow = true;
+      node.matrixWorld.decompose(lod.position, lod.quaternion, lod.scale);
+      lodMeshes.push(lod);
+      prevLevel = lvl;
+      prev = lod;
+    }
+    prev.userData.lodRange = [prevLevel, LOD_LEVELS - 1];
   });
 
+  // Bounds / trunk foot from full detail only; LOD meshes are added afterwards with the same offset.
   const box = new THREE.Box3().setFromObject(group);
   if (box.isEmpty()) {
     return { template: group, radius: 0.5, height: 1 };
@@ -186,7 +226,14 @@ function extractPrefab(src, foliageMats, palmLeafMats) {
   box.setFromObject(group);
   const size = box.getSize(new THREE.Vector3());
   const radius = Math.max(0.3, Math.max(size.x, size.z) * 0.5);
-  return { template: group, radius, height: size.y, size, base: lowVertexCentre(group, 0.5) };
+  const base = lowVertexCentre(group, 0.5);
+  for (const lod of lodMeshes) {
+    lod.position.x -= center.x;
+    lod.position.z -= center.z;
+    lod.position.y -= minY;
+    group.add(lod);
+  }
+  return { template: group, radius, height: size.y, size, base };
 }
 
 /** Average XZ of vertices within `maxY` of the ground — a palm's trunk foot, not its leaning crown. */
@@ -194,6 +241,7 @@ function lowVertexCentre(group, maxY) {
   const v = new THREE.Vector3();
   let sx = 0, sz = 0, n = 0;
   for (const mesh of group.children) {
+    if (!mesh.isMesh && !mesh.isSkinnedMesh) continue;
     mesh.updateMatrix();
     const p = mesh.geometry.attributes.position;
     for (let i = 0; i < p.count; i++) {
@@ -203,6 +251,77 @@ function lowVertexCentre(group, maxY) {
     }
   }
   return n ? new THREE.Vector2(sx / n, sz / n) : new THREE.Vector2();
+}
+
+/** Blend each vertex between neighbouring palm bones by height (bone 0 = foot). */
+function addPalmSkinAttributes(geometry, height, boneCount) {
+  const pos = geometry.attributes.position;
+  const n = pos.count;
+  const skinIndex = new THREE.BufferAttribute(new Uint16Array(n * 4), 4);
+  const skinWeight = new THREE.BufferAttribute(new Float32Array(n * 4), 4);
+  const h = Math.max(height, 0.01);
+  for (let i = 0; i < n; i++) {
+    const t = THREE.MathUtils.clamp(pos.getY(i) / h, 0, 0.999) * (boneCount - 1);
+    const i0 = Math.floor(t);
+    const i1 = Math.min(i0 + 1, boneCount - 1);
+    const f = t - i0;
+    skinIndex.setXYZW(i, i0, i1, 0, 0);
+    skinWeight.setXYZW(i, 1 - f, f, 0, 0);
+  }
+  geometry.setAttribute('skinIndex', skinIndex);
+  geometry.setAttribute('skinWeight', skinWeight);
+}
+
+/**
+ * Replace a baked palm group (trunk + leaves meshes) with a skinned rig:
+ * bone 0 stays planted; upper bones carry wind lean.
+ */
+function rigPalmTemplate(template, height) {
+  const group = new THREE.Group();
+  group.name = template.name;
+
+  const bones = [];
+  const spacing = height / (PALM_BONE_COUNT - 1);
+  for (let i = 0; i < PALM_BONE_COUNT; i++) {
+    const bone = new THREE.Bone();
+    bone.name = `PalmBone_${i}`;
+    bone.position.y = i === 0 ? 0 : spacing;
+    if (i === 0) group.add(bone);
+    else bones[i - 1].add(bone);
+    bones.push(bone);
+  }
+  const skeleton = new THREE.Skeleton(bones);
+  group.updateMatrixWorld(true);
+
+  for (const child of template.children) {
+    if (!child.isMesh) continue;
+    const geo = child.geometry.clone();
+    child.updateMatrix();
+    geo.applyMatrix4(child.matrix);
+    addPalmSkinAttributes(geo, height, PALM_BONE_COUNT);
+    const sm = new THREE.SkinnedMesh(geo, child.material);
+    sm.name = child.name;
+    sm.userData.lodRange = child.userData.lodRange;
+    sm.castShadow = true;
+    sm.receiveShadow = true;
+    group.add(sm);
+    sm.bind(skeleton);
+  }
+
+  group.userData.palmBones = bones;
+  return group;
+}
+
+function collectPalmBones(root) {
+  const bones = [];
+  for (let i = 0; i < PALM_BONE_COUNT; i++) {
+    let found = null;
+    root.traverse((c) => {
+      if (c.isBone && c.name === `PalmBone_${i}`) found = c;
+    });
+    if (found) bones.push(found);
+  }
+  return bones;
 }
 
 function overlaps(placed, x, z, r) {
@@ -224,7 +343,7 @@ function canPlaceTree(x, z) {
   if (heightAt(x, z) < WATER_Y + 0.4) return false;
   if (slopeAt(x, z) > 0.12) return false;
   if (nearSpawn(x, z)) return false;
-  if (isAirfield(x, z)) return false;
+  if (isAirfield(x, z) || isPort(x, z)) return false;
   return true;
 }
 
@@ -234,7 +353,7 @@ function canPlacePlant(x, z) {
   if (heightAt(x, z) < WATER_Y + 0.25) return false;
   if (slopeAt(x, z) > 0.28) return false;
   if (nearSpawn(x, z)) return false;
-  if (isAirfield(x, z)) return false;
+  if (isAirfield(x, z) || isPort(x, z)) return false;
   return true;
 }
 
@@ -243,7 +362,7 @@ function canPlaceRock(x, z) {
   if (shore < 1.5) return false;
   if (heightAt(x, z) < WATER_Y + 0.05) return false;
   if (nearSpawn(x, z)) return false;
-  if (isAirfield(x, z)) return false;
+  if (isAirfield(x, z) || isPort(x, z)) return false;
   if (isOnRoad(x, z, 1.5)) return false; // keep the mud track clear of gray rocks
   return true;
 }
@@ -253,7 +372,7 @@ function canPlaceCover(x, z) {
   if (heightAt(x, z) < WATER_Y + 1) return false;
   if (slopeAt(x, z, 2) > 0.1) return false;
   if (Math.hypot(x - SPAWN.x, z - SPAWN.z) < COVER_SPAWN_CLEAR) return false;
-  if (isAirfield(x, z)) return false;
+  if (isAirfield(x, z) || isPort(x, z)) return false;
   if (isOnRoad(x, z, 3.5)) return false;
   return true;
 }
@@ -279,12 +398,32 @@ function lowestGround(x, z, radius) {
  *   setFoliageBrightness: (v: number) => void,
  *   getWind: () => number,
  *   setWind: (v: number) => void,
+ *   getLodScale: () => number,
+ *   setLodScale: (v: number) => void,
+ *   getPlantCull: () => number,
+ *   setPlantCull: (v: number) => void,
  *   update: (time: number) => void,
+ *   updateLod: (camPos: THREE.Vector3) => void,
  * }>}
  */
 export async function buildVegetation(scene, { RAPIER, world }) {
-  const gltf = await new GLTFLoader().loadAsync('./models/vegetation.glb');
+  const loader = new GLTFLoader();
+  const [gltf, lodGltf] = await Promise.all([
+    loader.loadAsync('./models/vegetation.glb'),
+    loader.loadAsync('./models/vegetation_lods.glb').catch((err) => {
+      console.warn('[vegetation] no LOD file, using full detail everywhere', err);
+      return null;
+    }),
+  ]);
   gltf.scene.updateMatrixWorld(true);
+
+  const lodNodes = new Map();
+  if (lodGltf) {
+    lodGltf.scene.updateMatrixWorld(true);
+    lodGltf.scene.traverse((o) => {
+      if (o.isMesh) lodNodes.set(o.name, o);
+    });
+  }
 
   const nodes = [];
   gltf.scene.traverse((o) => nodes.push(o));
@@ -308,7 +447,10 @@ export async function buildVegetation(scene, { RAPIER, world }) {
       console.warn(`[vegetation] missing prefab ${name}`);
       continue;
     }
-    const extracted = extractPrefab(src, foliageMats, palmLeafMats);
+    const extracted = extractPrefab(src, foliageMats, palmLeafMats, lodNodes);
+    if (meta.kind === 'tree') {
+      extracted.template = rigPalmTemplate(extracted.template, extracted.height);
+    }
     catalog[meta.kind].push({ name, meta, ...extracted });
   }
   console.info(
@@ -346,13 +488,14 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     const r = collisionRadius(item, scale);
     if (overlaps(placed, x, z, r)) return false;
 
-    const inst = item.template.clone(true);
+    const inst = item.meta.kind === 'tree' ? cloneSkinned(item.template) : item.template.clone(true);
     inst.traverse((c) => {
       if (c.isMesh) {
         c.castShadow = true;
         c.receiveShadow = true;
       }
     });
+    initLod(inst);
 
     const yaw = rand() * Math.PI * 2;
     // Rocks: bury 50% of height so they sit in the ground, not float.
@@ -368,6 +511,9 @@ export async function buildVegetation(scene, { RAPIER, world }) {
       inst.userData.windPhase = rand() * Math.PI * 2;
       inst.userData.yaw = yaw;
     }
+    if (item.meta.kind === 'tree') {
+      inst.userData.palmBones = collectPalmBones(inst);
+    }
     root.add(inst);
     placed.push({ x, z, r });
     count++;
@@ -376,24 +522,74 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     return true;
   }
 
+  const lodInstances = [];
+
+  function initLod(inst) {
+    const meshes = [];
+    inst.traverse((c) => {
+      if (c.isMesh && c.userData.lodRange) meshes.push(c);
+    });
+    inst.userData.lodMeshes = meshes;
+    inst.userData.lod = -2;
+    lodInstances.push(inst);
+  }
+
+  function setLodLevel(inst, level) {
+    if (inst.userData.lod === level) return;
+    inst.userData.lod = level;
+    for (const m of inst.userData.lodMeshes) {
+      const [lo, hi] = m.userData.lodRange;
+      m.visible = level >= lo && level <= hi;
+    }
+  }
+
+  let lodScale = 1;
+  let plantCull = PLANT_CULL_DEFAULT;
+
+  /** Level -1 hides every mesh (plants past the cull distance). */
+  function updateLod(camPos) {
+    for (const inst of lodInstances) {
+      if (!inst.visible || !inst.parent) continue;
+      const kind = inst.userData.kind;
+      const d = inst.position.distanceTo(camPos);
+      const cur = inst.userData.lod;
+      const cullPad = plantCull * 0.05;
+      let level;
+      if (kind === 'plant' && d > plantCull + (cur === -1 ? -cullPad : cullPad)) {
+        level = -1;
+      } else {
+        level = pickLod(d, LOD_EDGES, kind === 'cover' ? lodScale * COVER_LOD_MUL : lodScale, cur);
+      }
+      setLodLevel(inst, level);
+    }
+  }
+
   function setWind(v) {
     windAmp = THREE.MathUtils.clamp(v, 0, 0.15);
   }
 
   function update(time) {
-    // Lean the whole prefab (trunk + crown / stem + leaves). Don't rotate leaf
-    // meshes alone — their local origin isn't at the stem tip.
+    // Palms: foot bone stays planted; lean is shared across upper trunk/crown bones.
     const palmLean = windAmp * PALM_WIND_LEAN;
     for (const p of palms) {
       if (!p.visible) continue;
       const ph = p.userData.windPhase ?? 0;
       p.rotation.y = p.userData.yaw ?? p.rotation.y;
-      p.rotation.x = Math.sin(time * 0.95 + ph) * palmLean;
-      p.rotation.z = Math.sin(time * 1.15 + ph * 1.7) * palmLean * 0.85;
+      p.rotation.x = 0;
+      p.rotation.z = 0;
+      const bones = p.userData.palmBones;
+      if (!bones?.length) continue;
+      const leanX = Math.sin(time * 0.95 + ph) * palmLean;
+      const leanZ = Math.sin(time * 1.15 + ph * 1.7) * palmLean * 0.85;
+      for (let i = 0; i < bones.length; i++) {
+        const k = PALM_BONE_SHARE[i] ?? 0;
+        bones[i].rotation.x = leanX * k;
+        bones[i].rotation.z = leanZ * k;
+      }
     }
     const plantLean = windAmp * PLANT_WIND_LEAN;
     for (const p of plants) {
-      if (!p.visible) continue;
+      if (!p.visible || p.userData.lod === -1) continue;
       const ph = p.userData.windPhase ?? 0;
       p.rotation.y = p.userData.yaw ?? p.rotation.y;
       // Slightly faster sway than palms — big leaves catch gusts quicker.
@@ -573,10 +769,11 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     inst.userData.kind = 'cover';
     coverRoot.add(inst);
     inst.updateMatrixWorld(true);
+    initLod(inst);
 
     const pts = [];
     inst.traverse((m) => {
-      if (!m.isMesh) return;
+      if (!m.isMesh || m.userData.lodRange?.[0] > 0) return;
       const p = m.geometry.attributes.position;
       const stride = Math.max(1, Math.floor(p.count / 600));
       for (let i = 0; i < p.count; i += stride) {
@@ -676,6 +873,11 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     setFoliageBrightness,
     getWind: () => windAmp,
     setWind,
+    getLodScale: () => lodScale,
+    setLodScale: (v) => { lodScale = THREE.MathUtils.clamp(v, 0.25, 50); },
+    getPlantCull: () => plantCull,
+    setPlantCull: (v) => { plantCull = THREE.MathUtils.clamp(v, 10, 1000); },
     update,
+    updateLod,
   };
 }
