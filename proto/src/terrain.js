@@ -1,8 +1,12 @@
 import * as THREE from 'three';
+import { WaterMesh } from 'three/examples/jsm/objects/WaterMesh.js';
 
 export const SIZE = 250;
 export const WATER_Y = 0.2;
-const SEGS = 220;
+// −20% vs the old 220-seg grid; sea faces are pruned after displace
+const SEGS = 176;
+/** Keep a triangle if any corner is at least this far from shore (inland +, sea −). */
+const SEA_PRUNE = -10;
 
 // Hills: [cx, cz, height, radius] — ~50% taller + tighter falloff than the old 500 m map.
 const HILLS = [
@@ -11,8 +15,106 @@ const HILLS = [
   [-22, 72, 11, 12], [2, -78, 17, 18], [-48, -8, 14, 15],
 ];
 
+// Flat-valley tracks only (open polylines). Never routed over hill flanks.
+// Each entry: { closed, pts: [[x,z],…] }
+const ROAD_WAYS = [
+  // South meadow bowl
+  { closed: false, pts: [[-8, -5], [0, -18], [8, -28], [4, -40], [-8, -36], [-2, -22]] },
+  // North / west saddles between the big hills
+  { closed: true, pts: [
+    [-8, -5], [0, 8], [-8, 22], [-18, 30], [-28, 28], [-34, 16], [-28, 6], [-16, 2],
+  ] },
+  // East meadow spur
+  { closed: false, pts: [[-8, -5], [4, 0], [10, 12], [6, 26], [-4, 34]] },
+];
+export const ROAD_HALF_W = 4.2;
+
+/** Spawn-side airfield / refuel pad (axis-aligned; hangar sits on the east edge). */
+export const AIRFIELD = {
+  cx: -1,
+  cz: -11,
+  hw: 17,   // half-width along X
+  hd: 14,   // half-depth along Z
+  edge: 5,  // soft blend outside the hard pad
+};
+
 const smooth = (x, a, b) => THREE.MathUtils.smoothstep(x, a, b);
 const clamp01 = (v) => Math.min(1, Math.max(0, v));
+
+/** Soft 0..1 mask for the airfield pad (1 = fully flattened concrete apron). */
+export function airfieldFactor(x, z) {
+  const dx = Math.abs(x - AIRFIELD.cx) - AIRFIELD.hw;
+  const dz = Math.abs(z - AIRFIELD.cz) - AIRFIELD.hd;
+  const outside = Math.max(dx, dz);
+  if (outside <= 0) return 1;
+  if (outside >= AIRFIELD.edge) return 0;
+  return 1 - smooth(outside, 0, AIRFIELD.edge);
+}
+
+export function isAirfield(x, z) {
+  return airfieldFactor(x, z) > 0.4;
+}
+
+function distPointSeg(px, pz, ax, az, bx, bz) {
+  const abx = bx - ax, abz = bz - az;
+  const apx = px - ax, apz = pz - az;
+  const ab2 = abx * abx + abz * abz || 1e-8;
+  const t = clamp01((apx * abx + apz * abz) / ab2);
+  const dx = apx - abx * t, dz = apz - abz * t;
+  return Math.hypot(dx, dz);
+}
+
+/** Peak hill gaussian height at (x,z) — used to keep roads/grass off flanks. */
+function hillStrength(x, z) {
+  let s = 0;
+  for (const [cx, cz, hh, rad] of HILLS) {
+    const d2 = (x - cx) ** 2 + (z - cz) ** 2;
+    s = Math.max(s, hh * Math.exp(-d2 / (rad * rad)));
+  }
+  return s;
+}
+
+function slopeAt(x, z, e = 1) {
+  const dx = heightAt(x + e, z) - heightAt(x - e, z);
+  const dz = heightAt(x, z + e) - heightAt(x, z - e);
+  return 1 - (2 * e) / Math.hypot(dx, 2 * e, dz);
+}
+
+/** Metres to the nearest mud-road centreline. */
+export function roadDist(x, z) {
+  let best = Infinity;
+  for (const way of ROAD_WAYS) {
+    const pts = way.pts;
+    const n = pts.length;
+    const segs = way.closed ? n : n - 1;
+    for (let i = 0; i < segs; i++) {
+      const a = pts[i], b = pts[(i + 1) % n];
+      best = Math.min(best, distPointSeg(x, z, a[0], a[1], b[0], b[1]));
+    }
+  }
+  return best;
+}
+
+/** Flat valley only — roads never climb the hills even if a segment grazes a flank. */
+function isRoadable(x, z) {
+  if (shoreSigned(x, z) < 10) return false;
+  if (hillStrength(x, z) > 3.4) return false;
+  if (ridgeHeight(x, z) > 4) return false;
+  if (slopeAt(x, z) > 0.11) return false;
+  return true;
+}
+
+/** Soft 0..1 mask for painting the track (1 = centre). */
+export function roadFactor(x, z) {
+  const d = roadDist(x, z);
+  if (d >= ROAD_HALF_W + 1.5) return 0;
+  if (!isRoadable(x, z)) return 0;
+  return 1 - smooth(d, ROAD_HALF_W * 0.55, ROAD_HALF_W + 1.5);
+}
+
+export function isOnRoad(x, z, margin = 0) {
+  return roadDist(x, z) < ROAD_HALF_W + margin && isRoadable(x, z);
+}
 
 /** Signed distance-ish to shore: >0 inland, 0 at beach edge, <0 in water. */
 export function shoreSigned(x, z) {
@@ -62,10 +164,10 @@ function ridgeHeight(x, z) {
 }
 
 /**
- * Terrain height in metres.
+ * Natural terrain height (no airfield flatten).
  * Island interior with dramatic hills; beach shelf; seabed below WATER_Y offshore.
  */
-export function heightAt(x, z) {
+function naturalHeightAt(x, z) {
   const signed = shoreSigned(x, z);
 
   if (signed < -1.5) {
@@ -111,18 +213,28 @@ export function heightAt(x, z) {
   return h;
 }
 
-/** True where fluffy grass should grow (meadow, not beach / rock / water). */
+/** Pad height locked to the meadow at the airfield centre. */
+export const AIRFIELD_Y = naturalHeightAt(AIRFIELD.cx, AIRFIELD.cz);
+
+/**
+ * Terrain height in metres (airfield pad flattened for the apron).
+ */
+export function heightAt(x, z) {
+  const h = naturalHeightAt(x, z);
+  const f = airfieldFactor(x, z);
+  if (f <= 0) return h;
+  return THREE.MathUtils.lerp(h, AIRFIELD_Y, f);
+}
+
+/** Meadow mask: grass ground inland, not beach / hill rock / road / airfield. */
 export function isGrassable(x, z) {
-  if (shoreSigned(x, z) < 10) return false;
+  if (isAirfield(x, z)) return false;
+  if (shoreSigned(x, z) < 12) return false; // beach stays sand
   if (heightAt(x, z) < WATER_Y + 1.6) return false;
-  const e = 0.75;
-  const dx = heightAt(x + e, z) - heightAt(x - e, z);
-  const dz = heightAt(x, z + e) - heightAt(x, z - e);
-  const ny = (2 * e) / Math.hypot(dx, 2 * e, dz);
-  const slope = 1 - ny;
-  if (slope > 0.2) return false;
-  // Keep mountain crest clear
-  if (ridgeHeight(x, z) > 8 && slope > 0.08) return false;
+  if (isOnRoad(x, z, 0.8)) return false;
+  if (hillStrength(x, z) > 4.5) return false;
+  if (ridgeHeight(x, z) > 6) return false;
+  if (slopeAt(x, z, 0.75) > 0.16) return false;
   return true;
 }
 
@@ -150,39 +262,39 @@ function detailTexture() {
   return tex;
 }
 
-function waterTexture() {
-  const n = 128;
-  const c = document.createElement('canvas');
-  c.width = c.height = n;
-  const g = c.getContext('2d');
-  g.fillStyle = '#3a7a9a';
-  g.fillRect(0, 0, n, n);
-  for (let i = 0; i < 400; i++) {
-    g.fillStyle = `rgba(220,240,255,${0.04 + Math.random() * 0.08})`;
-    g.fillRect(Math.random() * n, Math.random() * n, 4 + Math.random() * 18, 1 + Math.random() * 2);
-  }
-  const tex = new THREE.CanvasTexture(c);
-  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.repeat.set(40, 40);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
-}
-
 export const DEFAULT_GROUND_PALETTE = {
-  grass: '#2e4717',
-  dry: '#524c24',
-  dirt: '#47331f',
-  sand: '#c2b385',
-  wetSand: '#8c8061',
-  rock: '#6b6661',
+  grass: '#3a5a22',   // meadow under the fluffy grass
+  dry: '#6a6a38',
+  dirt: '#5a4028',
+  mud: '#4a321c',     // packed track
+  sand: '#d2c49a',    // beach
+  wetSand: '#9a8c68',
+  rock: '#6e6a64',    // hills / stone
+  concrete: '#c4bda8', // airfield apron (beige / light gray)
   water: '#2a6a88',
 };
 
-export function buildTerrain(RAPIER, world, scene) {
+/** Drop faces that sit entirely out at sea so the wireframe/collider aren't a dense ocean grid. */
+function pruneSeaFaces(geo) {
+  const pos = geo.attributes.position;
+  const src = geo.index.array;
+  const out = [];
+  for (let i = 0; i < src.length; i += 3) {
+    const a = src[i], b = src[i + 1], c = src[i + 2];
+    const sa = shoreSigned(pos.getX(a), pos.getZ(a));
+    const sb = shoreSigned(pos.getX(b), pos.getZ(b));
+    const sc = shoreSigned(pos.getX(c), pos.getZ(c));
+    if (sa > SEA_PRUNE || sb > SEA_PRUNE || sc > SEA_PRUNE) out.push(a, b, c);
+  }
+  geo.setIndex(out);
+}
+
+export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEGS, SEGS);
   geo.rotateX(-Math.PI / 2);
   const pos = geo.attributes.position;
   for (let i = 0; i < pos.count; i++) pos.setY(i, heightAt(pos.getX(i), pos.getZ(i)));
+  pruneSeaFaces(geo);
   geo.computeVertexNormals();
 
   const nrm = geo.attributes.normal;
@@ -194,34 +306,64 @@ export function buildTerrain(RAPIER, world, scene) {
     grass: new THREE.Color(DEFAULT_GROUND_PALETTE.grass),
     dry: new THREE.Color(DEFAULT_GROUND_PALETTE.dry),
     dirt: new THREE.Color(DEFAULT_GROUND_PALETTE.dirt),
+    mud: new THREE.Color(DEFAULT_GROUND_PALETTE.mud),
     sand: new THREE.Color(DEFAULT_GROUND_PALETTE.sand),
     wetSand: new THREE.Color(DEFAULT_GROUND_PALETTE.wetSand),
     rock: new THREE.Color(DEFAULT_GROUND_PALETTE.rock),
+    concrete: new THREE.Color(DEFAULT_GROUND_PALETTE.concrete),
     water: new THREE.Color(DEFAULT_GROUND_PALETTE.water),
   };
   const c = new THREE.Color();
 
   function applyPalette() {
-    const grass = palette.grass, dry = palette.dry, dirt = palette.dirt;
+    const grass = palette.grass, dry = palette.dry, dirt = palette.dirt, mud = palette.mud;
     const sand = palette.sand, wetSand = palette.wetSand, rock = palette.rock;
+    const concrete = palette.concrete;
     for (let i = 0; i < pos.count; i++) {
       const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
       const signed = shoreSigned(x, z);
       const slope = 1 - nrm.getY(i);
       const patch = 0.5 + 0.5 * Math.sin(x * 0.07 + Math.sin(z * 0.05) * 2.0) * Math.cos(z * 0.06);
       const ridge = ridgeHeight(x, z);
+      const hills = hillStrength(x, z);
+      const road = roadFactor(x, z);
+      const apron = airfieldFactor(x, z);
 
+      // --- Biomes (intentional, little cross-bleed) ---
       if (y < WATER_Y + 0.05 || signed < 0) {
+        // Intertidal / seabed
         c.copy(wetSand).lerp(sand, clamp01((y - (WATER_Y - 1)) / 1.5));
-      } else if (signed < 9) {
-        const t = clamp01(signed / 9);
-        c.copy(sand).lerp(grass, t * t);
-        c.lerp(dry, patch * 0.25 * t);
+      } else if (signed < 12) {
+        // Beach: sand only (wet → dry as you leave the water)
+        const t = clamp01(signed / 12);
+        c.copy(wetSand).lerp(sand, 0.35 + 0.65 * t);
       } else {
-        c.copy(grass).lerp(dry, patch * 0.75).lerp(dirt, Math.min(1, slope * 5));
-        const rockAmt = clamp01(slope * 4.5 + ridge * 0.045 - 0.15);
-        c.lerp(rock, rockAmt);
-        if (ridge > 10 && slope > 0.12) c.lerp(rock, 0.55);
+        // Inland: rock on hills, grass meadows in the flats
+        const rocky = clamp01(
+          slope * 2.8 + hills * 0.12 + ridge * 0.05 - 0.2,
+        );
+        if (rocky > 0.45) {
+          c.copy(rock).lerp(dirt, 0.15 + patch * 0.1);
+          c.lerp(sand, clamp01(slope - 0.15) * 0.12); // dusty stone
+        } else {
+          // Grass ground — fluffy grass draws on top of this
+          c.copy(grass).lerp(dry, patch * 0.4);
+          c.lerp(dirt, clamp01(slope * 2.5) * 0.25);
+          c.lerp(rock, rocky * 0.9); // soft foot-of-hill blend
+        }
+      }
+
+      // Mud road on flat valleys only (roadFactor already gated)
+      if (road > 0.02) {
+        const rut = 0.82 + 0.18 * Math.sin(x * 0.55 + z * 0.4);
+        c.lerp(mud, road * rut);
+        c.lerp(dirt, road * 0.3 * (1 - rut));
+      }
+      // Beige concrete apron under the hangar / refuel pad
+      if (apron > 0.02) {
+        const slab = 0.92 + 0.08 * Math.sin(x * 1.1) * Math.cos(z * 1.05);
+        c.lerp(concrete, apron * slab);
+        c.lerp(dirt, apron * 0.12 * (1 - slab));
       }
       if (y < WATER_Y) c.multiplyScalar(0.65);
       colors.set([c.r, c.g, c.b], i * 3);
@@ -236,19 +378,23 @@ export function buildTerrain(RAPIER, world, scene) {
   mesh.name = 'IslandTerrain';
   scene.add(mesh);
 
-  // Ocean plane (visual); seabed collider is the terrain mesh.
-  const waterGeo = new THREE.PlaneGeometry(SIZE * 1.6, SIZE * 1.6, 1, 1);
-  waterGeo.rotateX(-Math.PI / 2);
-  const waterMat = new THREE.MeshStandardMaterial({
-    color: palette.water,
-    map: waterTexture(),
-    transparent: true,
-    opacity: 0.82,
-    roughness: 0.25,
-    metalness: 0.1,
-    depthWrite: false,
-  });
-  const water = new THREE.Mesh(waterGeo, waterMat);
+  // WebGPU ocean placeholder (three.js WaterMesh / webgpu_ocean example).
+  // Seabed collider stays on the terrain mesh (shore skirt only after prune).
+  const waterNormals = await new THREE.TextureLoader().loadAsync('./textures/waternormals.jpg');
+  waterNormals.wrapS = waterNormals.wrapT = THREE.RepeatWrapping;
+  const water = new WaterMesh(
+    new THREE.PlaneGeometry(SIZE * 1.6, SIZE * 1.6),
+    {
+      waterNormals,
+      sunDirection: (sunDir || new THREE.Vector3(0.70707, 0.70707, 0)).clone().normalize(),
+      sunColor: 0xffffff,
+      waterColor: palette.water,
+      distortionScale: 3.7,
+      size: 1.0,
+      resolutionScale: 0.5,
+    },
+  );
+  water.rotation.x = -Math.PI / 2;
   water.position.y = WATER_Y;
   water.receiveShadow = true;
   water.name = 'Ocean';
@@ -267,7 +413,7 @@ export function buildTerrain(RAPIER, world, scene) {
       for (const [k, v] of Object.entries(partial)) {
         if (!palette[k]) continue;
         palette[k].set(v);
-        if (k === 'water') waterMat.color.copy(palette.water);
+        if (k === 'water') water.waterColor.value.copy(palette.water);
       }
       applyPalette();
     },

@@ -7,8 +7,8 @@ import { SIZE, heightAt, isGrassable } from './terrain.js';
 
 const CHUNK = 32;
 const DENSITY = 1.15; // clumps per m² on meadows
-// LOD00 native height ≈ 0.14 m; ~0.3–0.6 m after scale (readable, still below track tops).
-const BASE_SCALE = 3.6;
+// LOD00 native height ≈ 0.14 m; ~0.45–0.9 m after scale (+50% vs prior 3.6).
+const BASE_SCALE = 5.4;
 const HALF = SIZE * 0.5;
 
 function hash2(ix, iz) {
@@ -21,7 +21,7 @@ function heightMulAt(x, z) {
   const a = 0.5 + 0.5 * Math.sin(x * 0.028 + 0.7) * Math.cos(z * 0.024 - 0.3);
   const b = 0.5 + 0.5 * Math.sin(x * 0.011 + z * 0.009);
   const patch = a * 0.65 + b * 0.35;
-  // 0.55 … 1.25 → roughly 0.25 m … 0.55 m after BASE_SCALE
+  // 0.55 … 1.25 → roughly 0.4 m … 0.85 m after BASE_SCALE
   return 0.55 + patch * 0.7;
 }
 

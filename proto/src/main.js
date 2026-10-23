@@ -1,23 +1,30 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { WebGPURenderer } from 'three/webgpu';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
-import { Lensflare, LensflareElement } from 'three/examples/jsm/objects/Lensflare.js';
+import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader.js';
+import { LightProbeGenerator } from 'three/examples/jsm/lights/LightProbeGenerator.js';
+import { SkyMesh } from 'three/examples/jsm/objects/SkyMesh.js';
 import { createPost } from './post.js';
 import { buildTerrain, heightAt, isGrassable } from './terrain.js';
 import { buildProps } from './props.js';
+import { buildAirfield } from './airfield.js';
 import { buildGrass } from './grass.js';
 import { buildVegetation } from './vegetation.js';
 import { createVisualsEditor } from './visuals.js';
 import { shadowTint, patchShadowTint } from './shadowTint.js';
 import { Input } from './input.js';
-import { Tank, RELOAD } from './tank.js';
+import { Tank, RELOAD, MG_DAMAGE } from './tank.js';
 import { Effects } from './fx.js';
 import { TankCamera } from './TankCamera.js';
 import { Sfx } from './sfx.js';
 import { NavGrid } from './navgrid.js';
 import { TankAI, pickSpawn } from './ai.js';
 import { createHud } from './hud.js';
+import { createDebug } from './debug.js';
+import { FreeFlight } from './freeflight.js';
+import { buildPlanes } from './planes.js';
+import { buildSoldiers } from './soldiers.js';
 import './style.css';
 
 const FIXED_DT = 1 / 120;
@@ -25,9 +32,11 @@ const sunDir = new THREE.Vector3(-0.45, 0.75, 0.48).normalize();
 const SHADOW_EXTENT = 38;
 const MIN_SPAWN_GAP = 75;        // metres between the two tanks at round start
 const ROUND_RESTART_DELAY = 4;   // seconds the wreck burns before the next round
-const ENEMY_TINT = new THREE.Color(0.62, 0.6, 0.58);   // weathered grey vs your olive drab
+const ENEMY_TINT = new THREE.Color(1.0, 0.72, 0.38);     // orange drab (keep channels ≤1 so bloom stays off)
 const IDLE = Object.freeze({ throttle: 0, turn: 0, boost: false });
 const SOLO_KEY = 'sherman.solo';
+const MUSIC_MUTE_KEY = 'sherman.musicMute';
+const MUSIC_VOL_KEY = 'sherman.musicVol';
 
 const $ = (id) => document.getElementById(id);
 
@@ -35,38 +44,60 @@ async function main() {
   await RAPIER.init();
 
   // ---------------------------------------------------------------- renderer / scene
-  const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+  // TODO: LensflareMesh once post+shaders are ported.
+  const renderer = new WebGPURenderer({ antialias: false, powerPreference: 'high-performance' });
+  await renderer.init();
+  if (!renderer.backend.isWebGPUBackend) {
+    throw new Error('WebGPU is required (WebGL2 fallback disabled for this proto).');
+  }
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   renderer.setSize(innerWidth, innerHeight);
-  renderer.toneMapping = THREE.NoToneMapping;
+  // HDR scene → post bloom → ACES Filmic (same path as three.js webgpu_tonemapping).
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 0.74;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFShadowMap;
   document.body.prepend(renderer.domElement);
 
   const scene = new THREE.Scene();
-  const horizon = new THREE.Color(0.55, 0.68, 0.74);
-  scene.fog = new THREE.Fog(horizon, 70, 240);
+  const fogColor = new THREE.Color(0xc2fff3);
+  scene.fog = new THREE.Fog(fogColor, 30, 151);
+
+  // HDRI → cube RT → LightProbe (diffuse SH) + PMREM env (specular), same path as webgpu_lightprobe
+  const equirect = await new EXRLoader().loadAsync('./textures/hdri/env.exr');
+  equirect.mapping = THREE.EquirectangularReflectionMapping;
+
+  const cubeRT = new THREE.CubeRenderTarget(256, {
+    type: THREE.HalfFloatType,
+    format: THREE.RGBAFormat,
+    generateMipmaps: false,
+  });
+  cubeRT.fromEquirectangularTexture(renderer, equirect);
+  const lightProbe = await LightProbeGenerator.fromCubeRenderTarget(renderer, cubeRT);
+  lightProbe.intensity = 1;
+  scene.add(lightProbe);
+  cubeRT.dispose();
 
   const pmrem = new THREE.PMREMGenerator(renderer);
-  scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-  scene.environmentIntensity = 0.35;
+  scene.environment = pmrem.fromEquirectangular(equirect).texture;
+  scene.environmentIntensity = 1;
+  equirect.dispose();
+  pmrem.dispose();
 
-  const sky = new THREE.Mesh(
-    new THREE.SphereGeometry(900, 32, 16),
-    new THREE.ShaderMaterial({
-      side: THREE.BackSide, depthWrite: false, fog: false,
-      uniforms: { horizon: { value: horizon }, zenith: { value: new THREE.Color(0.18, 0.32, 0.62) },
-                  sunDir: { value: sunDir }, sunColor: { value: new THREE.Color(8, 6.5, 4.5) } },
-      vertexShader: `varying vec3 vDir; void main(){ vDir = normalize(position);
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
-      fragmentShader: `varying vec3 vDir; uniform vec3 horizon, zenith, sunDir, sunColor;
-        void main(){ float h = max(vDir.y, 0.0);
-          vec3 c = mix(horizon, zenith, pow(h, 0.55));
-          float s = max(dot(normalize(vDir), sunDir), 0.0);
-          c += sunColor * pow(s, 900.0) + vec3(1.0, 0.8, 0.55) * pow(s, 12.0) * 0.25;
-          gl_FragColor = vec4(c, 1.0); }`,
-    }),
-  );
+  // Procedural skydome (three.js SkyMesh / webgpu_sky) — depth forced to far plane.
+  const sky = new SkyMesh();
+  sky.scale.setScalar(450000);
+  sky.turbidity.value = 6;
+  sky.rayleigh.value = 0.293;
+  sky.mieCoefficient.value = 0.001;
+  sky.mieDirectionalG.value = 0.413;
+  sky.cloudCoverage.value = 0.22;
+  sky.cloudDensity.value = 0.39;
+  sky.cloudElevation.value = 0.46;
+  sky.showSunDisc.value = true;
+  sky.sunPosition.value.copy(sunDir);
+  // Fog colour lives on the mesh for the visuals editor (sky itself is procedural).
+  sky.userData.fogColor = fogColor;
   scene.add(sky);
 
   const sun = new THREE.DirectionalLight(new THREE.Color(1.0, 0.93, 0.82), 3.2);
@@ -80,27 +111,6 @@ async function main() {
   sun.shadow.intensity = 1;
   scene.add(sun, sun.target);
 
-  // Soft warm sun flare (less saturated than a classic red Knoll look)
-  {
-    const loader = new THREE.TextureLoader();
-    const flare0 = loader.load('./textures/lensflare/lensflare0.png');
-    const flare2 = loader.load('./textures/lensflare/lensflare2.png');
-    const flare3 = loader.load('./textures/lensflare/lensflare3.png');
-    const warm = new THREE.Color(1.0, 0.94, 0.86);
-    const soft = new THREE.Color(1.0, 0.88, 0.78);
-    const pale = new THREE.Color(0.95, 0.92, 0.88);
-    const lensflare = new Lensflare();
-    lensflare.addElement(new LensflareElement(flare0, 520, 0, warm));
-    lensflare.addElement(new LensflareElement(flare3, 48, 0.35, soft));
-    lensflare.addElement(new LensflareElement(flare2, 36, 0.5, pale));
-    lensflare.addElement(new LensflareElement(flare3, 60, 0.6, soft));
-    lensflare.addElement(new LensflareElement(flare3, 70, 0.7, pale));
-    lensflare.addElement(new LensflareElement(flare2, 50, 0.85, soft));
-    lensflare.addElement(new LensflareElement(flare3, 100, 0.9, pale));
-    lensflare.addElement(new LensflareElement(flare3, 55, 1.0, warm));
-    sun.add(lensflare);
-  }
-
   const hemi = new THREE.HemisphereLight(new THREE.Color(0.55, 0.65, 0.85), new THREE.Color(0.32, 0.27, 0.18), 0.85);
   const ambient = new THREE.AmbientLight(0xffffff, 0.12);
   scene.add(hemi, ambient);
@@ -111,11 +121,13 @@ async function main() {
   // ---------------------------------------------------------------- world
   const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
   world.timestep = FIXED_DT;
-  const terrain = buildTerrain(RAPIER, world, scene);
+  const terrain = await buildTerrain(RAPIER, world, scene, { sunDir });
   const props = buildProps(RAPIER, world, scene);
-  const [grass, vegetation] = await Promise.all([
+  const airfield = buildAirfield(RAPIER, world, scene);
+  const [grass, vegetation, planes] = await Promise.all([
     buildGrass(scene),
     buildVegetation(scene, { RAPIER, world }),
+    buildPlanes(scene),
   ]);
 
   const loader = new GLTFLoader();
@@ -123,13 +135,14 @@ async function main() {
     loader.loadAsync('./models/sherman.glb'),
     loader.loadAsync('./models/sherman.glb'),
   ]);
-  const spawn = { x: -8, y: heightAt(-8, -5) + 0.6, z: -5, yaw: 0 };
+  const spawn = { x: -8, y: heightAt(-8, -5) + 0.6, z: -5, yaw: Math.PI / 2 };
   const tank = new Tank(gltf, RAPIER, world, spawn);
   scene.add(tank.model);
   const fx = new Effects(scene, RAPIER, world, tank.body, props.dynamic);
 
   const nav = new NavGrid();
-  nav.setObstacles(vegetation.navObstacles());
+  nav.setObstacles([...vegetation.navObstacles(), ...airfield.navObstacles()]);
+  const soldiers = await buildSoldiers(scene, nav);
   const enemySpawn = pickSpawn(nav, spawn, MIN_SPAWN_GAP);
   const enemy = new Tank(enemyGltf, RAPIER, world, enemySpawn, { tint: ENEMY_TINT });
   scene.add(enemy.model);
@@ -140,11 +153,17 @@ async function main() {
   tankCam.setColliders([terrain.mesh, vegetation.coverRoot]);
   const sfx = new Sfx();
   await Promise.all([sfx.load(), fx.load()]);
+  sfx.setMusicMuted(localStorage.getItem(MUSIC_MUTE_KEY) === '1');
+  {
+    const saved = localStorage.getItem(MUSIC_VOL_KEY);
+    if (saved != null) sfx.setMusicVolume(Number(saved));
+  }
 
   // ---------------------------------------------------------------- round state
   const game = {
     solo: localStorage.getItem(SOLO_KEY) === '1',
     showPath: false,
+    debug: false,
     overT: 0,          // > 0 while a wreck burns before the auto-restart
     wreck: null,       // the destroyed tank
   };
@@ -160,21 +179,30 @@ async function main() {
 
   function updatePathLine() {
     pathLine.visible = game.showPath && !game.solo;
-    if (!pathLine.visible) { hud.debug(''); return; }
-    const { mode, mood, path } = ai.debug;
-    const attr = pathLine.geometry.attributes.position;
-    const n = Math.min(path.length, 255);
-    const p = enemy.body.translation();
-    attr.setXYZ(0, p.x, p.y + 1.5, p.z);
-    for (let i = 0; i < n; i++) attr.setXYZ(i + 1, path[i].x, heightAt(path[i].x, path[i].z) + 1.5, path[i].z);
-    attr.needsUpdate = true;
-    pathLine.geometry.setDrawRange(0, n + 1);
-    hud.debug(`AI ${mode} · ${mood}${ai.visible ? ' · sees you' : ''}`);
+    const bits = [];
+    if (game.debug) bits.push('DEBUG · F3');
+    if (fly.enabled) bits.push(`FLY · F · ${Math.round(fly.speed)} m/s`);
+    if (pathLine.visible) {
+      const { mode, mood, path } = ai.debug;
+      const attr = pathLine.geometry.attributes.position;
+      const n = Math.min(path.length, 255);
+      const p = enemy.body.translation();
+      attr.setXYZ(0, p.x, p.y + 1.5, p.z);
+      for (let i = 0; i < n; i++) attr.setXYZ(i + 1, path[i].x, heightAt(path[i].x, path[i].z) + 1.5, path[i].z);
+      attr.needsUpdate = true;
+      pathLine.geometry.setDrawRange(0, n + 1);
+      bits.push(`AI ${mode} · ${mood}${ai.visible ? ' · sees you' : ''}`);
+    }
+    hud.debug(bits.join('\n'));
   }
+
+  sky.name = 'SkyDome';
+  const debug = createDebug(scene, world, { tanks: [tank, enemy], grass });
+  const fly = new FreeFlight(camera);
 
   patchShadowTint(scene);
   const visuals = createVisualsEditor({
-    scene, sky, sun, sunDir, hemi, ambient, terrain, grass, vegetation, post, shadowTint,
+    renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe, terrain, grass, vegetation, post, shadowTint,
     getEnvIntensity: () => scene.environmentIntensity,
     setEnvIntensity: (v) => { scene.environmentIntensity = v; },
     game: {
@@ -186,6 +214,27 @@ async function main() {
       },
       getShowPath: () => game.showPath,
       setShowPath: (v) => { game.showPath = v; },
+      getDebug: () => game.debug,
+      setDebug: (v) => setDebug(v),
+      getFly: () => fly.enabled,
+      setFly: (v) => {
+        if (!!v === fly.enabled) return;
+        toggleFly();
+      },
+      getFlyFov: () => fly.fov,
+      setFlyFov: (v) => fly.setFov(v),
+      getFlyTilt: () => fly.getTiltDeg(),
+      setFlyTilt: (v) => fly.setTiltDeg(v),
+      getMusicMuted: () => sfx.musicMuted,
+      setMusicMuted: (v) => {
+        sfx.setMusicMuted(v);
+        localStorage.setItem(MUSIC_MUTE_KEY, v ? '1' : '0');
+      },
+      getMusicVolume: () => sfx.musicVolume,
+      setMusicVolume: (v) => {
+        sfx.setMusicVolume(v);
+        localStorage.setItem(MUSIC_VOL_KEY, String(sfx.musicVolume));
+      },
     },
   });
 
@@ -201,30 +250,69 @@ async function main() {
       tankCam.addShake(0.45 * (1 - d / 40));
     }
   };
-  fx.onMgShot = () => tankCam.pulseMgShake();
-  fx.onShellHit = ({ collider, owner }) => {
+  fx.onMgShot = ({ owner } = {}) => {
+    if (owner === tank.body) tankCam.pulseMgShake();
+  };
+  const metalBodies = new Set(props.dynamic.map((d) => d.body.handle));
+
+  function onTankDestroyed(victim) {
+    fx.wreck(new THREE.Vector3().copy(victim.body.translation()).add(new THREE.Vector3(0, 1.2, 0)));
+    tankCam.addShake(victim === tank ? 1 : 0.4);
+    game.overT = ROUND_RESTART_DELAY;
+    game.wreck = victim;
+    hud.banner(victim === tank ? 'YOU WERE DESTROYED' : 'ENEMY DESTROYED', 'next round in a moment…');
+  }
+
+  fx.onShellHit = ({ collider, owner, point, dir }) => {
     const body = collider?.parent();
     if (!body || game.overT > 0) return;
     const victim = [tank, enemy].find((t) => t.body.handle === body.handle);
     if (!victim || victim.body === owner || !victim.alive) return;
     victim.hp -= 1;
-    sfx.hit(1);
+    // Clank at the impact (player hits = full volume; distant enemy hits fall off)
+    {
+      const d = (point ?? victim.model.position).distanceTo(tank.model.position);
+      sfx.hit(THREE.MathUtils.clamp(1 - d / 220, 0.15, 1));
+    }
     if (victim === tank) {
       hud.flash();
       if (owner) hud.hitFrom(owner.translation());
       if (owner === enemy.body) ai.onScored();
       input.rumble(1, 1, 450);
-      tankCam.addShake(0.9);
+      // Same fire-kick envelope, shoved along the shell's travel (away from where it came)
+      tankCam.kick(1.0, RELOAD, dir);
     } else {
+      victim.flashHit();
       ai.onHit();
     }
     hud.setHealth(tank.hp / tank.maxHp, enemy.hp / enemy.maxHp);
-    if (!victim.alive) {
-      fx.wreck(new THREE.Vector3().copy(victim.body.translation()).add(new THREE.Vector3(0, 1.2, 0)));
-      tankCam.addShake(victim === tank ? 1 : 0.4);
-      game.overT = ROUND_RESTART_DELAY;
-      game.wreck = victim;
-      hud.banner(victim === tank ? 'YOU WERE DESTROYED' : 'ENEMY DESTROYED', 'next round in a moment…');
+    if (!victim.alive) onTankDestroyed(victim);
+  };
+
+  // Traced .50 hits: metal ricochet SFX + tiny chip damage on tanks / barrels.
+  fx.onMgHit = ({ collider, owner, point }) => {
+    const body = collider?.parent();
+    if (!body || game.overT > 0) return;
+    const victim = [tank, enemy].find((t) => t.body.handle === body.handle);
+    const isTank = !!victim && victim.body !== owner && victim.alive;
+    const isBarrel = metalBodies.has(body.handle);
+    if (!isTank && !isBarrel) return;
+
+    const d = point.distanceTo(tank.model.position);
+    sfx.ricochet(THREE.MathUtils.clamp(1 - d / 180, 0.12, 1));
+
+    if (!isTank) return;
+    const wasAlive = victim.alive;
+    victim.hp = Math.max(0, victim.hp - MG_DAMAGE);
+    if (victim === tank) {
+      if (owner) hud.hitFrom(owner.translation());
+      input.rumble(0.08, 0.18, 40);
+    }
+    hud.setHealth(tank.hp / tank.maxHp, enemy.hp / enemy.maxHp);
+    if (wasAlive && !victim.alive) {
+      if (victim === tank && owner === enemy.body) ai.onScored();
+      if (victim === enemy) ai.onHit();
+      onTankDestroyed(victim);
     }
   };
   // ---------------------------------------------------------------- resize
@@ -287,7 +375,7 @@ async function main() {
   function restartGame({ resetCam = true } = {}) {
     tank.respawn(spawn);
     fx.clearShells();
-    nav.setObstacles(vegetation.navObstacles());   // palm slider may have changed
+    nav.setObstacles([...vegetation.navObstacles(), ...airfield.navObstacles()]);   // palm slider may have changed
     enemy.setActive(!game.solo);
     if (!game.solo) {
       enemy.respawn(pickSpawn(nav, spawn, MIN_SPAWN_GAP));
@@ -302,8 +390,10 @@ async function main() {
     lookYaw = spawn.yaw;
     lookPitch = -0.08;
     prevLookYaw = lookYaw;
+    if (fly.enabled) fly.exit();
     if (resetCam) tankCam.resetDefaults();
     snapCam();
+    updatePathLine();
   }
 
   $('reset-cam').addEventListener('click', (e) => {
@@ -315,9 +405,32 @@ async function main() {
     restartGame();
   });
 
+  function setDebug(on) {
+    debug.setEnabled(on);
+    game.debug = debug.enabled;
+    updatePathLine();
+    visuals.syncUi();
+  }
+
+  /** Freefly is independent of F3 debug — full colour for screenshots / paint-overs. */
+  function toggleFly() {
+    if (fly.toggle()) {
+      updatePathLine();
+      visuals.syncUi();
+    } else {
+      snapCam();
+      updatePathLine();
+      visuals.syncUi();
+    }
+  }
+
   input.onPress = (code) => {
-    if (code === 'KeyR') { tank.reset(heightAt); snapCam(); }
+    if (code === 'KeyR' && !fly.enabled) { tank.reset(heightAt); snapCam(); }
+    // Space: hop upright only when flipped (ignored while upright / in freefly)
+    if (code === 'Space' && !fly.enabled) tank.unflipJump(heightAt);
     if (code === 'KeyV') visuals.toggle();
+    if (code === 'F3' || code === 'Backquote') setDebug(!game.debug);
+    if (code === 'KeyF') toggleFly();
   };
 
   function castFrom(origin, dir, maxDist, out) {
@@ -326,6 +439,12 @@ async function main() {
   }
 
   function updateCamera(dt, inp) {
+    if (fly.enabled) {
+      fly.update(dt, inp);
+      camera.getWorldDirection(viewDir);
+      return;
+    }
+
     lookYaw -= inp.aimX;
     lookPitch = THREE.MathUtils.clamp(lookPitch - inp.aimY, -0.75, 0.45);
 
@@ -354,11 +473,13 @@ async function main() {
   }
 
   function updateSun() {
-    const tp = tank.model.position;
+    const tp = fly.enabled ? camera.position : tank.model.position;
     const step = (2 * SHADOW_EXTENT) / sun.shadow.mapSize.x;
     sun.target.position.set(Math.round(tp.x / step) * step, tp.y, Math.round(tp.z / step) * step);
     sun.position.copy(sun.target.position).addScaledVector(sunDir, 120);
     sun.target.updateMatrixWorld();
+    terrain.water.sunDirection.value.copy(sunDir);
+    terrain.water.sunColor.value.copy(sun.color);
   }
 
   // ---------------------------------------------------------------- reticle + start overlay
@@ -366,12 +487,19 @@ async function main() {
   const projected = new THREE.Vector3();
 
   function updateHud(inp) {
-    projected.copy(gunPoint).project(camera);
-    const visible = projected.z < 1;
-    gunMarker.style.display = visible ? 'block' : 'none';
-    if (visible) {
-      gunMarker.style.transform =
-        `translate(${(projected.x * 0.5 + 0.5) * innerWidth}px, ${(-projected.y * 0.5 + 0.5) * innerHeight}px)`;
+    // Freefly screenshots: hide reticle chrome so the frame is clean to draw on
+    if (fly.enabled) {
+      gunMarker.style.display = 'none';
+      $('crosshair').style.display = 'none';
+    } else {
+      $('crosshair').style.display = '';
+      projected.copy(gunPoint).project(camera);
+      const visible = projected.z < 1;
+      gunMarker.style.display = visible ? 'block' : 'none';
+      if (visible) {
+        gunMarker.style.transform =
+          `translate(${(projected.x * 0.5 + 0.5) * innerWidth}px, ${(-projected.y * 0.5 + 0.5) * innerHeight}px)`;
+      }
     }
     // Hide while driving, on gamepad, or while the visuals editor has the cursor
     $('overlay').classList.toggle('hidden', input.locked || !!inp.pad || visuals.open);
@@ -443,32 +571,43 @@ async function main() {
   function frame(now) {
     const dt = Math.min(0.1, (now - last) / 1000);
     last = now;
-    elapsed += dt;
     input.setEnabled(!visuals.open);
     const inp = input.read(dt);
-    if (inp.padPressed.includes(9)) { tank.reset(heightAt); snapCam(); }
+    if (inp.padPressed.includes(9) && !fly.enabled) { tank.reset(heightAt); snapCam(); }
 
     const versus = !game.solo;
-    if (versus) ai.update(dt, { halt: game.overT > 0 });
-    const playerDrive = tank.alive ? inp : IDLE;
-    const enemyDrive = enemy.alive ? ai.drive : IDLE;
+    const flying = fly.enabled;
+    // Freefly freezes the sim so screenshots don't fight moving tanks / FX.
+    const paused = flying;
+    if (!paused) elapsed += dt;
 
-    acc += dt;
-    while (acc >= FIXED_DT) {
-      tank.physicsStep(FIXED_DT, playerDrive);
-      if (versus) enemy.physicsStep(FIXED_DT, enemyDrive);
-      world.step();
-      acc -= FIXED_DT;
+    if (versus && !paused) ai.update(dt, { halt: game.overT > 0 });
+    const playerDrive = (!flying && tank.alive) ? inp : IDLE;
+    const enemyDrive = (!paused && enemy.alive) ? ai.drive : IDLE;
+
+    if (!paused) {
+      acc += dt;
+      while (acc >= FIXED_DT) {
+        tank.physicsStep(FIXED_DT, playerDrive);
+        if (versus) enemy.physicsStep(FIXED_DT, enemyDrive);
+        world.step();
+        acc -= FIXED_DT;
+      }
     }
     props.sync();
+    if (!paused) {
+      planes.update(dt);
+      soldiers.update(dt);
+    }
 
     updateCamera(dt, inp);
     castFrom(camera.position, viewDir, 1200, aimPoint);
-    tank.update(dt, tank.alive ? aimPoint : null);
+    // Freefly owns the look — leave the turret alone so the hull doesn't track the ghost cam
+    if (!paused) tank.update(dt, tank.alive ? aimPoint : null);
     const m = tank.muzzle();
     castFrom(m.pos, m.dir, 1200, gunPoint);
 
-    if (inp.fire && tank.alive) {
+    if (inp.fire && tank.alive && !flying) {
       const shot = tank.tryFire();
       if (shot) {
         fx.fire({ ...shot, owner: tank.body });
@@ -480,7 +619,7 @@ async function main() {
       }
     }
 
-    if (versus) {
+    if (versus && !paused) {
       enemy.update(dt, enemy.alive ? ai.aimPoint : null);
       if (ai.wantsFire) {
         const shot = enemy.tryFire();
@@ -495,30 +634,39 @@ async function main() {
       tankFx(enemy, dt);
     }
 
-    // Roof .50 cal — hold RMB (or pad R1)
-    const mgFire = inp.mgFire && tank.alive;
-    sfx.setMgFire(mgFire);
+    // Roof .50 cal — player RMB/R1; enemy AI sprays sometimes while its main gun reloads
+    const mgFire = inp.mgFire && tank.alive && !flying;
+    const enemyMg = versus && !paused && enemy.alive && ai.wantsMg;
+    sfx.setMgFire(mgFire || enemyMg);
     if (mgFire) {
-      fx.setMgFlash(tank.mgMuzzle());
+      fx.setMgFlash(tank.mgMuzzle(), tank.body, 'player');
       input.rumble(0.12, 0.35, 50);
     } else {
-      fx.setMgFlash(null);
+      fx.setMgFlash(null, null, 'player');
     }
-    tankFx(tank, dt);
+    if (enemyMg) fx.setMgFlash(enemy.mgMuzzle(), enemy.body, 'enemy');
+    else fx.setMgFlash(null, null, 'enemy');
+    if (!paused) tankFx(tank, dt);
 
-    if (game.overT > 0) {
+    if (!paused && game.overT > 0) {
       game.overT -= dt;
       if (game.overT <= 0) restartGame({ resetCam: false });
     }
     updatePathLine();
-    fx.update(dt, heightAt);
-    grass.update(elapsed);
-    sfx.update(dt, {
-      speed: tank.forwardSpeed(),
-      throttle: tank.cmd.throttle,
-      maxSpeed: 12.5,
-      turretSlew: tank.turretSlew,
-    });
+    debug.update();
+    if (!paused) {
+      fx.update(dt, heightAt);
+      grass.update(elapsed);
+      vegetation?.update?.(elapsed);
+      sfx.update(dt, {
+        speed: tank.forwardSpeed(),
+        throttle: tank.cmd.throttle,
+        maxSpeed: 12.5,
+        turretSlew: tank.turretSlew,
+      });
+    } else {
+      sfx.update(dt, { speed: 0, throttle: 0, maxSpeed: 12.5, turretSlew: 0 });
+    }
     updateSun();
     updateHud(inp);
     hud.update(dt, camera);
@@ -527,7 +675,7 @@ async function main() {
   }
   requestAnimationFrame(frame);
   $('loading').remove();
-  window.__sherman = { tank, enemy, ai, nav, game, input, fx, tankCam, sfx, world, grass, vegetation, terrain, visuals };
+  window.__sherman = { tank, enemy, ai, nav, game, input, fx, tankCam, sfx, world, grass, vegetation, terrain, visuals, debug, fly, lightProbe, sky, planes, soldiers };
 }
 
 main().catch((e) => {

@@ -1,6 +1,46 @@
 // Shells (ballistic, raycast against the physics world), muzzle flash, impacts, smoke and track dust.
-// Bright parts are pushed well above 1.0 so the bloom pass picks them up.
-import * as THREE from 'three';
+// Selective emissive bloom: put glow energy in `emissive` / `emissiveNode`, not HDR `color`.
+import * as THREE from 'three/webgpu';
+import { texture, uniform } from 'three/tsl';
+import { heightAt as terrainHeightAt } from './terrain.js';
+
+/** Sprite that writes HDR into the emissive MRT (beauty via emissive add, not diffuse color). */
+function emissiveSpriteMat(map, hdr, opts = {}) {
+  const hdrCol = hdr.isColor ? hdr.clone() : new THREE.Color(hdr);
+  const uEm = uniform(hdrCol);
+  const mat = new THREE.SpriteNodeMaterial({
+    map: map ?? null,
+    color: new THREE.Color(0, 0, 0),
+    transparent: true,
+    depthWrite: false,
+    depthTest: opts.depthTest !== false,
+    blending: opts.additive ? THREE.AdditiveBlending : THREE.NormalBlending,
+    opacity: opts.opacity ?? 1,
+  });
+  mat.emissiveNode = map ? texture(map).rgb.mul(uEm) : uEm;
+  mat.userData.emissiveUniform = uEm;
+  return mat;
+}
+
+/** MeshBasic stand-in: black albedo + HDR emissive for selective bloom. */
+function emissiveBasicMat(hdr, opts = {}) {
+  const hdrCol = hdr.isColor ? hdr.clone() : new THREE.Color(hdr);
+  return new THREE.MeshStandardMaterial({
+    color: 0x000000,
+    emissive: hdrCol,
+    emissiveIntensity: 1,
+    map: opts.map ?? null,
+    emissiveMap: opts.map ?? null,
+    transparent: !!opts.transparent,
+    depthWrite: opts.depthWrite !== false,
+    depthTest: opts.depthTest !== false,
+    blending: opts.additive ? THREE.AdditiveBlending : THREE.NormalBlending,
+    side: opts.side ?? THREE.FrontSide,
+    toneMapped: false,
+    roughness: 1,
+    metalness: 0,
+  });
+}
 
 const GRAVITY = 9.81;
 const IMPACT_IMPULSE = 2500;
@@ -61,11 +101,16 @@ function radialTexture(stops) {
   return t;
 }
 
-function setFlipbookFrame(tex, cols, rows, frame) {
-  const col = frame % cols;
-  const row = Math.floor(frame / cols);
-  tex.offset.set(col / cols, 1 - (row + 1) / rows);
-  tex.updateMatrix();
+/** Blit one atlas cell into a canvas texture — reliable flipbook on WebGPU (offset/repeat is flaky). */
+function blitFlipbookFrame(fb, frame) {
+  if (frame === fb.frame) return;
+  fb.frame = frame;
+  const col = frame % fb.cols;
+  const row = Math.floor(frame / fb.cols);
+  const { ctx, cellW, cellH, atlasImg } = fb;
+  ctx.clearRect(0, 0, cellW, cellH);
+  ctx.drawImage(atlasImg, col * cellW, row * cellH, cellW, cellH, 0, 0, cellW, cellH);
+  fb.map.needsUpdate = true;
 }
 
 export class Effects {
@@ -80,13 +125,18 @@ export class Effects {
     this.onImpact = () => {};
     this.onShellHit = () => {};
     this.onMgShot = () => {};
+    this.onMgHit = () => {};
     this.groundExplosionAtlas = null;
     this.impactGlowTex = null;
 
     this.flashTex = radialTexture([[0, '#ffffff'], [0.25, '#ffd28a'], [0.6, 'rgba(255,120,30,0.35)'], [1, 'rgba(255,80,0,0)']]);
     this.smokeTex = radialTexture([[0, 'rgba(255,255,255,0.9)'], [0.5, 'rgba(255,255,255,0.35)'], [1, 'rgba(255,255,255,0)']]);
     this.shellGeo = new THREE.CylinderGeometry(0.05, 0.05, 1.6, 6).rotateZ(Math.PI / 2);
-    this.shellMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(14, 7, 2.5) });
+    // WebGL look: unlit HDR streak so beauty-buffer bloom picks it up (emissive-only was invisible).
+    this.shellMat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(14, 7, 2.5),
+      toneMapped: false,
+    });
     this.debrisGeo = new THREE.BoxGeometry(0.15, 0.15, 0.15);
     this.debrisMat = new THREE.MeshStandardMaterial({ color: 0x2b2418, roughness: 1 });
     // Tiny torn blades kicked up by tracks on meadows
@@ -120,16 +170,16 @@ export class Effects {
     });
     this._light = 0;
 
-    this.mgFlash = null; // set in load(): { star, plumes[2], light }
-    this._mgOn = false;
-    this._mgPose = null;
-    this._mgShotT = 0;
-    this._mgFlashAge = 1; // start hidden until first shot
-    this._mgRoll = 0;
+    this.mgFlash = null; // legacy single kit (player); enemy uses mgFlashB
+    this.mgFlashB = null;
+    // Active .50 streams: id → { pose, owner, shotT, flashAge, flash, roll }
+    this._mgStreams = new Map();
     this._mgUp = new THREE.Vector3();
     this._mgSide = new THREE.Vector3();
     this._mgSide2 = new THREE.Vector3();
     this._mgMat = new THREE.Matrix4();
+    this._mgRayOrigin = { x: 0, y: 0, z: 0 };
+    this._mgRayDir = { x: 1, y: 0, z: 0 };
   }
 
   async load() {
@@ -144,9 +194,7 @@ export class Effects {
     tex.magFilter = THREE.LinearFilter;
     tex.minFilter = THREE.LinearFilter;
     tex.generateMipmaps = false;
-    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(1 / GROUND_EXPLOSION.cols, 1 / GROUND_EXPLOSION.rows);
-    setFlipbookFrame(tex, GROUND_EXPLOSION.cols, GROUND_EXPLOSION.rows, 0);
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
     this.groundExplosionAtlas = tex;
 
     glowMap.colorSpace = THREE.SRGBColorSpace;
@@ -161,47 +209,50 @@ export class Effects {
     }
 
     // Camera-facing star + two barrel-aligned plumes crossed 90° (reads from all angles).
-    // Colors are >1 so bloom picks them up; +25% emissive punch.
-    const starMat = new THREE.SpriteMaterial({
-      map: starMap, color: new THREE.Color(2.2 * 1.25, 1.6 * 1.25, 0.7 * 1.25),
-      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-    });
-    const star = new THREE.Sprite(starMat);
-    star.scale.setScalar(MG_FLASH.starSize);
-    star.visible = false;
-    this.scene.add(star);
-
-    const plumeGeo = new THREE.PlaneGeometry(1, 1);
-    const plumes = [0, 1].map(() => {
-      const mat = new THREE.MeshBasicMaterial({
-        map: plumeMap, color: new THREE.Color(2.0 * 1.25, 1.4 * 1.25, 0.55 * 1.25),
-        transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-        side: THREE.DoubleSide,
+    // Two kits so player + enemy can spray at once.
+    const makeKit = () => {
+      const starMat = emissiveSpriteMat(
+        starMap,
+        new THREE.Color(2.2 * 1.25, 1.6 * 1.25, 0.7 * 1.25),
+        { additive: true },
+      );
+      const star = new THREE.Sprite(starMat);
+      star.scale.setScalar(MG_FLASH.starSize);
+      star.visible = false;
+      this.scene.add(star);
+      const plumeGeo = new THREE.PlaneGeometry(1, 1);
+      const plumes = [0, 1].map(() => {
+        const mat = emissiveBasicMat(new THREE.Color(2.0 * 1.25, 1.4 * 1.25, 0.55 * 1.25), {
+          map: plumeMap, transparent: true, depthWrite: false, additive: true, side: THREE.DoubleSide,
+        });
+        const mesh = new THREE.Mesh(plumeGeo, mat);
+        mesh.visible = false;
+        this.scene.add(mesh);
+        return mesh;
       });
-      // Plane local +Y = along barrel; texture core at bottom of image.
-      const mesh = new THREE.Mesh(plumeGeo, mat);
-      mesh.visible = false;
-      this.scene.add(mesh);
-      return mesh;
-    });
-
-    const light = new THREE.PointLight(0xffb060, 0, 18, 2);
-    this.scene.add(light);
-    this.mgFlash = { star, plumes, light };
+      const light = new THREE.PointLight(0xffb060, 0, 18, 2);
+      this.scene.add(light);
+      return { star, plumes, light };
+    };
+    this.mgFlash = makeKit();
+    this.mgFlashB = makeKit();
   }
 
-  _flashLight(pos, peak) {
+  _flashLight(pos, peak, { color = 0xffb060, distance = 40 } = {}) {
     const L = this.lights[this._light++ % this.lights.length];
     L.light.position.copy(pos);
+    L.light.color.set(color);
+    L.light.distance = distance;
     L.t = 0;
     L.peak = peak;
   }
 
   _sprite(tex, color, pos, size, life, opts = {}) {
-    const mat = new THREE.SpriteMaterial({
-      map: tex, color, transparent: true, depthWrite: false,
-      blending: opts.additive ? THREE.AdditiveBlending : THREE.NormalBlending,
-    });
+    const mat = opts.additive
+      ? emissiveSpriteMat(tex, color, { additive: true })
+      : new THREE.SpriteMaterial({
+        map: tex, color, transparent: true, depthWrite: false,
+      });
     const s = new THREE.Sprite(mat);
     s.position.copy(pos);
     s.scale.setScalar(size);
@@ -213,31 +264,39 @@ export class Effects {
   }
 
   /**
-   * Hold-to-fire .50 cal muzzle. Pass { pos, dir } each frame while firing, or null to stop.
-   * Flash blinks per round in update() — not a continuous glow.
+   * Hold-to-fire .50 cal. `id` isolates player vs enemy streams.
+   * Pass { pos, dir } each frame while firing, or null to stop.
+   * `owner` = firing tank rigid body (excluded from the bullet ray).
    */
-  setMgFlash(pose) {
-    const fx = this.mgFlash;
-    if (!fx) return;
-    const wasOn = this._mgOn;
-    this._mgOn = !!pose;
-    this._mgPose = pose;
+  setMgFlash(pose, owner = null, id = 'player') {
+    if (!this.mgFlash) return;
     if (!pose) {
-      fx.star.visible = false;
-      for (const p of fx.plumes) p.visible = false;
-      fx.light.intensity = 0;
-      this._mgFlashAge = 1;
+      const s = this._mgStreams.get(id);
+      if (s) {
+        s.flash.star.visible = false;
+        for (const p of s.flash.plumes) p.visible = false;
+        s.flash.light.intensity = 0;
+        this._mgStreams.delete(id);
+      }
       return;
     }
-    // Fire the first round immediately on press.
-    if (!wasOn) {
-      this._mgShotT = MG_FLASH.shotInterval;
-      this._mgFlashAge = 1;
+    let s = this._mgStreams.get(id);
+    if (!s) {
+      const flash = id === 'enemy' && this.mgFlashB ? this.mgFlashB : this.mgFlash;
+      s = {
+        pose, owner, flash,
+        shotT: MG_FLASH.shotInterval, // first round fires immediately
+        flashAge: 1,
+        roll: 0,
+      };
+      this._mgStreams.set(id, s);
+    } else {
+      s.pose = pose;
+      s.owner = owner;
     }
   }
 
-  _layoutMgFlash(pos, dir, visible) {
-    const fx = this.mgFlash;
+  _layoutMgFlash(fx, pos, dir, visible, roll) {
     fx.star.visible = visible;
     fx.star.position.copy(pos);
 
@@ -246,14 +305,13 @@ export class Effects {
     this._mgSide.crossVectors(dir, up).normalize();
     up.crossVectors(this._mgSide, dir).normalize();
 
-    // Roll the side/up frame so each shot’s cross lands at a slightly different angle.
-    const c = Math.cos(this._mgRoll), s = Math.sin(this._mgRoll);
-    const sx = this._mgSide.x * c + up.x * s;
-    const sy = this._mgSide.y * c + up.y * s;
-    const sz = this._mgSide.z * c + up.z * s;
-    const ux = -this._mgSide.x * s + up.x * c;
-    const uy = -this._mgSide.y * s + up.y * c;
-    const uz = -this._mgSide.z * s + up.z * c;
+    const c = Math.cos(roll), sn = Math.sin(roll);
+    const sx = this._mgSide.x * c + up.x * sn;
+    const sy = this._mgSide.y * c + up.y * sn;
+    const sz = this._mgSide.z * c + up.z * sn;
+    const ux = -this._mgSide.x * sn + up.x * c;
+    const uy = -this._mgSide.y * sn + up.y * c;
+    const uz = -this._mgSide.z * sn + up.z * c;
     this._mgSide.set(sx, sy, sz);
     up.set(ux, uy, uz);
 
@@ -274,21 +332,92 @@ export class Effects {
     fx.light.position.copy(pos).addScaledVector(dir, 0.3);
   }
 
-  _triggerMgShot() {
-    const fx = this.mgFlash;
-    const { pos, dir } = this._mgPose;
+  /** Hitscan .50 round — real physics ray so ricochets / damage line up with the barrel. */
+  _traceMgBullet(pos, dir, owner) {
+    const R = this.RAPIER;
+    const o = this._mgRayOrigin;
+    const d = this._mgRayDir;
+    o.x = pos.x; o.y = pos.y; o.z = pos.z;
+    d.x = dir.x; d.y = dir.y; d.z = dir.z;
+    const ray = new R.Ray(o, d);
+    const hit = this.world.castRayAndGetNormal(ray, 450, true, undefined, undefined, undefined, owner);
+    if (!hit) return;
+    const point = pos.clone().addScaledVector(dir, hit.timeOfImpact);
+    const normal = new THREE.Vector3(hit.normal.x, hit.normal.y, hit.normal.z);
+    // Ground/dirt: near terrain height with an upward face (keeps tank/barrel hits as metal sparks)
+    const dirt = Math.abs(point.y - terrainHeightAt(point.x, point.z)) < 0.35 && normal.y > 0.45;
+    this._mgImpactSparks(point, normal, dir, dirt);
+    this.onMgHit({
+      point,
+      collider: hit.collider,
+      owner,
+      dir: dir.clone(),
+      normal,
+    });
+  }
+
+  /** Impact sparks — white-hot on metal, fewer brown flecks on dirt. */
+  _mgImpactSparks(point, normal, dir, dirt = false) {
+    const nDot = dir.dot(normal);
+    const bounce = dir.clone().addScaledVector(normal, -2 * nDot);
+    if (bounce.lengthSq() < 1e-6) bounce.copy(normal);
+    else bounce.normalize();
+
+    this._flashLight(
+      point.clone().addScaledVector(normal, 0.15),
+      dirt ? 18 : 55,
+      { color: dirt ? 0x8a6230 : 0xffb060, distance: dirt ? 8 : 14 },
+    );
+
+    const n = dirt
+      ? 6 + Math.floor(Math.random() * 3)   // ~50% of metal count
+      : 12 + Math.floor(Math.random() * 6);
+    for (let i = 0; i < n; i++) {
+      const size = dirt ? 0.14 + Math.random() * 0.2 : 0.18 + Math.random() * 0.28;
+      const mat = emissiveSpriteMat(
+        this.flashTex,
+        dirt ? new THREE.Color(2.2, 1.2, 0.45) : new THREE.Color(14, 12, 6),
+        { additive: true },
+      );
+      const spark = new THREE.Sprite(mat);
+      spark.scale.setScalar(size);
+      spark.position.copy(point).addScaledVector(normal, 0.04 + Math.random() * 0.08);
+      this.scene.add(spark);
+      const along = dirt ? 5 + Math.random() * 9 : 10 + Math.random() * 18;
+      const spray = dirt ? 4 + Math.random() * 7 : 8 + Math.random() * 14;
+      const v = bounce.clone().multiplyScalar(along * (0.55 + Math.random() * 0.45))
+        .addScaledVector(normal, (dirt ? 1 : 2) + Math.random() * (dirt ? 4 : 7))
+        .add(new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.15, Math.random() - 0.5).multiplyScalar(spray));
+      this.particles.push({
+        obj: spark,
+        life: (dirt ? 0.22 : 0.28) + Math.random() * (dirt ? 0.35 : 0.45),
+        age: 0,
+        vel: v,
+        size,
+        spark: true,
+        // Dirt: brown → darker earth; metal keeps the default white→red fade in update()
+        sparkFrom: dirt ? [2.4, 1.25, 0.4] : null,
+        sparkTo: dirt ? [0.45, 0.22, 0.08] : null,
+      });
+    }
+  }
+
+  _triggerMgShot(stream) {
+    const fx = stream.flash;
+    const { pos, dir } = stream.pose;
     fx.star.material.rotation = Math.random() * Math.PI * 2;
-    this._mgRoll = Math.random() * Math.PI;
-    this._layoutMgFlash(pos, dir, true);
+    stream.roll = Math.random() * Math.PI;
+    this._layoutMgFlash(fx, pos, dir, true, stream.roll);
     const kick = 0.95 + Math.random() * 0.2;
     fx.star.scale.setScalar(MG_FLASH.starSize * kick);
     const ps = MG_FLASH.plumeSize * kick;
     for (const p of fx.plumes) p.scale.set(ps, ps, 1);
     fx.light.intensity = 22 + Math.random() * 14;
-    this._mgFlashAge = 0;
+    stream.flashAge = 0;
     this._mgSmoke(pos, dir);
     this._ejectMgBrass(pos, dir);
-    this.onMgShot();
+    this._traceMgBullet(pos, dir, stream.owner);
+    this.onMgShot({ owner: stream.owner });
   }
 
   /** One spent casing out the right side of the receiver per round. */
@@ -361,7 +490,8 @@ export class Effects {
     const fwd = pos.clone().addScaledVector(dir, 0.6);
     this._sprite(this.flashTex, new THREE.Color(30, 18, 8), fwd, 2.6, 0.09, { additive: true, grow: 1.6 });
     this._sprite(this.flashTex, new THREE.Color(14, 8, 3), pos.clone().addScaledVector(dir, 1.6), 1.6, 0.07, { additive: true });
-    this._flashLight(fwd, 60);
+    // Brief yellow muzzle spill (~4 m) — same pool as impact flashes, retargeted per shot.
+    this._flashLight(fwd, 45, { color: 0xffcc33, distance: 4 });
 
     // Placeholder anime-style muzzle plume: dense grey cloud at the breech that
     // billows out along the barrel, then hangs and rises. Replace later with real VFX.
@@ -371,7 +501,8 @@ export class Effects {
     side.crossVectors(dir, up).normalize();
     up.crossVectors(side, dir).normalize();
 
-    for (let i = 0; i < 22; i++) {
+    // −25% smoke count vs prior 22 / 8
+    for (let i = 0; i < 17; i++) {
       const along = 0.3 + Math.random() * 2.4;
       const spread = (0.4 + Math.random() * 1.1) * (0.35 + along * 0.25);
       const a = Math.random() * Math.PI * 2;
@@ -393,7 +524,7 @@ export class Effects {
       );
     }
     // Lingering core puff that stays near the muzzle and climbs
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 6; i++) {
       const v = new THREE.Vector3(
         (Math.random() - 0.5) * 0.8,
         1.2 + Math.random() * 1.6,
@@ -550,9 +681,7 @@ export class Effects {
     }
     for (let i = emit(4); i > 0; i--) {
       const size = 0.1 + Math.random() * 0.14;
-      const mat = new THREE.SpriteMaterial({
-        map: this.flashTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-      });
+      const mat = emissiveSpriteMat(this.flashTex, new THREE.Color(10, 10, 10), { additive: true });
       const spark = new THREE.Sprite(mat);
       spark.scale.setScalar(size);
       spark.position.copy(jitter(0.8));
@@ -564,20 +693,41 @@ export class Effects {
 
   _groundExplosion(point) {
     const cfg = GROUND_EXPLOSION;
-    if (!this.groundExplosionAtlas) return;
-    const map = this.groundExplosionAtlas.clone();
-    map.repeat.copy(this.groundExplosionAtlas.repeat);
-    setFlipbookFrame(map, cfg.cols, cfg.rows, 0);
+    const atlas = this.groundExplosionAtlas;
+    if (!atlas?.image) return;
+
+    const atlasImg = atlas.image;
+    const cellW = Math.floor(atlasImg.width / cfg.cols);
+    const cellH = Math.floor(atlasImg.height / cfg.rows);
+    const canvas = document.createElement('canvas');
+    canvas.width = cellW;
+    canvas.height = cellH;
+    const ctx = canvas.getContext('2d', { alpha: true });
+    const map = new THREE.CanvasTexture(canvas);
+    map.colorSpace = THREE.SRGBColorSpace;
+    map.magFilter = THREE.LinearFilter;
+    map.minFilter = THREE.LinearFilter;
+    map.generateMipmaps = false;
+
+    const flipbook = {
+      map, ctx, cellW, cellH, atlasImg,
+      cols: cfg.cols, rows: cfg.rows, frames: cfg.frameCount, fps: cfg.fps,
+      frame: -1, height: 0,
+    };
+    blitFlipbookFrame(flipbook, 0);
+
     const mat = new THREE.SpriteMaterial({
       map,
       color: new THREE.Color(1.35, 1.2, 0.95),
       transparent: true,
       depthWrite: false,
       opacity: 1,
+      toneMapped: false,
     });
     const s = new THREE.Sprite(mat);
     const w = cfg.width;
     const h = w / cfg.aspect;
+    flipbook.height = h;
     s.scale.set(w, h, 1);
     // Atlas cells are bottom-aligned; sprites are centered — lift so contact sits on the ground.
     s.position.set(point.x, point.y + h * 0.5, point.z);
@@ -585,7 +735,7 @@ export class Effects {
     const life = cfg.frameCount / cfg.fps;
     this.particles.push({
       obj: s, life, age: 0, vel: new THREE.Vector3(), grow: 1, size: w, fade: 1, drag: 0, rise: 0, opacity: 1,
-      flipbook: { map, cols: cfg.cols, rows: cfg.rows, frames: cfg.frameCount, fps: cfg.fps, height: h },
+      flipbook,
     });
   }
 
@@ -595,14 +745,8 @@ export class Effects {
     // Quick emissive glow-ball flash (placeholder texture, additive, fades over glowLife).
     if (this.impactGlowTex) {
       const glowSize = GROUND_EXPLOSION.glowSize;
-      const mat = new THREE.SpriteMaterial({
-        map: this.impactGlowTex,
-        color: new THREE.Color(21, 10.5, 2.4), // +50% emissive vs prior
-        transparent: true,
-        depthWrite: false,
-        depthTest: false,
-        blending: THREE.AdditiveBlending,
-        opacity: 1,
+      const mat = emissiveSpriteMat(this.impactGlowTex, new THREE.Color(21, 10.5, 2.4), {
+        additive: true, depthTest: false,
       });
       const glow = new THREE.Sprite(mat);
       glow.renderOrder = 5;
@@ -627,16 +771,9 @@ export class Effects {
     this._flashLight(point.clone().addScaledVector(normal, 1.5), 220);
 
     // Emissive sparks: fly out from center, bounce, white → red as they die.
-    for (let i = 0; i < 30; i++) {
-      const size = 0.45 + Math.random() * 0.55;
-      const mat = new THREE.SpriteMaterial({
-        map: this.flashTex,
-        color: new THREE.Color(10, 10, 10),
-        transparent: true,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-        opacity: 1,
-      });
+    for (let i = 0; i < 60; i++) {
+      const size = (0.45 + Math.random() * 0.55) * 0.5;
+      const mat = emissiveSpriteMat(this.flashTex, new THREE.Color(10, 10, 10), { additive: true });
       const spark = new THREE.Sprite(mat);
       spark.scale.setScalar(size);
       spark.position.copy(point).addScaledVector(normal, 0.5 + Math.random() * 0.4);
@@ -689,7 +826,7 @@ export class Effects {
       if (hit || s.age > 6) {
         if (hit) {
           const p = s.pos.clone().addScaledVector(dir, hit.timeOfImpact);
-          this.onShellHit({ point: p, collider: hit.collider, owner: s.owner });
+          this.onShellHit({ point: p, collider: hit.collider, owner: s.owner, dir });
           this._explode(p, new THREE.Vector3(hit.normal.x, hit.normal.y, hit.normal.z), dir, hit.collider);
         }
         this.scene.remove(s.mesh);
@@ -714,8 +851,8 @@ export class Effects {
           && p.obj.material !== this.grassBitMat
           && p.obj.material !== this.grassBitMatB
         ) {
-          // Flipbook maps are Texture.clone() of the shared atlas — don't dispose them
-          // or the atlas GPU texture gets wiped for every instance.
+          // Flipbook uses a per-burst CanvasTexture — dispose it. Shared atlas stays alive.
+          if (p.flipbook) p.flipbook.map.dispose();
           p.obj.material.dispose();
         }
         this.particles.splice(i, 1);
@@ -747,12 +884,15 @@ export class Effects {
           p.vel.z *= 0.55;
           p.vel.y = Math.abs(p.vel.y) * 0.5;
         }
-        // White → red, stay HDR-emissive the whole life.
-        p.obj.material.color.setRGB(
-          THREE.MathUtils.lerp(10, 8, k),
-          THREE.MathUtils.lerp(10, 0.55, k),
-          THREE.MathUtils.lerp(10, 0.06, k),
-        );
+        // Metal: white → red. Dirt: brown → dark earth. Stay emissive either way.
+        const from = p.sparkFrom ?? [10, 10, 10];
+        const to = p.sparkTo ?? [8, 0.55, 0.06];
+        const r = THREE.MathUtils.lerp(from[0], to[0], k);
+        const gC = THREE.MathUtils.lerp(from[1], to[1], k);
+        const b = THREE.MathUtils.lerp(from[2], to[2], k);
+        const em = p.obj.material.userData.emissiveUniform;
+        if (em) em.value.setRGB(r, gC, b);
+        else p.obj.material.color.setRGB(r, gC, b);
         p.obj.material.opacity = (1 - k) * (1 - k);
         p.obj.scale.setScalar(p.size * (1 - k * 0.65));
         continue;
@@ -760,10 +900,9 @@ export class Effects {
       if (p.flipbook) {
         const fb = p.flipbook;
         const frame = Math.min(fb.frames - 1, Math.floor(p.age * fb.fps));
-        setFlipbookFrame(fb.map, fb.cols, fb.rows, frame);
+        blitFlipbookFrame(fb, frame);
         // Soft fade on the last ~15% so the last sparse frames don't hard-cut.
-        const fade = k > 0.85 ? (1 - (k - 0.85) / 0.15) : 1;
-        p.obj.material.opacity = fade;
+        p.obj.material.opacity = k > 0.85 ? (1 - (k - 0.85) / 0.15) : 1;
         continue;
       }
       p.vel.multiplyScalar(Math.exp(-p.drag * dt));
@@ -782,23 +921,25 @@ export class Effects {
       L.light.intensity = L.t < 0.25 ? L.peak * (1 - L.t / 0.25) ** 2 : 0;
     }
 
-    if (this.mgFlash && this._mgOn && this._mgPose) {
-      this._mgShotT += dt;
-      if (this._mgShotT >= MG_FLASH.shotInterval) {
-        this._mgShotT -= MG_FLASH.shotInterval;
-        this._triggerMgShot();
+    for (const stream of this._mgStreams.values()) {
+      stream.shotT += dt;
+      if (stream.shotT >= MG_FLASH.shotInterval) {
+        stream.shotT -= MG_FLASH.shotInterval;
+        this._triggerMgShot(stream);
       } else {
-        this._layoutMgFlash(this._mgPose.pos, this._mgPose.dir, this._mgFlashAge < MG_FLASH.flashLife);
+        this._layoutMgFlash(
+          stream.flash, stream.pose.pos, stream.pose.dir,
+          stream.flashAge < MG_FLASH.flashLife, stream.roll,
+        );
       }
-      this._mgFlashAge += dt;
-      if (this._mgFlashAge >= MG_FLASH.flashLife) {
-        this.mgFlash.star.visible = false;
-        for (const p of this.mgFlash.plumes) p.visible = false;
-        this.mgFlash.light.intensity = 0;
+      stream.flashAge += dt;
+      if (stream.flashAge >= MG_FLASH.flashLife) {
+        stream.flash.star.visible = false;
+        for (const p of stream.flash.plumes) p.visible = false;
+        stream.flash.light.intensity = 0;
       } else {
-        // Hard blink: bright peak, then snuff out before the next round.
-        const k = this._mgFlashAge / MG_FLASH.flashLife;
-        this.mgFlash.light.intensity *= Math.max(0, 1 - k * k);
+        const k = stream.flashAge / MG_FLASH.flashLife;
+        stream.flash.light.intensity *= Math.max(0, 1 - k * k);
       }
     }
   }

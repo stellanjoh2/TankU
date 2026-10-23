@@ -18,18 +18,26 @@ function hydrate(json) {
   const g = json.ground;
   return {
     horizon: col(json.horizon),
-    zenith: col(json.zenith),
     fogNear: json.fogNear,
     fogFar: json.fogFar,
     elev: json.elev,
     az: json.az,
+    turbidity: json.turbidity ?? 10,
+    rayleigh: json.rayleigh ?? 3,
+    mieCoefficient: json.mieCoefficient ?? 0.005,
+    mieDirectionalG: json.mieDirectionalG ?? 0.7,
+    cloudCoverage: json.cloudCoverage ?? 0.4,
+    cloudDensity: json.cloudDensity ?? 0.4,
+    cloudElevation: json.cloudElevation ?? 0.5,
+    showSunDisc: json.showSunDisc ?? true,
+    toneExposure: json.toneExposure ?? 0.8,
     sunIntensity: json.sunIntensity,
     sunColor: col(json.sunColor),
-    skySun: col(json.skySun).multiplyScalar(6.5),
     hemiSky: col(json.hemiSky),
     hemiGround: col(json.hemiGround),
     hemiIntensity: json.hemiIntensity,
     ambient: json.ambient,
+    lightProbe: json.lightProbe ?? 1,
     env: json.env,
     ground: {
       grass: col(g.grass),
@@ -38,6 +46,7 @@ function hydrate(json) {
       sand: col(g.sand),
       wetSand: col(g.wetSand),
       rock: col(g.rock),
+      concrete: col(g.concrete ?? '#c4bda8'),
       water: col(g.water),
     },
     grassBase: col(json.grassBase),
@@ -72,16 +81,14 @@ function hydrate(json) {
  */
 export function createVisualsEditor(ctx) {
   const {
-    scene, sky, sun, sunDir, hemi, ambient,
+    renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe,
     terrain, grass, vegetation, post, shadowTint,
     getEnvIntensity, setEnvIntensity,
     initial = VISUAL_DEFAULTS,
     game = null,
   } = ctx;
 
-  const horizon = sky.material.uniforms.horizon.value;
-  const zenith = sky.material.uniforms.zenith.value;
-  const skySun = sky.material.uniforms.sunColor.value;
+  const fogColor = sky.userData.fogColor;
   const gU = grass.material.uniforms;
   const bloom = post.bloom;
   const grade = post.grade.uniforms;
@@ -94,24 +101,45 @@ export function createVisualsEditor(ctx) {
     const el = THREE.MathUtils.degToRad(elev);
     const a = THREE.MathUtils.degToRad(az);
     sunDir.set(Math.cos(el) * Math.cos(a), Math.sin(el), Math.cos(el) * Math.sin(a)).normalize();
-    sky.material.uniforms.sunDir.value.copy(sunDir);
+    sky.sunPosition.value.copy(sunDir);
+    terrain.water.sunDirection.value.copy(sunDir);
+  }
+
+  function applySky(s) {
+    sky.turbidity.value = s.turbidity;
+    sky.rayleigh.value = s.rayleigh;
+    sky.mieCoefficient.value = s.mieCoefficient;
+    sky.mieDirectionalG.value = s.mieDirectionalG;
+    sky.cloudCoverage.value = s.cloudCoverage;
+    sky.cloudDensity.value = s.cloudDensity;
+    sky.cloudElevation.value = s.cloudElevation;
+    sky.showSunDisc.value = s.showSunDisc ? 1 : 0;
+    if (renderer) renderer.toneMappingExposure = s.toneExposure;
   }
 
   function readState() {
     return {
-      horizon: horizon.clone(),
-      zenith: zenith.clone(),
+      horizon: fogColor.clone(),
       fogNear: scene.fog.near,
       fogFar: scene.fog.far,
       elev,
       az,
+      turbidity: sky.turbidity.value,
+      rayleigh: sky.rayleigh.value,
+      mieCoefficient: sky.mieCoefficient.value,
+      mieDirectionalG: sky.mieDirectionalG.value,
+      cloudCoverage: sky.cloudCoverage.value,
+      cloudDensity: sky.cloudDensity.value,
+      cloudElevation: sky.cloudElevation.value,
+      showSunDisc: !!sky.showSunDisc.value,
+      toneExposure: renderer?.toneMappingExposure ?? 0.8,
       sunIntensity: sun.intensity,
       sunColor: sun.color.clone(),
-      skySun: skySun.clone(),
       hemiSky: hemi.color.clone(),
       hemiGround: hemi.groundColor.clone(),
       hemiIntensity: hemi.intensity,
       ambient: ambient.intensity,
+      lightProbe: lightProbe?.intensity ?? 0,
       env: getEnvIntensity(),
       ground: {
         grass: terrain.palette.grass.clone(),
@@ -120,6 +148,7 @@ export function createVisualsEditor(ctx) {
         sand: terrain.palette.sand.clone(),
         wetSand: terrain.palette.wetSand.clone(),
         rock: terrain.palette.rock.clone(),
+        concrete: terrain.palette.concrete.clone(),
         water: terrain.palette.water.clone(),
       },
       grassBase: gU.uBaseColor.value.clone(),
@@ -150,8 +179,7 @@ export function createVisualsEditor(ctx) {
   }
 
   function writeState(s) {
-    horizon.copy(s.horizon);
-    zenith.copy(s.zenith);
+    fogColor.copy(s.horizon);
     scene.fog.color.copy(s.horizon);
     scene.fog.near = s.fogNear;
     scene.fog.far = s.fogFar;
@@ -159,13 +187,14 @@ export function createVisualsEditor(ctx) {
     elev = s.elev;
     az = s.az;
     applySunDir();
+    applySky(s);
     sun.intensity = s.sunIntensity;
     sun.color.copy(s.sunColor);
-    skySun.copy(s.skySun);
     hemi.color.copy(s.hemiSky);
     hemi.groundColor.copy(s.hemiGround);
     hemi.intensity = s.hemiIntensity;
     ambient.intensity = s.ambient;
+    if (lightProbe) lightProbe.intensity = s.lightProbe ?? 1;
     setEnvIntensity(s.env);
     terrain.setPalette(s.ground);
     grass.setColors({
@@ -175,6 +204,7 @@ export function createVisualsEditor(ctx) {
       intensity: s.grassIntensity,
     });
     gU.uWindAmp.value = s.wind;
+    vegetation?.setWind?.(s.wind);
     vegetation?.setPalmAmount?.(s.palmAmount ?? 1);
     vegetation?.setPlantAmount?.(s.plantAmount ?? 1);
     vegetation?.setPalmBrightness?.(s.palmBrightness ?? 1);
@@ -206,19 +236,26 @@ export function createVisualsEditor(ctx) {
     const c = (col) => `#${col.getHexString()}`;
     return {
       horizon: c(s.horizon),
-      zenith: c(s.zenith),
       fogNear: s.fogNear,
       fogFar: s.fogFar,
       elev: s.elev,
       az: s.az,
+      turbidity: s.turbidity,
+      rayleigh: s.rayleigh,
+      mieCoefficient: s.mieCoefficient,
+      mieDirectionalG: s.mieDirectionalG,
+      cloudCoverage: s.cloudCoverage,
+      cloudDensity: s.cloudDensity,
+      cloudElevation: s.cloudElevation,
+      showSunDisc: s.showSunDisc,
+      toneExposure: s.toneExposure,
       sunIntensity: s.sunIntensity,
       sunColor: c(s.sunColor),
-      // stored ×6.5 in the shader; export matches the colour-picker hex
-      skySun: c(s.skySun.clone().multiplyScalar(1 / 6.5)),
       hemiSky: c(s.hemiSky),
       hemiGround: c(s.hemiGround),
       hemiIntensity: s.hemiIntensity,
       ambient: s.ambient,
+      lightProbe: s.lightProbe,
       env: s.env,
       ground: {
         grass: c(s.ground.grass),
@@ -227,6 +264,7 @@ export function createVisualsEditor(ctx) {
         sand: c(s.ground.sand),
         wetSand: c(s.ground.wetSand),
         rock: c(s.ground.rock),
+        concrete: c(s.ground.concrete),
         water: c(s.ground.water),
       },
       grassBase: c(s.grassBase),
@@ -361,17 +399,39 @@ export function createVisualsEditor(ctx) {
     const s = addSection('Game');
     addToggle(s, 'Solo (no enemy)', game.getSolo, game.setSolo);
     addToggle(s, 'Show AI path', game.getShowPath, game.setShowPath);
+    if (game.getMusicMuted && game.setMusicMuted) {
+      addToggle(s, 'Mute music', game.getMusicMuted, game.setMusicMuted);
+    }
+    if (game.getMusicVolume && game.setMusicVolume) {
+      addSlider(s, 'Music volume', 0, 1, 0.01, game.getMusicVolume, game.setMusicVolume);
+    }
+    if (game.getDebug && game.setDebug) {
+      addToggle(s, 'Debug (F3)', game.getDebug, game.setDebug);
+    }
+    if (game.getFly && game.setFly) {
+      addToggle(s, 'Freefly / photomode (F)', game.getFly, game.setFly);
+    }
+    if (game.getFlyFov && game.setFlyFov) {
+      addSlider(s, 'Photomode FOV', 15, 120, 1, game.getFlyFov, game.setFlyFov);
+    }
+    if (game.getFlyTilt && game.setFlyTilt) {
+      addSlider(s, 'Photomode tilt', -45, 45, 1, game.getFlyTilt, game.setFlyTilt);
+    }
+    if (post.motionBlur) {
+      addToggle(s, 'Motion blur',
+        () => post.motionBlur.enabled,
+        (v) => { post.motionBlur.enabled = v; });
+    }
   }
 
-  // Sky & fog
+  // Sky & fog (SkyMesh / webgpu_sky params)
   {
     const s = addSection('Sky & fog');
-    addColor(s, 'Horizon', () => hexOf(horizon), (v) => {
-      horizon.set(v);
-      scene.fog.color.copy(horizon);
-      grass.setFog(horizon);
+    addColor(s, 'Fog colour', () => hexOf(fogColor), (v) => {
+      fogColor.set(v);
+      scene.fog.color.copy(fogColor);
+      grass.setFog(fogColor);
     });
-    addColor(s, 'Zenith', () => hexOf(zenith), (v) => zenith.set(v));
     addSlider(s, 'Fog near', 10, 200, 1, () => scene.fog.near, (v) => {
       scene.fog.near = v;
       grass.setFog(undefined, v, undefined);
@@ -379,6 +439,33 @@ export function createVisualsEditor(ctx) {
     addSlider(s, 'Fog far', 40, 500, 1, () => scene.fog.far, (v) => {
       scene.fog.far = v;
       grass.setFog(undefined, undefined, v);
+    });
+    addSlider(s, 'Turbidity', 0, 20, 0.1, () => sky.turbidity.value, (v) => {
+      sky.turbidity.value = v;
+    });
+    addSlider(s, 'Rayleigh', 0, 4, 0.001, () => sky.rayleigh.value, (v) => {
+      sky.rayleigh.value = v;
+    });
+    addSlider(s, 'Mie coeff', 0, 0.1, 0.001, () => sky.mieCoefficient.value, (v) => {
+      sky.mieCoefficient.value = v;
+    });
+    addSlider(s, 'Mie G', 0, 1, 0.001, () => sky.mieDirectionalG.value, (v) => {
+      sky.mieDirectionalG.value = v;
+    });
+    addSlider(s, 'Tone exposure', 0, 1, 0.01, () => renderer.toneMappingExposure, (v) => {
+      renderer.toneMappingExposure = v;
+    });
+    addToggle(s, 'Sun disc', () => !!sky.showSunDisc.value, (v) => {
+      sky.showSunDisc.value = v ? 1 : 0;
+    });
+    addSlider(s, 'Cloud coverage', 0, 1, 0.01, () => sky.cloudCoverage.value, (v) => {
+      sky.cloudCoverage.value = v;
+    });
+    addSlider(s, 'Cloud density', 0, 1, 0.01, () => sky.cloudDensity.value, (v) => {
+      sky.cloudDensity.value = v;
+    });
+    addSlider(s, 'Cloud elevation', 0, 1, 0.01, () => sky.cloudElevation.value, (v) => {
+      sky.cloudElevation.value = v;
     });
   }
 
@@ -388,11 +475,10 @@ export function createVisualsEditor(ctx) {
     addSlider(s, 'Height', 2, 88, 1, () => elev, (v) => { elev = v; applySunDir(); });
     addSlider(s, 'Azimuth', -180, 180, 1, () => az, (v) => { az = v; applySunDir(); });
     addSlider(s, 'Strength', 0, 8, 0.05, () => sun.intensity, (v) => { sun.intensity = v; });
-    addColor(s, 'Sun colour', () => hexOf(sun.color), (v) => sun.color.set(v));
-    addColor(s, 'Sky disc', () => {
-      const t = skySun.clone().multiplyScalar(1 / 6.5);
-      return hexOf(t);
-    }, (v) => { skySun.set(v).multiplyScalar(6.5); });
+    addColor(s, 'Sun colour', () => hexOf(sun.color), (v) => {
+      sun.color.set(v);
+      terrain.water.sunColor.value.copy(sun.color);
+    });
     addSlider(s, 'Shadow strength', 0, 1, 0.02, () => sun.shadow.intensity, (v) => {
       sun.shadow.intensity = v;
     });
@@ -402,11 +488,16 @@ export function createVisualsEditor(ctx) {
   // Fill
   {
     const s = addSection('Fill light');
+    if (lightProbe) {
+      addSlider(s, 'Light probe', 0, 2, 0.02, () => lightProbe.intensity, (v) => {
+        lightProbe.intensity = v;
+      });
+    }
+    addSlider(s, 'Env map', 0, 2, 0.02, getEnvIntensity, setEnvIntensity);
     addColor(s, 'Hemi sky', () => hexOf(hemi.color), (v) => hemi.color.set(v));
     addColor(s, 'Hemi ground', () => hexOf(hemi.groundColor), (v) => hemi.groundColor.set(v));
     addSlider(s, 'Hemi strength', 0, 2, 0.02, () => hemi.intensity, (v) => { hemi.intensity = v; });
     addSlider(s, 'Ambient', 0, 1, 0.01, () => ambient.intensity, (v) => { ambient.intensity = v; });
-    addSlider(s, 'Env light', 0, 1.5, 0.02, getEnvIntensity, setEnvIntensity);
   }
 
   // Ground
@@ -419,6 +510,7 @@ export function createVisualsEditor(ctx) {
       ['sand', 'Sand'],
       ['wetSand', 'Wet sand'],
       ['rock', 'Rock'],
+      ['concrete', 'Concrete'],
       ['water', 'Water'],
     ]) {
       addColor(s, label, () => hexOf(terrain.palette[key]), (v) => terrain.setPalette({ [key]: v }));
@@ -434,7 +526,10 @@ export function createVisualsEditor(ctx) {
     addSlider(s, 'Brightness', 0.2, 2.5, 0.05, () => gU.uGrassLightIntensity.value, (v) => {
       grass.setColors({ intensity: v });
     });
-    addSlider(s, 'Wind', 0, 0.15, 0.005, () => gU.uWindAmp.value, (v) => { gU.uWindAmp.value = v; });
+    addSlider(s, 'Wind strength', 0, 0.15, 0.005, () => gU.uWindAmp.value, (v) => {
+      gU.uWindAmp.value = v;
+      vegetation?.setWind?.(v);
+    });
   }
 
   // Vegetation (palms / tropical pack)
@@ -522,6 +617,7 @@ export function createVisualsEditor(ctx) {
     get open() { return open; },
     setOpen,
     toggle() { setOpen(!open); },
+    syncUi,
     exportSettings,
   };
 }

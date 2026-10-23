@@ -1,108 +1,30 @@
-// Adapted from https://github.com/thebenezer/FluffyGrass (MIT).
-// Standalone ShaderMaterial so we don't fight three@0.186 MeshLambert chunk changes.
-import * as THREE from 'three';
+// TSL grass for WebGPU — UV flip, tip/base colors, alpha discard, world wind, shadow receive.
+import * as THREE from 'three/webgpu';
+import {
+  uv, texture, vec2, vec3, vec4, float, mix, uniform, sin, exp, dot, normalize,
+  positionLocal, modelWorldMatrix, modelWorldMatrixInverse,
+  normalView, diffuseColor, BRDF_Lambert,
+} from 'three/tsl';
 import { shadowTint } from './shadowTint.js';
 
-const vertexShader = /* glsl */ `
-  precision highp float;
-
-  uniform float uTime;
-  uniform float uHeightAmp;
-  uniform float uWindAmp;
-  uniform float uTerrainSize;
-  uniform float uNoiseScale;
-  uniform sampler2D uNoiseTexture;
-
-  varying vec2 vGrassUv;
-  varying vec2 vGlobalUV;
-  varying float vFogDepth;
-
-  #include <common>
-  #include <shadowmap_pars_vertex>
-
-  void main() {
-    vec3 pos = position;
-    #ifdef USE_INSTANCING
-      pos = (instanceMatrix * vec4(pos, 1.0)).xyz;
-    #endif
-
-    vec4 worldPosition = modelMatrix * vec4(pos, 1.0);
-    vGlobalUV = (uTerrainSize - worldPosition.xz) / uTerrainSize;
-
-    vec4 noise = texture2D(uNoiseTexture, vGlobalUV + uTime * 0.0008);
-    float tip = 1.0 - uv.y;
-    float sinWave = sin(
-      28.0 * dot(normalize(vec2(1.0, 0.65)), vGlobalUV)
-      + noise.g * 4.0
-      + uTime * 0.85
-    ) * uWindAmp * tip;
-    worldPosition.x += sinWave;
-    worldPosition.z += sinWave;
-    worldPosition.y += exp(texture2D(uNoiseTexture, vGlobalUV * uNoiseScale).r) * uHeightAmp * tip;
-
-    vec4 mvPosition = viewMatrix * worldPosition;
-    gl_Position = projectionMatrix * mvPosition;
-
-    vGrassUv = vec2(uv.x, 1.0 - uv.y);
-    vFogDepth = -mvPosition.z;
-
-    // Manual shadow coords — geometry has normals (HAS_NORMAL) but we don't run
-    // defaultnormal_vertex, so shadowmap_vertex would fail on transformedNormal.
-    // Light.normalBias already handles acne; grass blades are thin receivers.
-    #if defined( USE_SHADOWMAP ) && ( NUM_DIR_LIGHT_SHADOWS > 0 )
-      #pragma unroll_loop_start
-      for ( int i = 0; i < NUM_DIR_LIGHT_SHADOWS; i ++ ) {
-        vDirectionalShadowCoord[ i ] = directionalShadowMatrix[ i ] * worldPosition;
-      }
-      #pragma unroll_loop_end
-    #endif
+/** Two-sided wrapped diffuse — crossed billboard cards never go black when facing away from the sun. */
+class GrassLightingModel extends THREE.PhongLightingModel {
+  constructor() {
+    super(false);
   }
-`;
 
-const fragmentShader = /* glsl */ `
-  precision highp float;
-
-  uniform vec3 uBaseColor;
-  uniform vec3 uTipColor1;
-  uniform vec3 uTipColor2;
-  uniform sampler2D uGrassAlphaTexture;
-  uniform sampler2D uNoiseTexture;
-  uniform float uNoiseScale;
-  uniform float uGrassLightIntensity;
-  uniform vec3 fogColor;
-  uniform float fogNear;
-  uniform float fogFar;
-  uniform vec3 shadowTint;
-
-  varying vec2 vGrassUv;
-  varying vec2 vGlobalUV;
-  varying float vFogDepth;
-
-  #include <common>
-  #include <packing>
-
-  uniform bool receiveShadow;
-
-  #include <shadowmap_pars_fragment>
-  #include <shadowmask_pars_fragment>
-
-  void main() {
-    float alpha = texture2D(uGrassAlphaTexture, vGrassUv).r;
-    if (alpha < 0.15) discard;
-
-    vec3 tipColor = mix(uTipColor1, uTipColor2, texture2D(uNoiseTexture, vGlobalUV * uNoiseScale).r);
-    vec3 color = mix(uBaseColor, tipColor, vGrassUv.y) * uGrassLightIntensity;
-
-    // Unlit grass has no ambient fill — floor shadow at 50% so blades stay readable.
-    float sm = mix(0.5, 1.0, getShadowMask());
-    color *= mix(shadowTint, vec3(1.0), sm);
-
-    float fogFactor = smoothstep(fogNear, fogFar, vFogDepth);
-    color = mix(color, fogColor, fogFactor);
-
-    gl_FragColor = vec4(color, 1.0);
+  direct({ lightDirection, lightColor, reflectedLight }) {
+    const wrap = float(0.4);
+    const ndotl = normalView.dot(lightDirection).abs();
+    const diffuse = ndotl.add(wrap).div(wrap.add(1.0)).clamp();
+    const irradiance = diffuse.mul(lightColor);
+    reflectedLight.directDiffuse.addAssign(
+      irradiance.mul(BRDF_Lambert({ diffuseColor: diffuseColor.rgb })),
+    );
   }
-`;
+}
+
+const grassLighting = new GrassLightingModel();
 
 export class GrassMaterial {
   constructor({
@@ -116,43 +38,59 @@ export class GrassMaterial {
     fogNear = 70,
     fogFar = 240,
   } = {}) {
-    this.uniforms = THREE.UniformsUtils.merge([
-      THREE.UniformsLib.lights,
-      {
-        uTime: { value: 0 },
-        uHeightAmp: { value: heightAmp },
-        uWindAmp: { value: windAmp },
-        uTerrainSize: { value: terrainSize },
-        uNoiseScale: { value: 1.2 },
-        uGrassLightIntensity: { value: 1.35 },
-        uBaseColor: { value: new THREE.Color(baseColor) },
-        uTipColor1: { value: new THREE.Color(tipColor1) },
-        uTipColor2: { value: new THREE.Color(tipColor2) },
-        uNoiseTexture: { value: null },
-        uGrassAlphaTexture: { value: null },
-        fogColor: { value: fogColor.isColor ? fogColor : new THREE.Color(fogColor) },
-        fogNear: { value: fogNear },
-        fogFar: { value: fogFar },
-      },
-    ]);
-    // Shared with MeshStandard tint patch — must not be cloned by merge.
-    this.uniforms.shadowTint = shadowTint;
+    const base = new THREE.Color(baseColor);
+    const tip1 = new THREE.Color(tipColor1);
+    const tip2 = new THREE.Color(tipColor2);
+    const fogCol = fogColor.isColor ? fogColor : new THREE.Color(fogColor);
 
-    this.material = new THREE.ShaderMaterial({
-      uniforms: this.uniforms,
-      vertexShader,
-      fragmentShader,
-      lights: true,
+    this.uniforms = {
+      uTime: { value: 0 },
+      uHeightAmp: { value: heightAmp },
+      uWindAmp: { value: windAmp },
+      uTerrainSize: { value: terrainSize },
+      uNoiseScale: { value: 1.2 },
+      uGrassLightIntensity: { value: 1.35 },
+      uBaseColor: { value: base },
+      uTipColor1: { value: tip1 },
+      uTipColor2: { value: tip2 },
+      uNoiseTexture: { value: null },
+      uGrassAlphaTexture: { value: null },
+      fogColor: { value: fogCol },
+      fogNear: { value: fogNear },
+      fogFar: { value: fogFar },
+      shadowTint,
+    };
+
+    this._uTime = uniform(0);
+    this._uHeightAmp = uniform(heightAmp);
+    this._uWindAmp = uniform(windAmp);
+    this._uTerrainSize = uniform(terrainSize);
+    this._uNoiseScale = uniform(1.2);
+    this._uIntensity = uniform(1.35);
+    this._uBase = uniform(base);
+    this._uTip1 = uniform(tip1);
+    this._uTip2 = uniform(tip2);
+    this._alphaTex = null;
+    this._noiseTex = null;
+
+    // Lambert so InstancedMesh receiveShadow works (MeshBasic is unlit).
+    this.material = new THREE.MeshLambertNodeMaterial({
       side: THREE.DoubleSide,
-      // Opaque + discard (not transparent blending) — sorts correctly with the terrain.
       transparent: false,
       depthWrite: true,
-      fog: false, // fog applied manually to match scene Fog ranges
+      fog: true,
     });
+    this.material.setupLightingModel = () => grassLighting;
   }
 
   update(time) {
     this.uniforms.uTime.value = time;
+    this._uTime.value = time;
+    this._uHeightAmp.value = this.uniforms.uHeightAmp.value;
+    this._uWindAmp.value = this.uniforms.uWindAmp.value;
+    this._uTerrainSize.value = this.uniforms.uTerrainSize.value;
+    this._uNoiseScale.value = this.uniforms.uNoiseScale.value;
+    this._uIntensity.value = this.uniforms.uGrassLightIntensity.value;
   }
 
   setupTextures(grassAlpha, noise) {
@@ -162,7 +100,43 @@ export class GrassMaterial {
     noise.wrapS = noise.wrapT = THREE.RepeatWrapping;
     noise.colorSpace = THREE.NoColorSpace;
     noise.needsUpdate = true;
+
     this.uniforms.uGrassAlphaTexture.value = grassAlpha;
     this.uniforms.uNoiseTexture.value = noise;
+    this._alphaTex = texture(grassAlpha);
+    this._noiseTex = texture(noise);
+
+    // Same flip as the old GLSL: vGrassUv = vec2(uv.x, 1.0 - uv.y)
+    const grassUv = vec2(uv().x, float(1).sub(uv().y));
+    const tipBlend = this._noiseTex.sample(grassUv.mul(this._uNoiseScale)).r;
+    const tipColor = mix(this._uTip1, this._uTip2, tipBlend);
+    const albedo = mix(this._uBase, tipColor, grassUv.y).mul(this._uIntensity);
+
+    this.material.colorNode = albedo;
+    this.material.opacityNode = this._alphaTex.sample(grassUv).r;
+    this.material.alphaTestNode = float(0.15);
+
+    // World-space wind (same math as prior FluffyGrass GLSL).
+    const worldPos = modelWorldMatrix.mul(vec4(positionLocal, 1.0)).xyz.toVar();
+    const globalUV = vec2(
+      this._uTerrainSize.sub(worldPos.x),
+      this._uTerrainSize.sub(worldPos.z),
+    ).div(this._uTerrainSize);
+
+    const windNoise = this._noiseTex.sample(globalUV.add(this._uTime.mul(0.0008)));
+    const tip = float(1).sub(uv().y);
+    const windDir = normalize(vec2(1.0, 0.65));
+    const sinWave = sin(
+      float(28).mul(dot(windDir, globalUV))
+        .add(windNoise.g.mul(4))
+        .add(this._uTime.mul(0.85)),
+    ).mul(this._uWindAmp).mul(tip);
+
+    const heightNoise = this._noiseTex.sample(globalUV.mul(this._uNoiseScale)).r;
+    worldPos.assign(worldPos.add(vec3(sinWave, exp(heightNoise).mul(this._uHeightAmp).mul(tip), sinWave)));
+
+    this.material.positionNode = modelWorldMatrixInverse.mul(vec4(worldPos, 1.0)).xyz;
+
+    this.material.needsUpdate = true;
   }
 }

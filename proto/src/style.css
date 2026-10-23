@@ -10,6 +10,7 @@ canvas { display: block; }
 .overlay-inner {
   display: flex; flex-direction: column; align-items: center; gap: 18px; text-align: center;
 }
+.overlay-hint { font-size: 12px; opacity: 0.55; letter-spacing: 0.06em; }
 #reset-cam, #restart-game {
   pointer-events: auto; cursor: pointer; font: inherit; letter-spacing: 0.04em;
   color: #e8e4d8; background: rgba(0, 0, 0, 0.55); border: 1px solid rgba(232, 228, 216, 0.35);

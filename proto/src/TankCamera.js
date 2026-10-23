@@ -27,16 +27,18 @@ export const CAMERA_CONFIG = {
   reverseThreshold: 1.5,     // m/s before reverse counts as reversing
 
   // ---------- Turret influence ----------
-  turretFollowWeight: 0.45,  // 0 = camera ignores turret, 1 = camera fully follows turret yaw
-  turretLookWeight: 0.85,    // how much the LOOK target aims along the turret (0 = tank heading)
-  turretYawLambda: 6.0,      // smoothing for turret-driven aim
-  turretSwingRollDeg: 2.5,   // extra roll when turret slews quickly
-  turretSwingOffset: 0.8,    // sideways camera shift (m) while turret slews
+  // Hull-locked chase: cam stays mostly behind the hull so big mouse turns don't orbit the world.
+  // Look still tracks the gun (soft lag). Tiny follow + light slew cues keep it from feeling bolted on.
+  turretFollowWeight: 0.1,   // 0 = camera ignores turret, 1 = camera fully follows turret yaw
+  turretLookWeight: 0.92,    // how much the LOOK target aims along the turret (0 = tank heading)
+  turretYawLambda: 4.8,      // smoothing for turret-driven aim (lower = floatier)
+  turretSwingRollDeg: 1.1,   // extra roll when turret slews quickly
+  turretSwingOffset: 0.28,   // sideways camera shift (m) while turret slews
   // Gun elev (lookPitch): gentle vertical react — raise look when aiming up, drop cam slightly
   turretPitchFollow: 0.32,   // 0..1 how much gun pitch tilts the view after lookAt
-  turretPitchLookWeight: 0.5,// how strongly look-at Y follows gun elev (× lookAhead)
+  turretPitchLookWeight: 0.55,// how strongly look-at Y follows gun elev (× lookAhead)
   turretPitchHeight: 0.55,   // metres of camera Y shift per radian of gun elev (down when aiming up)
-  turretPitchLambda: 4.5,    // damp rate for gun-elev follow (lower = floatier)
+  turretPitchLambda: 4.0,    // damp rate for gun-elev follow (lower = floatier)
 
   // ---------- Steering tilt / lean ----------
   maxRollDeg: 4.5,           // horizon roll into turns at full steer + speed
@@ -87,7 +89,10 @@ export const CAMERA_CONFIG = {
   minDistance: 2.0,          // never closer than this to pivot
 
   // ---------- Misc ----------
-  maxDt: 1 / 30,             // clamps big frame hitches
+  // Match main's frame dt cap. Do NOT clamp tighter (e.g. 1/30): exp damping is
+  // already stable for large dt, and under-damping on slow frames lets the chase
+  // pivot trail the tank so the cam "drifts away" until FPS recovers.
+  maxDt: 0.1,
   near: 0.1,
   far: 1000,
 };
@@ -155,6 +160,8 @@ export class TankCamera {
     this.kickReturnStart = 0;
     this.kickReturnLen = 0;
     this.kickRollSign = 1;
+    this.kickDirectional = false;
+    this.kickPush = new THREE.Vector3(); // world XZ shove (hit impulse); fire kick leaves this unused
 
     this.trauma = 0;
     this.time = 0;
@@ -170,8 +177,11 @@ export class TankCamera {
 
   setColliders(objects) { this.colliders = objects; }
 
-  /** Ease into peak shove, then ease-out return landing at `returnDuration` (reload). */
-  kick(strength = 1, returnDuration = null) {
+  /**
+   * Ease into peak shove, then ease-out return landing at `returnDuration` (reload).
+   * Pass `worldDir` (shell travel) to shove along the hit impulse instead of camera-back recoil.
+   */
+  kick(strength = 1, returnDuration = null, worldDir = null) {
     const total = Math.max(1e-4, returnDuration ?? this.cfg.kickReturnDuration);
     const attack = Math.min(this.cfg.kickAttackDuration, total * 0.45);
     this.kickPeak = strength;
@@ -183,6 +193,15 @@ export class TankCamera {
     this.kickReturnStart = 0;
     this.kickReturnLen = 0;
     this.kickRollSign = Math.random() < 0.5 ? -1 : 1;
+    if (worldDir) {
+      this.kickPush.copy(worldDir).setY(0);
+      const len = this.kickPush.length();
+      this.kickDirectional = len > 1e-6;
+      if (this.kickDirectional) this.kickPush.multiplyScalar(1 / len);
+    } else {
+      this.kickDirectional = false;
+      this.kickPush.set(0, 0, 0);
+    }
     this.addShake(this.cfg.kickShake * strength);
   }
 
@@ -206,6 +225,8 @@ export class TankCamera {
     this.kickTotalDuration = 0;
     this.kickReturnStart = 0;
     this.kickReturnLen = 0;
+    this.kickDirectional = false;
+    this.kickPush.set(0, 0, 0);
     this.trauma = 0;
     this.collisionDist = Infinity;
     this.roll = 0;
@@ -309,8 +330,13 @@ export class TankCamera {
     // ----- build desired camera position -----
     fwd(this.yaw, this._f);
     right(this.yaw, this._r);
-    const kickBack = this.kickX * c.kickDistance;
-    let dist = this.distance + kickBack;
+    // Fire: shove back along view. Hit: shove along shell travel (away from where it came).
+    const kickAmt = this.kickX * c.kickDistance;
+    let dist = this.distance + (this.kickDirectional ? 0 : kickAmt);
+    if (this.kickDirectional && this.kickX > 0) {
+      const side = this.kickPush.dot(this._r);
+      if (Math.abs(side) > 0.05) this.kickRollSign = Math.sign(side);
+    }
 
     const pivotCopy = this._pivotWorld.copy(this.pivot);
     pivotCopy.y += c.pivotHeight;
@@ -321,6 +347,9 @@ export class TankCamera {
       .addScaledVector(this._r, this.lateral + this.slew * c.turretSwingOffset);
     // Aim up → cam drops a touch; aim down → rises (keeps hull framed)
     this._desired.y += height - this.gunPitch * c.turretPitchHeight;
+    if (this.kickDirectional && kickAmt > 0) {
+      this._desired.addScaledVector(this.kickPush, kickAmt);
+    }
 
     if (c.collisionEnabled && this.colliders.length) {
       this._dir.subVectors(this._desired, pivotCopy);

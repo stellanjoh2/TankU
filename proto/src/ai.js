@@ -84,6 +84,7 @@ export class TankAI {
     this.drive = { throttle: 0, turn: 0, boost: false };
     this.aimPoint = new THREE.Vector3();
     this.wantsFire = false;
+    this.wantsMg = false;
     this.exposure = new Int8Array(nav.n * nav.n);
     this.exposureFrom = { x: Infinity, z: Infinity };
     this.pos = new THREE.Vector3();
@@ -117,6 +118,8 @@ export class TankAI {
     this.reactT = 0;
     this.cooldown = rnd(2, 3.5);
     this.shotsAt = 0;
+    this.mgBurstT = 0;
+    this.mgCool = rnd(0.8, 1.8);
     this.blockedT = 0;
     this.holdT = 0;
     this.hideFor = 1;
@@ -186,6 +189,7 @@ export class TankAI {
     this.enemyPos.set(e.x, e.y, e.z);
 
     this.wantsFire = false;
+    this.wantsMg = false;
     if (halt || !this.tank.alive) {
       this.drive.throttle = this.drive.turn = 0;
       this.drive.boost = false;
@@ -202,6 +206,7 @@ export class TankAI {
     this._steer(dt);
     this._aim(dt);
     this._trigger(dt);
+    this._triggerMg(dt);
     this._flipCheck(dt);
   }
 
@@ -680,5 +685,34 @@ export class TankAI {
     } else {
       this.blockedT += dt;
     }
+  }
+
+  /**
+   * Occasional .50 bursts while the main gun reloads — not every reload, short sprays
+   * when the roof gun is roughly on the player.
+   */
+  _triggerMg(dt) {
+    this.mgCool -= dt;
+    if (this.mgBurstT > 0) {
+      this.mgBurstT -= dt;
+      if (this.visible && this.enemy.alive && this.tank.reload > 0.15) this.wantsMg = true;
+      return;
+    }
+    if (!this.visible || !this.enemy.alive || this.tank.reload <= 0.2) return;
+    if (this.mgCool > 0 || this.seenFor < 0.4) return;
+    // Skip most reload windows so it stays an accent, not a constant hose
+    if (Math.random() > 0.38) {
+      this.mgCool = rnd(0.5, 1.2);
+      return;
+    }
+    const { pos, dir } = this.tank.mgMuzzle();
+    const to = _t.set(this.enemyPos.x, this.enemyPos.y + this.aimH, this.enemyPos.z).sub(pos);
+    if (to.lengthSq() < 1 || dir.angleTo(to) > 0.4) {
+      this.mgCool = rnd(0.25, 0.6);
+      return;
+    }
+    this.mgBurstT = rnd(0.35, 0.85);
+    this.mgCool = rnd(1.4, 2.8);
+    this.wantsMg = true;
   }
 }

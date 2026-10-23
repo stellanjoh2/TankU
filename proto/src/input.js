@@ -13,7 +13,7 @@ function stick(x, y) {
 }
 
 const NEUTRAL = Object.freeze({
-  throttle: 0, turn: 0, boost: false,
+  throttle: 0, turn: 0, boost: false, ascend: 0,
   aimX: 0, aimY: 0, fire: false, mgFire: false, zoom: 0, zoomHold: false,
   padPressed: Object.freeze([]), pad: null,
 });
@@ -35,6 +35,8 @@ export class Input {
 
     addEventListener('keydown', (e) => {
       if (!e.repeat) this.onPress(e.code);
+      // Keep F3 from opening the browser Find UI when we use it as debug toggle
+      if (e.code === 'F3') e.preventDefault();
       if (this.enabled) this.keys.add(e.code);
     });
     addEventListener('keyup', (e) => this.keys.delete(e.code));
@@ -103,6 +105,7 @@ export class Input {
     const k = (c) => this.keys.has(c);
     let throttle = (k('KeyW') || k('ArrowUp') ? 1 : 0) - (k('KeyS') || k('ArrowDown') ? 1 : 0);
     let turn = (k('KeyD') || k('ArrowRight') ? 1 : 0) - (k('KeyA') || k('ArrowLeft') ? 1 : 0);
+    let ascend = (k('Space') || k('KeyE') ? 1 : 0) - (k('ControlLeft') || k('ControlRight') || k('KeyQ') || k('KeyC') ? 1 : 0);
     let boost = k('ShiftLeft') || k('ShiftRight');
     let aimX = this.mouseDX * MOUSE_SENS;
     let aimY = this.mouseDY * MOUSE_SENS;
@@ -120,6 +123,9 @@ export class Input {
       const b = (i) => pad.buttons[i] ? pad.buttons[i].value : 0;
       if (Math.abs(ly) > Math.abs(throttle)) throttle = -ly;
       if (Math.abs(lx) > Math.abs(turn)) turn = lx;
+      // face buttons: X/□ up, A/✕ down (indices 3 / 0 on standard mapping)
+      const padUp = b(3) - b(0);
+      if (Math.abs(padUp) > Math.abs(ascend)) ascend = padUp;
       aimX += rx * PAD_AIM_SPEED * dt;
       aimY += ry * PAD_AIM_SPEED * dt;
       boost ||= b(4) > 0.5 || b(10) > 0.5;
@@ -131,6 +137,6 @@ export class Input {
         this._padButtons[i] = btn.pressed;
       });
     }
-    return { throttle, turn, boost, aimX, aimY, fire, mgFire, zoom, zoomHold, padPressed: pressed, pad };
+    return { throttle, turn, ascend, boost, aimX, aimY, fire, mgFire, zoom, zoomHold, padPressed: pressed, pad };
   }
 }

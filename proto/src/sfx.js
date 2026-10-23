@@ -2,7 +2,9 @@
 // + looping drive (Sounds/187676__qubodup__driving-tank-engine.flac)
 // + .50 cal loop (Sounds/581771__hz37__machine-gun-hza-01-08-2021.wav, silence trimmed)
 // + turret traverse (Sounds/171657__qubodup__tank-or-tower-turret-moving-and-turning.flac)
-// + tank-on-tank hit (Sounds/337875__newagesoup__small-metal-hit-12.wav).
+// + first-hit armor clang (Sounds/435681__eben-frostey__metallic-clang.mp3)
+// + MG metal hit (Sounds/446128__justinvoke__metal-clank-4.wav — pitched-down variants)
+// + in-game music (Sounds/Steel and Silence.mp3).
 const SHOT_URLS = [
   './sounds/tank_shot_1.wav',
   './sounds/tank_shot_2.wav',
@@ -11,8 +13,20 @@ const SHOT_URLS = [
 const ENGINE_URL = './sounds/tank_engine.wav';
 const MG50_URL = './sounds/mg50_loop.wav';
 const TURRET_URL = './sounds/turret_loop.wav';
-const HIT_URL = './sounds/metal_hit.wav';
-// Playback rate offset for left (−) / right (+); ~1.5 semitones each way
+const HIT_URL = './sounds/metallic_clang.mp3';
+const MG_CLANK_URL = './sounds/mg_metal_clank.wav';
+// Four pitched-down rates (−1 / −2.5 / −4 / −6 semitones) × 0.45 (−55% total) + tiny jitter
+const MG_CLANK_RATES = [
+  Math.pow(2, -1 / 12) * 0.45,
+  Math.pow(2, -2.5 / 12) * 0.45,
+  Math.pow(2, -4 / 12) * 0.45,
+  Math.pow(2, -6 / 12) * 0.45,
+];
+const MG_CLANK_DB = Math.pow(10, -3 / 20); // −3 dB
+const MUSIC_URL = './sounds/steel_and_silence.mp3';
+const MUSIC_VOL_DEFAULT = 0.35; // ~25% above prior 0.28
+// Base rate (+20% vs sample); L/R offset ~1.5 semitones each way
+const TURRET_BASE = 1.2;
 const TURRET_PITCH = 0.09;
 
 const damp = (a, b, lambda, dt) => a + (b - a) * (1 - Math.exp(-lambda * dt));
@@ -25,9 +39,13 @@ export class Sfx {
     this.mgBuf = null;
     this.turretBuf = null;
     this.hitBuf = null;
+    this.mgClankBuf = null;
+    this.musicBuf = null;
     this.ready = false;
     this._last = -1;
+    this._ricoLast = -1;
     this._hitCool = 0;
+    this._ricoCool = 0;
     this._active = new Set(); // retain one-shots until onended (avoids GC cutting tails)
     this._engine = null;
     this._engineGain = null;
@@ -40,7 +58,11 @@ export class Sfx {
     this._turret = null;
     this._turretGain = null;
     this._turretVol = 0;
-    this._turretRate = 1;
+    this._turretRate = TURRET_BASE;
+    this._music = null;
+    this._musicGain = null;
+    this._musicMuted = false;
+    this._musicVol = MUSIC_VOL_DEFAULT;
   }
 
   async load() {
@@ -50,18 +72,22 @@ export class Sfx {
       const res = await fetch(url);
       return this.ctx.decodeAudioData(await res.arrayBuffer());
     };
-    const [shots, engine, mg, turret, hit] = await Promise.all([
+    const [shots, engine, mg, turret, hit, mgClank, music] = await Promise.all([
       Promise.all(SHOT_URLS.map(decode)),
       decode(ENGINE_URL),
       decode(MG50_URL),
       decode(TURRET_URL),
       decode(HIT_URL),
+      decode(MG_CLANK_URL),
+      decode(MUSIC_URL),
     ]);
     this.shots = shots;
     this.engineBuf = engine;
     this.mgBuf = mg;
     this.turretBuf = turret;
     this.hitBuf = hit;
+    this.mgClankBuf = mgClank;
+    this.musicBuf = music;
     this.ready = true;
   }
 
@@ -70,6 +96,38 @@ export class Sfx {
     if (!this.ctx) return;
     if (this.ctx.state === 'suspended') this.ctx.resume();
     this._ensureEngine();
+    this._ensureMusic();
+  }
+
+  get musicMuted() { return this._musicMuted; }
+  get musicVolume() { return this._musicVol; }
+
+  setMusicMuted(on) {
+    this._musicMuted = !!on;
+    this._applyMusicGain();
+  }
+
+  setMusicVolume(v) {
+    this._musicVol = Math.max(0, Math.min(1, Number(v) || 0));
+    this._applyMusicGain();
+  }
+
+  _applyMusicGain() {
+    if (!this._musicGain) return;
+    this._musicGain.gain.value = this._musicMuted ? 0 : this._musicVol;
+  }
+
+  _ensureMusic() {
+    if (!this.ready || !this.musicBuf || this._music) return;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.musicBuf;
+    src.loop = true;
+    const g = this.ctx.createGain();
+    g.gain.value = this._musicMuted ? 0 : this._musicVol;
+    src.connect(g).connect(this.ctx.destination);
+    src.start();
+    this._music = src;
+    this._musicGain = g;
   }
 
   _ensureEngine() {
@@ -105,8 +163,8 @@ export class Sfx {
   }
 
   /**
-   * Tank-on-tank (or similar) metal hit. Call when you hit another tank or get hit.
-   * `intensity` 0..1 scales volume; light pitch variance so repeats don't machine-gun.
+   * Armor clang on a main-gun tank hit. `intensity` 0..1 scales volume
+   * (pass distance falloff from the listener); light pitch variance so repeats don't stack.
    */
   hit(intensity = 1) {
     if (!this.ready || !this.hitBuf) return;
@@ -115,14 +173,39 @@ export class Sfx {
     const t = Math.max(0, Math.min(1, intensity));
     const src = this.ctx.createBufferSource();
     src.buffer = this.hitBuf;
-    src.playbackRate.value = 0.94 + Math.random() * 0.12;
+    src.playbackRate.value = 0.96 + Math.random() * 0.08;
     const g = this.ctx.createGain();
-    g.gain.value = 0.35 + t * 0.55;
+    g.gain.value = 0.25 + t * 0.75;
     src.connect(g).connect(this.ctx.destination);
     this._active.add(src);
     src.onended = () => this._active.delete(src);
     src.start();
-    this._hitCool = 0.08; // short debounce for contact chatter
+    this._hitCool = 0.08;
+  }
+
+  /**
+   * .50 cal metal clank — one source, 4 pitched-down variants (avoid repeat),
+   * short cool so traced MG hits still read as a spray.
+   */
+  ricochet(intensity = 1) {
+    if (!this.ready || !this.mgClankBuf) return;
+    if (this._ricoCool > 0) return;
+    this.unlock();
+    let i = Math.floor(Math.random() * MG_CLANK_RATES.length);
+    if (i === this._ricoLast) i = (i + 1) % MG_CLANK_RATES.length;
+    this._ricoLast = i;
+    const t = Math.max(0, Math.min(1, intensity));
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.mgClankBuf;
+    // Base variant + tiny jitter so identical picks still differ slightly
+    src.playbackRate.value = MG_CLANK_RATES[i] * (0.98 + Math.random() * 0.04);
+    const g = this.ctx.createGain();
+    g.gain.value = (0.28 + t * 0.55) * MG_CLANK_DB;
+    src.connect(g).connect(this.ctx.destination);
+    this._active.add(src);
+    src.onended = () => this._active.delete(src);
+    src.start();
+    this._ricoCool = 0.035;
   }
 
   _ensureMg() {
@@ -171,6 +254,7 @@ export class Sfx {
   update(dt, { speed = 0, throttle = 0, maxSpeed = 12.5, turretSlew = 0 } = {}) {
     if (!this.ready) return;
     if (this._hitCool > 0) this._hitCool = Math.max(0, this._hitCool - dt);
+    if (this._ricoCool > 0) this._ricoCool = Math.max(0, this._ricoCool - dt);
     this._ensureEngine();
     if (this._engine && this._engineGain) {
       const absSpd = Math.abs(speed);
@@ -208,9 +292,10 @@ export class Sfx {
       const slewT = Math.max(-1, Math.min(1, turretSlew / 0.7));
       const moving = Math.abs(slewT) > 0.04;
       if (moving) this.unlock();
-      const targetVol = moving ? 0.28 + Math.abs(slewT) * 0.22 : 0;
+      // −4 dB vs prior levels (× 10^(−4/20) ≈ 0.631)
+      const targetVol = moving ? 0.177 + Math.abs(slewT) * 0.139 : 0;
       // left (− pitch) / right (+ pitch)
-      const targetRate = 1 - slewT * TURRET_PITCH;
+      const targetRate = TURRET_BASE - slewT * TURRET_PITCH;
       this._turretVol = damp(this._turretVol, targetVol, moving ? 14 : 8, dt);
       this._turretRate = damp(this._turretRate, targetRate, 10, dt);
       this._turretGain.gain.value = this._turretVol;

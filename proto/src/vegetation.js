@@ -3,11 +3,11 @@
 import * as THREE from 'three';
 import { PropertyBinding } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { SIZE, WATER_Y, heightAt, shoreSigned } from './terrain.js';
+import { SIZE, WATER_Y, heightAt, shoreSigned, isOnRoad, isAirfield } from './terrain.js';
 
 const PREFABS = {
   Palm_01: { kind: 'tree', weight: 1.0 },
-  Palm_02: { kind: 'tree', weight: 0.85 },
+  // Palm_02 omitted: heavily bent trunk (~51° lean)
   Palm_03: { kind: 'tree', weight: 0.9 },
   Palm_04: { kind: 'tree', weight: 0.95 },
   Rocks_low: { kind: 'rock', weight: 1.2 },
@@ -41,14 +41,20 @@ const SPAWN_CLEAR = 14;
 const HALF = SIZE * 0.5;
 
 const CLUSTER_COUNT = 32;
-const ROCK_SCATTER = 14;
-const MAX_PLACED = 520;
+// Gray-rock piles: few sites, many stones packed tight (reads as intentional outcrops).
+const ROCK_GROUPS = 10;
+const ROCK_GROUP_SPACING = 32;
+const ROCK_GROUP_MEMBERS = [4, 7]; // inclusive range
+const ROCK_PACK = [0.55, 2.4];     // metres from group centre
+const MAX_PLACED = 620;
 
-// Tank-sized cover: same rock prefabs, scaled so the Sherman (~2.9 m tall) can hide behind them.
-const COVER_ROCKS = 28;
+// Tank-sized cover: clustered into small outcrops (total count −20% vs original 28).
+const COVER_ROCKS = 22;
+const COVER_GROUP_SIZE = [2, 3];
+const COVER_GROUP_SPACING = 28;
+const COVER_PACK = [2.5, 6.5];
 const COVER_HEIGHT = [3.4, 4.8];
 const COVER_MAX_FOOTPRINT = 15;
-const COVER_SPACING = 15;
 const COVER_SPAWN_CLEAR = 18;
 const PALM_TRUNK_R = 0.4;
 
@@ -57,13 +63,19 @@ export const PALM_AMOUNT_DEFAULT = 1;
 const BASE_PALM_TARGET = 35;
 const MAX_PALM_TARGET = Math.ceil(BASE_PALM_TARGET * 2);
 
-/** Default visible ground-plant count. Slider 1.0 = this; pool is 2× for headroom. */
+/** Default visible ground-plant count (+25% vs prior 200). Slider 1.0 = this; pool is 2× for headroom. */
 export const PLANT_AMOUNT_DEFAULT = 1;
-const BASE_PLANT_TARGET = 200;
+const BASE_PLANT_TARGET = 250;
 const MAX_PLANT_TARGET = Math.ceil(BASE_PLANT_TARGET * 2);
 
 export const FOLIAGE_BRIGHTNESS_DEFAULT = 1;
 export const PALM_BRIGHTNESS_DEFAULT = 1;
+/** Same units as grass `uWindAmp` (visuals Wind strength). */
+export const WIND_DEFAULT = 0.085;
+/** Radians of whole-tree lean per unit of wind amp. */
+const PALM_WIND_LEAN = 1.35;
+/** Radians of big-leaf / bush lean per unit of wind amp (shorter plants → less lean). */
+const PLANT_WIND_LEAN = 0.7;
 
 function seededRand(seed) {
   let s = seed >>> 0;
@@ -212,6 +224,7 @@ function canPlaceTree(x, z) {
   if (heightAt(x, z) < WATER_Y + 0.4) return false;
   if (slopeAt(x, z) > 0.12) return false;
   if (nearSpawn(x, z)) return false;
+  if (isAirfield(x, z)) return false;
   return true;
 }
 
@@ -221,6 +234,7 @@ function canPlacePlant(x, z) {
   if (heightAt(x, z) < WATER_Y + 0.25) return false;
   if (slopeAt(x, z) > 0.28) return false;
   if (nearSpawn(x, z)) return false;
+  if (isAirfield(x, z)) return false;
   return true;
 }
 
@@ -229,6 +243,8 @@ function canPlaceRock(x, z) {
   if (shore < 1.5) return false;
   if (heightAt(x, z) < WATER_Y + 0.05) return false;
   if (nearSpawn(x, z)) return false;
+  if (isAirfield(x, z)) return false;
+  if (isOnRoad(x, z, 1.5)) return false; // keep the mud track clear of gray rocks
   return true;
 }
 
@@ -237,6 +253,8 @@ function canPlaceCover(x, z) {
   if (heightAt(x, z) < WATER_Y + 1) return false;
   if (slopeAt(x, z, 2) > 0.1) return false;
   if (Math.hypot(x - SPAWN.x, z - SPAWN.z) < COVER_SPAWN_CLEAR) return false;
+  if (isAirfield(x, z)) return false;
+  if (isOnRoad(x, z, 3.5)) return false;
   return true;
 }
 
@@ -259,6 +277,9 @@ function lowestGround(x, z, radius) {
  *   setPlantAmount: (v: number) => void,
  *   getFoliageBrightness: () => number,
  *   setFoliageBrightness: (v: number) => void,
+ *   getWind: () => number,
+ *   setWind: (v: number) => void,
+ *   update: (time: number) => void,
  * }>}
  */
 export async function buildVegetation(scene, { RAPIER, world }) {
@@ -310,6 +331,7 @@ export async function buildVegetation(scene, { RAPIER, world }) {
   let plantAmount = PLANT_AMOUNT_DEFAULT;
   let foliageBrightness = FOLIAGE_BRIGHTNESS_DEFAULT;
   let palmBrightness = PALM_BRIGHTNESS_DEFAULT;
+  let windAmp = WIND_DEFAULT;
 
   function collisionRadius(item, scale) {
     const kind = item.meta.kind;
@@ -333,21 +355,51 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     });
 
     const yaw = rand() * Math.PI * 2;
-    // Rocks: bury ≥25% of height so they never float.
+    // Rocks: bury 50% of height so they sit in the ground, not float.
     const y =
       item.meta.kind === 'rock'
-        ? heightAt(x, z) - item.height * scale * 0.25
+        ? lowestGround(x, z, r * 0.6) - item.height * scale * 0.5
         : heightAt(x, z);
     inst.position.set(x, y, z);
     inst.rotation.y = yaw;
     inst.scale.setScalar(scale);
     inst.userData.kind = item.meta.kind;
+    if (item.meta.kind === 'tree' || item.meta.kind === 'plant') {
+      inst.userData.windPhase = rand() * Math.PI * 2;
+      inst.userData.yaw = yaw;
+    }
     root.add(inst);
     placed.push({ x, z, r });
     count++;
     if (item.meta.kind === 'tree') palms.push(inst);
     if (item.meta.kind === 'plant') plants.push(inst);
     return true;
+  }
+
+  function setWind(v) {
+    windAmp = THREE.MathUtils.clamp(v, 0, 0.15);
+  }
+
+  function update(time) {
+    // Lean the whole prefab (trunk + crown / stem + leaves). Don't rotate leaf
+    // meshes alone — their local origin isn't at the stem tip.
+    const palmLean = windAmp * PALM_WIND_LEAN;
+    for (const p of palms) {
+      if (!p.visible) continue;
+      const ph = p.userData.windPhase ?? 0;
+      p.rotation.y = p.userData.yaw ?? p.rotation.y;
+      p.rotation.x = Math.sin(time * 0.95 + ph) * palmLean;
+      p.rotation.z = Math.sin(time * 1.15 + ph * 1.7) * palmLean * 0.85;
+    }
+    const plantLean = windAmp * PLANT_WIND_LEAN;
+    for (const p of plants) {
+      if (!p.visible) continue;
+      const ph = p.userData.windPhase ?? 0;
+      p.rotation.y = p.userData.yaw ?? p.rotation.y;
+      // Slightly faster sway than palms — big leaves catch gusts quicker.
+      p.rotation.x = Math.sin(time * 1.35 + ph) * plantLean;
+      p.rotation.z = Math.sin(time * 1.55 + ph * 1.9) * plantLean * 0.9;
+    }
   }
 
   function applyPalmVisibility() {
@@ -408,8 +460,8 @@ export async function buildVegetation(scene, { RAPIER, world }) {
   for (const c of clusterCenters) {
     const treeOk = canPlaceTree(c.x, c.z);
     const nTrees = treeOk ? 1 + (rand() < 0.55 ? 1 : 0) : 0;
-    const nRocks = rand() < 0.55 ? 1 + Math.floor(rand() * 2) : 0;
     const nPlants = 6 + Math.floor(rand() * 10);
+    // Rocks are placed as dedicated piles below — not sprinkled into every bush cluster.
 
     if (nTrees > 0 && canPlaceTree(c.x, c.z) && palms.length < MAX_PALM_TARGET) {
       placeOne(pickWeighted(catalog.tree, rand), c.x, c.z, 0.9 + rand() * 0.25);
@@ -425,17 +477,6 @@ export async function buildVegetation(scene, { RAPIER, world }) {
         if (!canPlaceTree(x, z)) continue;
         placedTree = placeOne(item, x, z, 0.85 + rand() * 0.3);
       }
-    }
-
-    for (let i = 0; i < nRocks; i++) {
-      const item = pickWeighted(catalog.rock, rand);
-      const jitter = 0.8 + rand() * 4.0;
-      const a = rand() * Math.PI * 2;
-      const x = c.x + Math.cos(a) * jitter;
-      const z = c.z + Math.sin(a) * jitter;
-      if (!canPlaceRock(x, z)) continue;
-      const s = (0.55 + rand() * 0.55) * ROCK_SCALE;
-      placeOne(item, x, z, s);
     }
 
     for (let i = 0; i < nPlants && plants.length < MAX_PLANT_TARGET; i++) {
@@ -474,44 +515,57 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     placeOne(pickWeighted(catalog.plant, rand), x, z, 0.7 + rand() * 0.5);
   }
 
-  // --- Extra rock clusters on slopes / inland ---
+  // --- Gray-rock outcrops: tight piles, sites spaced far apart ---
+  const rockGroupCenters = [];
   let rockTries = 0;
-  let rockPlaced = 0;
-  while (rockPlaced < ROCK_SCATTER && rockTries < ROCK_SCATTER * 50) {
+  let rockGroups = 0;
+  let rockStoneCount = 0;
+  while (rockGroups < ROCK_GROUPS && rockTries < ROCK_GROUPS * 80) {
     rockTries++;
     const x = (rand() * 2 - 1) * (HALF - 10);
     const z = (rand() * 2 - 1) * (HALF - 10);
     if (!canPlaceRock(x, z)) continue;
     const shore = shoreSigned(x, z);
     const slope = slopeAt(x, z);
+    // Prefer slopes / inland edges — outcrops, not meadow sprinkle
     if (shore < 8 && slope < 0.1) continue;
+    if (rockGroupCenters.some((c) => Math.hypot(c.x - x, c.z - z) < ROCK_GROUP_SPACING)) continue;
 
-    const members = 2 + Math.floor(rand() * 3);
+    const members = ROCK_GROUP_MEMBERS[0]
+      + Math.floor(rand() * (ROCK_GROUP_MEMBERS[1] - ROCK_GROUP_MEMBERS[0] + 1));
     let got = 0;
     for (let i = 0; i < members; i++) {
       const item = pickWeighted(catalog.rock, rand);
       const a = rand() * Math.PI * 2;
-      const d = i === 0 ? 0 : 1.2 + rand() * 3.2;
+      // Pack tight: first stone at centre, rest in a small ring
+      const d = i === 0 ? 0 : ROCK_PACK[0] + rand() * (ROCK_PACK[1] - ROCK_PACK[0]);
       const px = x + Math.cos(a) * d;
       const pz = z + Math.sin(a) * d;
       if (!canPlaceRock(px, pz)) continue;
-      const base = item.name.includes('002') ? 0.45 + rand() * 0.35 : 0.5 + rand() * 0.6;
+      const base = item.name.includes('002') ? 0.45 + rand() * 0.35 : 0.55 + rand() * 0.55;
       if (placeOne(item, px, pz, base * ROCK_SCALE)) got++;
     }
-    if (got) rockPlaced++;
+    if (got >= 3) {
+      rockGroupCenters.push({ x, z });
+      rockGroups++;
+      rockStoneCount += got;
+    }
   }
 
-  // --- Big cover rocks (own RNG so the layout above stays identical) ---
+  // --- Big cover rocks: 2–3 boulders per outcrop ---
   const coverRoot = new THREE.Group();
   coverRoot.name = 'CoverRocks';
   scene.add(coverRoot);
   const coverRocks = [];
+  const coverGroupCenters = [];
   const crand = seededRand(0x51c0ffee);
   const v = new THREE.Vector3();
 
   function addCoverRock(item, x, z, scale, yaw) {
     const hx = item.size.x * 0.5 * scale, hz = item.size.z * 0.5 * scale;
-    const y = lowestGround(x, z, Math.min(hx, hz) * 0.8) - 0.25;
+    const rockH = item.height * scale;
+    // Bury 50% so big cover stones don't float on uneven ground
+    const y = lowestGround(x, z, Math.min(hx, hz) * 0.8) - rockH * 0.5;
     const inst = item.template.clone(true);
     inst.position.set(x, y, z);
     inst.rotation.y = yaw;
@@ -547,16 +601,35 @@ export async function buildVegetation(scene, { RAPIER, world }) {
   }
 
   let coverTries = 0;
-  while (coverRocks.length < COVER_ROCKS && coverTries++ < COVER_ROCKS * 120) {
-    const x = (crand() * 2 - 1) * (HALF - 14);
-    const z = (crand() * 2 - 1) * (HALF - 14);
-    if (!canPlaceCover(x, z)) continue;
-    if (coverRocks.some((r) => Math.hypot(r.x - x, r.z - z) < COVER_SPACING)) continue;
-    if (palms.some((p) => Math.hypot(p.position.x - x, p.position.z - z) < 7)) continue;
-    const item = pickWeighted(catalog.rock, crand);
-    const targetH = THREE.MathUtils.lerp(COVER_HEIGHT[0], COVER_HEIGHT[1], crand());
-    const scale = Math.min(targetH / item.size.y, COVER_MAX_FOOTPRINT / (item.radius * 2));
-    addCoverRock(item, x, z, scale, crand() * Math.PI * 2);
+  while (coverRocks.length < COVER_ROCKS && coverTries++ < COVER_ROCKS * 100) {
+    const cx = (crand() * 2 - 1) * (HALF - 14);
+    const cz = (crand() * 2 - 1) * (HALF - 14);
+    if (!canPlaceCover(cx, cz)) continue;
+    if (coverGroupCenters.some((c) => Math.hypot(c.x - cx, c.z - cz) < COVER_GROUP_SPACING)) continue;
+    if (palms.some((p) => Math.hypot(p.position.x - cx, p.position.z - cz) < 7)) continue;
+
+    const want = COVER_GROUP_SIZE[0]
+      + Math.floor(crand() * (COVER_GROUP_SIZE[1] - COVER_GROUP_SIZE[0] + 1));
+    let got = 0;
+    for (let i = 0; i < want && coverRocks.length < COVER_ROCKS; i++) {
+      const a = crand() * Math.PI * 2;
+      const d = i === 0 ? 0 : COVER_PACK[0] + crand() * (COVER_PACK[1] - COVER_PACK[0]);
+      const x = cx + Math.cos(a) * d;
+      const z = cz + Math.sin(a) * d;
+      if (!canPlaceCover(x, z)) continue;
+      if (coverRocks.some((r) => Math.hypot(r.x - x, r.z - z) < 3.5)) continue;
+      const item = pickWeighted(catalog.rock, crand);
+      const targetH = THREE.MathUtils.lerp(COVER_HEIGHT[0], COVER_HEIGHT[1], crand());
+      // Slight size variety inside a pile (hero boulder + satellites)
+      const sizeMul = i === 0 ? 1 : 0.72 + crand() * 0.22;
+      const scale = Math.min(
+        (targetH * sizeMul) / item.size.y,
+        COVER_MAX_FOOTPRINT / (item.radius * 2),
+      );
+      addCoverRock(item, x, z, scale, crand() * Math.PI * 2);
+      got++;
+    }
+    if (got > 0) coverGroupCenters.push({ x: cx, z: cz });
   }
 
   // Palm trunk feet in world space (the crowns lean, so the bbox centre isn't the trunk).
@@ -583,7 +656,8 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     `[vegetation] ${count} instances (` +
       `${palms.length} palms pooled, ${Math.round(BASE_PALM_TARGET * palmAmount)} visible; ` +
       `${plants.length} plants pooled, ${Math.round(BASE_PLANT_TARGET * plantAmount)} visible) + ` +
-      `${rockPlaced} rock groups + ${coverRocks.length} cover rocks`,
+      `${rockGroups} gray-rock piles (${rockStoneCount} stones) + ` +
+      `${coverGroupCenters.length} cover outcrops (${coverRocks.length} boulders)`,
   );
 
   return {
@@ -600,5 +674,8 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     setPalmBrightness,
     getFoliageBrightness: () => foliageBrightness,
     setFoliageBrightness,
+    getWind: () => windAmp,
+    setWind,
+    update,
   };
 }

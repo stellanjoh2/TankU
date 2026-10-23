@@ -8,7 +8,7 @@ const RAY_UP = 0.4;          // ray starts this far above each contact's resting
 const SAG = 0.10;            // static spring compression (softer = more bounce)
 const MU_LONG = 1.14;        // longitudinal grip; higher = harder launch
 const MU_SIDE = 0.75;
-const SPEED = { cruise: 9.5, boost: 14.0, reverse: 4.5, pivot: 3.75, turn: 3.125 };   // m/s
+const SPEED = { cruise: 9.5, boost: 14.0, reverse: 4.5, pivot: 4.6875, turn: 3.90625 };   // m/s
 const DAMP_RATIO = 0.28;     // fraction of critical; lower = bouncier rebound
 const BRAKE_DIVE = 0.75;     // keep this fraction of nose-dive pitch under hard braking
 const TRAVERSE = THREE.MathUtils.degToRad(42);      // turret deg/s
@@ -22,6 +22,7 @@ const MG_ELEV_MAX = THREE.MathUtils.degToRad(70);
 export const RELOAD = 2.0;
 export const SHELL_SPEED = 260;
 export const MAX_HP = 2;     // main-gun hits to destroy
+export const MG_DAMAGE = 0.01; // .50 cal chip damage (−80%; ~100 rounds / full bar)
 const RECOIL_IMPULSE = 9000;  // N*s on the hull
 // MG50 mesh tip (Blender build: brake cyl at x=1.24, len 0.08 → tip ~1.28; z=0.43)
 const MG_MUZZLE_LOCAL = new THREE.Vector3(1.28, 0.43, 0);
@@ -30,6 +31,14 @@ const TAIL_MAT = 'M_Glass_Taillight';
 const TAIL_IDLE = 0.35;
 const TAIL_BRAKE = 18;       // bloom-heavy red when braking or reversing
 const TAIL_RGB = [1.0, 0.04, 0.02];
+// Hull local (+X fwd, +Y up): build_sherman lamp(-2.62, ±1.46, deck_z+0.1) → Three (x, z, ∓y)
+const TAIL_LIGHT_LOCALS = [
+  new THREE.Vector3(-2.72, 1.92, 1.50),
+  new THREE.Vector3(-2.72, 1.92, -1.50),
+];
+const TAIL_LIGHT_DIST = 0.5;
+const TAIL_LIGHT_IDLE = 0;
+const TAIL_LIGHT_BRAKE = 5;
 // Whip antenna (bones Antenna_0..3, rest pose straight up local +Y): lean = -GAIN * hull accel,
 // a slow base spring plus a quicker tip spring chasing it, so the tip lags and whips past.
 const ANT_GAIN = 0.075;      // rad of total lean per m/s² of acceleration
@@ -88,6 +97,8 @@ export class Tank {
     this.world = world;
     this.model = gltf.scene;
     this.tailMats = [];
+    this.flashMats = [];
+    this.hitFlashFrames = 0;
     this.hp = MAX_HP;
     this.maxHp = MAX_HP;
     this.model.traverse((o) => {
@@ -97,6 +108,7 @@ export class Tank {
       for (const m of mats) {
         if (!m) continue;
         m.envMapIntensity = 0.6;
+        if (m.emissive) this.flashMats.push(m);
         if (m.name === TAIL_MAT) {
           m.emissive.setRGB(...TAIL_RGB);
           m.emissiveIntensity = TAIL_IDLE;
@@ -105,6 +117,13 @@ export class Tank {
           m.color.multiply(opts.tint);
         }
       }
+    });
+    // Red point lights at the two rear brake lenses — spill onto hull/grass when braking.
+    this.tailLights = TAIL_LIGHT_LOCALS.map((local) => {
+      const l = new THREE.PointLight(new THREE.Color(...TAIL_RGB), TAIL_LIGHT_IDLE, TAIL_LIGHT_DIST, 2);
+      l.position.copy(local);
+      this.model.add(l);
+      return l;
     });
     const node = (n) => {
       const o = this.model.getObjectByName(n);
@@ -169,7 +188,13 @@ export class Tank {
         const r = w.userData.spin_radius;
         const isGear = name.startsWith('Sprocket') || name.startsWith('Idler');
         const bottom = w.position.y - r - (isGear ? LINK_T / 2 : LINK_T);
-        this.contacts.push({ side: s, local: new THREE.Vector3(w.position.x, bottom + RAY_UP, s.z), load: 0, vLong: 0 });
+        this.contacts.push({
+          side: s,
+          local: new THREE.Vector3(w.position.x, bottom + RAY_UP, s.z),
+          load: 0,
+          vLong: 0,
+          hitDist: -1, // last suspension ray TOI (−1 = miss); used by debug overlay
+        });
       }
     }
     const share = (MASS * 9.81) / this.contacts.filter((c) => c.local.y < RAY_UP + 0.1).length;
@@ -238,6 +263,7 @@ export class Tank {
       ray.dir = down;
       const hit = this.world.castRayAndGetNormal(ray, maxDist, true, undefined, undefined, undefined, this.body);
       c.load = 0;
+      c.hitDist = hit ? hit.timeOfImpact : -1;
       if (!hit) continue;
       const dist = hit.timeOfImpact;
       const comp = maxDist - dist;
@@ -363,18 +389,53 @@ export class Tank {
     this.barrel.position.x = this.barrelRest - k * this.recoilDistance;
     this.updateAntenna(dt);
 
-    // Brake / reverse: hard red emissive on M_Glass_Taillight (idle dim red)
-    if (this.tailMats.length) {
+    // Brake / reverse: hard red emissive on M_Glass_Taillight (idle dim red) + short-range spill
+    {
       const spd = this.forwardSpeed();
       const reversing = this.cmd.throttle < -0.05;
       const braking = this.cmd.throttle < 0.08 && spd > 1.2;
-      const target = (reversing || braking) ? TAIL_BRAKE : TAIL_IDLE;
-      for (const m of this.tailMats) {
-        m.emissiveIntensity += (target - m.emissiveIntensity) * Math.min(1, 14 * dt);
+      const lit = reversing || braking;
+      if (this.tailMats.length) {
+        const target = lit ? TAIL_BRAKE : TAIL_IDLE;
+        for (const m of this.tailMats) {
+          m.emissiveIntensity += (target - m.emissiveIntensity) * Math.min(1, 14 * dt);
+        }
+      }
+      const lightTarget = lit ? TAIL_LIGHT_BRAKE : TAIL_LIGHT_IDLE;
+      for (const l of this.tailLights) {
+        l.intensity += (lightTarget - l.intensity) * Math.min(1, 14 * dt);
       }
     }
 
+    // Classic RPG hit flash: brake-light red emissive for a couple of frames
+    if (this.hitFlashFrames > 0) {
+      this.hitFlashFrames -= 1;
+      if (this.hitFlashFrames > 0) this._applyHitFlash(true);
+      else this._applyHitFlash(false);
+    }
+
     this.model.updateMatrixWorld();
+  }
+
+  /** Two-frame red emissive flash (same red as taillights / bloom). */
+  flashHit() {
+    this.hitFlashFrames = 2;
+    this._applyHitFlash(true);
+  }
+
+  _applyHitFlash(on) {
+    for (const m of this.flashMats) {
+      if (on) {
+        m.emissive.setRGB(...TAIL_RGB);
+        m.emissiveIntensity = TAIL_BRAKE;
+      } else if (m.name === TAIL_MAT) {
+        m.emissive.setRGB(...TAIL_RGB);
+        m.emissiveIntensity = TAIL_IDLE;
+      } else {
+        m.emissive.setRGB(0, 0, 0);
+        m.emissiveIntensity = 1;
+      }
+    }
   }
 
   muzzle() {
@@ -403,6 +464,12 @@ export class Tank {
     return { pos, dir, vel };
   }
 
+  /** True when the hull is on its side / roof (tracks no longer under it). */
+  isFlipped() {
+    _v.set(0, 1, 0).applyQuaternion(_q.copy(this.body.rotation()));
+    return _v.y < 0.4;
+  }
+
   /** Unstick in place: lift to terrain and kill velocity, keep heading. */
   reset(spawnY) {
     const t = this.body.translation();
@@ -412,6 +479,23 @@ export class Tank {
     this.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
     this.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
     this.prevVel = null;
+  }
+
+  /**
+   * Arcade recovery when overturned: snap upright (keep yaw), hop clear of the ground.
+   * No-op while driving normally — Space must not bounce an upright tank.
+   */
+  unflipJump(spawnY) {
+    if (!this.isFlipped()) return false;
+    const t = this.body.translation();
+    const yaw = new THREE.Euler().setFromQuaternion(_q.copy(this.body.rotation()), 'YXZ').y;
+    const ground = spawnY(t.x, t.z);
+    this.body.setTranslation({ x: t.x, y: Math.max(t.y, ground) + 1.35, z: t.z }, true);
+    this.body.setRotation(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw), true);
+    this.body.setLinvel({ x: 0, y: 8.5, z: 0 }, true);
+    this.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    this.prevVel = null;
+    return true;
   }
 
   /** Full restart at the original spawn pose. */
@@ -427,6 +511,8 @@ export class Tank {
     this.recoilT = 1;
     this.prevVel = null;
     this.hp = this.maxHp;
+    this.hitFlashFrames = 0;
+    this._applyHitFlash(false);
     this.cmd.throttle = this.cmd.turn = 0;
   }
 
