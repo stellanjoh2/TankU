@@ -5,3 +5,4 @@ dist/
 textures/Source/
 __pycache__/
 *.pyc
+3D assets/free_lowpoly_barrels_set.glb
