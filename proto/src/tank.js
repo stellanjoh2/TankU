@@ -36,10 +36,10 @@ const MG_ELEVATE = THREE.MathUtils.degToRad(60);
 const MG_ELEV_MIN = THREE.MathUtils.degToRad(-20);
 const MG_ELEV_MAX = THREE.MathUtils.degToRad(70);
 export const RELOAD = 2.0;
-export const SHELL_SPEED = 260;
+export const SHELL_SPEED = 260 * 0.8;
 export const MAX_HP = 4;     // main-gun hits to destroy
 export const MG_DAMAGE = 0.01; // .50 cal chip damage (−80%; ~100 rounds / full bar)
-const RECOIL_IMPULSE = 9000;  // N*s on the hull
+const RECOIL_IMPULSE = 4500;  // N*s on the hull
 // MG50 mesh tip (Blender build: brake cyl at x=1.24, len 0.08 → tip ~1.28; z=0.43)
 const MG_MUZZLE_LOCAL = new THREE.Vector3(1.28, 0.43, 0);
 // GLB material index 4 / Blender slot 4 on Hull_Details — red brake/tail lenses
@@ -209,6 +209,7 @@ export class Tank {
     this.model = gltf.scene;
     this.tailMats = [];
     this.flashMats = [];
+    this.pbrMats = new Map();
     this.hitFlashFrames = 0;
     this.hp = MAX_HP;
     this.maxHp = MAX_HP;
@@ -218,6 +219,11 @@ export class Tank {
       const mats = Array.isArray(o.material) ? o.material : [o.material];
       for (const m of mats) {
         if (!m) continue;
+        if (m.name) {
+          let list = this.pbrMats.get(m.name);
+          if (!list) this.pbrMats.set(m.name, (list = []));
+          if (!list.includes(m)) list.push(m);
+        }
         m.envMapIntensity = 0.6;
         if (m.emissive) this.flashMats.push(m);
         if (m.name === TAIL_MAT) {
@@ -252,7 +258,7 @@ export class Tank {
     this.mgMount.rotation.set(0, 0, 0);
     this.barrelRest = this.barrel.position.x;
     // GLB ships 0.25; push a bit deeper for a heavier main-gun feel
-    this.recoilDistance = 0.4;
+    this.recoilDistance = 0.2;
     this.muzzleLocal = new THREE.Vector3(...(this.barrel.userData.muzzle_local ?? [2.44, 0, 0]));
     this.mgMuzzleLocal = MG_MUZZLE_LOCAL.clone();
 
@@ -339,6 +345,21 @@ export class Tank {
     }
     // charge 0..1 (two 0.5 hits); needFull = spent both, wait for 100% before next use
     this.nitro = { charge: 1, t: 0, power: 0, held: false, needFull: false, justStarted: false };
+  }
+
+  /** Flat metal/rough for one GLB material. Drops the shared ORM map so the slider value is what renders. */
+  setPbr(name, metalness, roughness) {
+    const list = this.pbrMats.get(name);
+    if (!list) return;
+    for (const m of list) {
+      if (m.metalnessMap || m.roughnessMap) {
+        m.metalnessMap = null;
+        m.roughnessMap = null;
+        m.needsUpdate = true;
+      }
+      m.metalness = metalness;
+      m.roughness = roughness;
+    }
   }
 
   get nitroCharge() { return this.nitro.charge; }

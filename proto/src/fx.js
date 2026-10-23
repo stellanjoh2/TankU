@@ -1,14 +1,32 @@
 // Shells (ballistic, raycast against the physics world), muzzle flash, impacts, smoke and track dust.
-// Selective emissive bloom: put glow energy in `emissive` / `emissiveNode`, not HDR `color`.
+// Glow sprites keep HDR in emissiveNode. Post blooms the whole frame plus that emissive buffer.
 import * as THREE from 'three/webgpu';
-import { texture, uniform } from 'three/tsl';
+import { float, smoothstep, texture, uniform, uv, vec4 } from 'three/tsl';
 import { heightAt as terrainHeightAt } from './terrain.js';
 import { VISUAL_DEFAULTS } from './visualDefaults.js';
 import { decodeGif } from './gif.js';
 
+/** Shared glow. Peak channel is this; a tint keeps its hue. */
+const SPRITE_EMISSIVE = 2.6;
+
+function toEmissiveLevel(hdr) {
+  const col = hdr.isColor ? hdr.clone() : new THREE.Color(hdr);
+  const peak = Math.max(col.r, col.g, col.b);
+  if (peak > 0) col.multiplyScalar(SPRITE_EMISSIVE / peak);
+  return col;
+}
+
+/** Same scale as `toEmissiveLevel`, applied to a hot → cool pair so the fade stays. */
+function emissiveRamp(from, to) {
+  const peak = Math.max(from[0], from[1], from[2]);
+  const s = peak > 0 ? SPRITE_EMISSIVE / peak : 0;
+  const mul = (a) => [a[0] * s, a[1] * s, a[2] * s];
+  return { from: mul(from), to: mul(to) };
+}
+
 /** Sprite that writes HDR into the emissive MRT (beauty via emissive add, not diffuse color). */
 function emissiveSpriteMat(map, hdr, opts = {}) {
-  const hdrCol = hdr.isColor ? hdr.clone() : new THREE.Color(hdr);
+  const hdrCol = toEmissiveLevel(hdr);
   const uEm = uniform(hdrCol);
   const mat = new THREE.SpriteNodeMaterial({
     map: map ?? null,
@@ -19,30 +37,57 @@ function emissiveSpriteMat(map, hdr, opts = {}) {
     blending: opts.additive ? THREE.AdditiveBlending : THREE.NormalBlending,
     opacity: opts.opacity ?? 1,
     sizeAttenuation: opts.sizeAttenuation !== false,
+    // Fog forces the card's alpha to 1, so the whole quad becomes a washed box
+    // tinted by the cyan fog colour.
+    fog: false,
   });
   mat.emissiveNode = map ? texture(map).rgb.mul(uEm) : uEm;
   mat.userData.emissiveUniform = uEm;
   return mat;
 }
 
-/** MeshBasic stand-in: black albedo + HDR emissive for selective bloom. */
-function emissiveBasicMat(hdr, opts = {}) {
-  const hdrCol = hdr.isColor ? hdr.clone() : new THREE.Color(hdr);
-  return new THREE.MeshStandardMaterial({
-    color: 0x000000,
-    emissive: hdrCol,
-    emissiveIntensity: 1,
-    map: opts.map ?? null,
-    emissiveMap: opts.map ?? null,
-    transparent: !!opts.transparent,
-    depthWrite: opts.depthWrite !== false,
-    depthTest: opts.depthTest !== false,
-    blending: opts.additive ? THREE.AdditiveBlending : THREE.NormalBlending,
-    side: opts.side ?? THREE.FrontSide,
-    toneMapped: false,
-    roughness: 1,
-    metalness: 0,
+/** Unlit card. Black albedo, HDR in emissive, plain additive so black texels add nothing. */
+function emissiveCardMat(map, hdr) {
+  const hdrCol = toEmissiveLevel(hdr);
+  const uEm = uniform(hdrCol);
+  const mat = new THREE.MeshBasicNodeMaterial({
+    color: new THREE.Color(0, 0, 0),
+    lights: false,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    fog: false,
+    blending: THREE.AdditiveBlending,
   });
+  mat.emissiveNode = texture(map).rgb.mul(uEm);
+  mat.userData.emissiveUniform = uEm;
+  return mat;
+}
+
+/**
+ * RGB painted on black, no alpha mask. Add the texel and leave framebuffer
+ * alpha alone so the card can't stamp a square into the target.
+ */
+function blackAdditive(mat) {
+  mat.transparent = true;
+  mat.depthWrite = false;
+  mat.fog = false;
+  mat.premultipliedAlpha = false;
+  mat.blending = THREE.CustomBlending;
+  mat.blendEquation = THREE.AddEquation;
+  mat.blendSrc = THREE.OneFactor;
+  mat.blendDst = THREE.OneFactor;
+  mat.blendEquationAlpha = THREE.AddEquation;
+  mat.blendSrcAlpha = THREE.ZeroFactor;
+  mat.blendDstAlpha = THREE.OneFactor;
+}
+
+/** 1 in the interior, 0 on the texture border, so a cropped card can't outline the quad. */
+function cardEdgeFade(margin) {
+  const p = uv().sub(0.5).abs();
+  const inner = float(0.5 - margin);
+  const outer = float(0.5);
+  return float(1).sub(smoothstep(inner, outer, p.x)).mul(float(1).sub(smoothstep(inner, outer, p.y)));
 }
 
 const GRAVITY = 9.81;
@@ -59,10 +104,24 @@ const GROUND_EXPLOSION = {
   aspect: 152 / 173, // cell w/h from baked atlas
   fps: 30,
   // Large on purpose so we can judge the flipbook in-game.
-  width: 22,
+  width: 22 * 0.75,
   glowUrl: './textures/vfx/T_impact_glow.png',
-  glowSize: 24, // 32 * 0.75
+  glowSize: 6,
   glowLife: 0.5,
+};
+
+/** Main-gun muzzle. Two 4-frame strips, RGB on black. Side sheet's point aims left. */
+const MAIN_MUZZLE = {
+  frontUrl: './textures/vfx/T_turret_muzzle_front.png',
+  sideUrl: './textures/vfx/T_turret_muzzle_side.png',
+  cols: 4,
+  rows: 1,
+  frames: 4,
+  fps: 12,
+  // Cell is mostly empty black; ~6 m tall puts the visible burst around 3 m.
+  height: 6,
+  // White scale so the painted orange stays. Same peak as every other glow sprite.
+  emissive: SPRITE_EMISSIVE,
 };
 
 const MG_FLASH = {
@@ -81,6 +140,26 @@ const MG_FLASH = {
   brassUp: 3.2,         // upward m/s baseline
   brassLife: 3.2,
 };
+
+// Main-gun tracer. Geometry lies on local +X (nose at +X). Stretched a little along
+// travel so a 260 m/s round still reads between frames without becoming a laser.
+const SHELL_GEO_LEN = 1.725;
+const SHELL_VIS_MAX = 3.9;
+// Slow enough to read leaving the gun. The old 480 m/s streak showed up downrange.
+const MG_TRACER_SPEED = 220 * 0.75;
+const MG_TRACER_GEO_LEN = 0.825 * 1.5;
+const MG_TRACER_LEN = 2.55 * 1.5;
+// Metres past the muzzle. The plume reaches about here; a tracer rooted on the
+// muzzle covers the star and makes the flash look broken. Clear shifts with the
+// extra length so the tail stays where it was.
+const MG_TRACER_CLEAR = 2.15 + 0.825 * 0.5;
+const _tracerFwd = new THREE.Vector3(1, 0, 0);
+
+const DAMAGE_FIRE_URL = './textures/vfx/fire.gif';
+// World metres. Matches the old screen-space size at the chase camera, and shrinks on a distant tank.
+// Steps: 25% / 50% / 75% damage, then the wreck.
+const DAMAGE_FIRE_SCALE = [0, 2.1, 3.6, 5.3, 7.6];
+const DAMAGE_FIRE_SPEED = 2.25;
 
 /** Right-hand side of a barrel dir (world +Y up). */
 function gunRight(dir, out) {
@@ -199,6 +278,7 @@ export class Effects {
     this.exclude = excludeBody;
     this.dynamic = dynamicProps;
     this.shells = [];
+    this.mgTracers = [];
     this.particles = [];
     this.onImpact = () => {};
     this.onShellHit = () => {};
@@ -212,14 +292,23 @@ export class Effects {
     this.burstTexs = [11, 4271, 90913].map(sparkBurstTexture);
     // Set from main.js — metal-hit sparks orient their streaks in screen space.
     this.camera = null;
+    this.damageFire = null;
     this._camQInv = new THREE.Quaternion();
     this._streakV = new THREE.Vector3();
     this.smokeTex = radialTexture([[0, 'rgba(255,255,255,0.9)'], [0.5, 'rgba(255,255,255,0.35)'], [1, 'rgba(255,255,255,0)']]);
-    this.shellGeo = new THREE.CylinderGeometry(0.05, 0.05, 1.6, 6).rotateZ(Math.PI / 2);
-    // WebGL look: unlit HDR streak so beauty-buffer bloom picks it up (emissive-only was invisible).
+    // Unlit HDR streak. Beauty color feeds the full-image bloom; toneMapped off keeps it hot.
+    // radiusTop is the tail after rotateZ(+90°); radiusBottom is the nose.
+    this.shellGeo = new THREE.CylinderGeometry(0.12, 0.054, SHELL_GEO_LEN, 6).rotateZ(Math.PI / 2);
     this.shellMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(14, 7, 2.5),
+      color: new THREE.Color(18, 5.6, 0.7),
       toneMapped: false,
+      fog: false,
+    });
+    this.mgTracerGeo = new THREE.CylinderGeometry(0.042 * 1.5, 0.015 * 1.5, MG_TRACER_GEO_LEN, 5).rotateZ(Math.PI / 2);
+    this.mgTracerMat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(34, 11, 1.4),
+      toneMapped: false,
+      fog: false,
     });
     this.debrisGeo = new THREE.BoxGeometry(0.15, 0.15, 0.15);
     this.debrisMat = new THREE.MeshStandardMaterial({ color: 0x2b2418, roughness: 1 });
@@ -240,8 +329,8 @@ export class Effects {
       side: THREE.DoubleSide,
       depthWrite: false,
     });
-    // First-pass .50 brass: ~2× real size, warm metal so it pops against olive drab.
-    this.brassGeo = new THREE.CylinderGeometry(0.045, 0.052, 0.18, 8);
+    // First-pass .50 brass: ~2× real size, then −25%. Warm metal so it pops against olive drab.
+    this.brassGeo = new THREE.CylinderGeometry(0.045 * 0.75, 0.052 * 0.75, 0.18 * 0.75, 8);
     this.brassMat = new THREE.MeshStandardMaterial({
       color: 0xe0b45a,
       metalness: 0.9,
@@ -269,15 +358,24 @@ export class Effects {
     this._mgMat = new THREE.Matrix4();
     this._mgRayOrigin = { x: 0, y: 0, z: 0 };
     this._mgRayDir = { x: 1, y: 0, z: 0 };
+
+    this.mainMuzzleFront = null;
+    this.mainMuzzleSide = null;
+    this.muzzleCardGeo = new THREE.PlaneGeometry(1, 1);
+    this._muzzleX = new THREE.Vector3();
+    this._muzzleY = new THREE.Vector3();
+    this._muzzleZ = new THREE.Vector3();
   }
 
   async load() {
     const loader = new THREE.TextureLoader();
-    const [tex, glowMap, starMap, plumeMap] = await Promise.all([
+    const [tex, glowMap, starMap, plumeMap, muzzleFront, muzzleSide] = await Promise.all([
       loader.loadAsync(GROUND_EXPLOSION.url),
       loader.loadAsync(GROUND_EXPLOSION.glowUrl),
       loader.loadAsync(MG_FLASH.starUrl),
       loader.loadAsync(MG_FLASH.plumeUrl),
+      loader.loadAsync(MAIN_MUZZLE.frontUrl),
+      loader.loadAsync(MAIN_MUZZLE.sideUrl),
     ]);
     tex.colorSpace = THREE.SRGBColorSpace;
     tex.magFilter = THREE.LinearFilter;
@@ -291,30 +389,56 @@ export class Effects {
     glowMap.minFilter = THREE.LinearMipmapLinearFilter;
     this.impactGlowTex = glowMap;
 
+    for (const m of [muzzleFront, muzzleSide]) {
+      m.colorSpace = THREE.SRGBColorSpace;
+      m.magFilter = THREE.LinearFilter;
+      m.minFilter = THREE.LinearFilter;
+      m.generateMipmaps = false;
+      m.wrapS = m.wrapT = THREE.ClampToEdgeWrapping;
+    }
+    this.mainMuzzleFront = muzzleFront;
+    this.mainMuzzleSide = muzzleSide;
+
+    // No mips: the art runs to the texture edge, and lower mips smear that into a square halo.
     for (const m of [starMap, plumeMap]) {
       m.colorSpace = THREE.SRGBColorSpace;
       m.magFilter = THREE.LinearFilter;
-      m.minFilter = THREE.LinearMipmapLinearFilter;
+      m.minFilter = THREE.LinearFilter;
+      m.generateMipmaps = false;
+      m.wrapS = m.wrapT = THREE.ClampToEdgeWrapping;
     }
 
     // Camera-facing star + two barrel-aligned plumes crossed 90° (reads from all angles).
     // Two kits so player + enemy can spray at once.
+    // Art is RGB on black (no alpha). Same emissive peak as the other glow sprites.
+    // One,One so the black texels add nothing; a short edge fade keeps the card from outlining.
+    const flashCard = (map, edgeFade, sprite) => {
+      const rgb = texture(map).rgb
+        .mul(uniform(new THREE.Color(SPRITE_EMISSIVE, SPRITE_EMISSIVE, SPRITE_EMISSIVE)))
+        .mul(cardEdgeFade(edgeFade));
+      const mat = sprite
+        ? new THREE.SpriteNodeMaterial({
+          transparent: true, depthWrite: false, fog: false,
+        })
+        : new THREE.MeshBasicNodeMaterial({
+          color: new THREE.Color(0, 0, 0),
+          lights: false, transparent: true, depthWrite: false,
+          side: THREE.DoubleSide, fog: false,
+        });
+      mat.colorNode = vec4(0, 0, 0, 1);
+      mat.emissiveNode = rgb;
+      blackAdditive(mat);
+      return mat;
+    };
     const makeKit = () => {
-      const starMat = emissiveSpriteMat(
-        starMap,
-        new THREE.Color(2.2 * 1.25, 1.6 * 1.25, 0.7 * 1.25),
-        { additive: true },
-      );
-      const star = new THREE.Sprite(starMat);
+      const star = new THREE.Sprite(flashCard(starMap, 0.02, true));
       star.scale.setScalar(MG_FLASH.starSize);
       star.visible = false;
       this.scene.add(star);
       const plumeGeo = new THREE.PlaneGeometry(1, 1);
+      const plumeMat = flashCard(plumeMap, 0.1, false);
       const plumes = [0, 1].map(() => {
-        const mat = emissiveBasicMat(new THREE.Color(2.0 * 1.25, 1.4 * 1.25, 0.55 * 1.25), {
-          map: plumeMap, transparent: true, depthWrite: false, additive: true, side: THREE.DoubleSide,
-        });
-        const mesh = new THREE.Mesh(plumeGeo, mat);
+        const mesh = new THREE.Mesh(plumeGeo, plumeMat);
         mesh.visible = false;
         this.scene.add(mesh);
         return mesh;
@@ -325,6 +449,46 @@ export class Effects {
     };
     this.mgFlash = makeKit();
     this.mgFlashB = makeKit();
+
+    const gif = decodeGif(await (await fetch(DAMAGE_FIRE_URL)).arrayBuffer());
+    const canvas = document.createElement('canvas');
+    canvas.width = gif.width;
+    canvas.height = gif.height;
+    const ctx = canvas.getContext('2d', { alpha: true });
+    const map = new THREE.CanvasTexture(canvas);
+    map.colorSpace = THREE.SRGBColorSpace;
+    map.magFilter = THREE.LinearFilter;
+    map.minFilter = THREE.LinearFilter;
+    map.generateMipmaps = false;
+    const fire = {
+      gif, ctx, map,
+      image: ctx.createImageData(gif.width, gif.height),
+      frame: -1,
+      acc: 0,
+    };
+    const mat = emissiveSpriteMat(map, new THREE.Color(1.15, 1.15, 1.15), {});
+    // Additive: dark smoke adds nothing, so it doesn't sit on the scene as a black blob.
+    // SrcAlpha keeps the gif's mask. Leave the frame's alpha alone so the card doesn't stamp a square.
+    mat.blending = THREE.CustomBlending;
+    mat.blendEquation = THREE.AddEquation;
+    mat.blendSrc = THREE.SrcAlphaFactor;
+    mat.blendDst = THREE.OneFactor;
+    mat.blendEquationAlpha = THREE.AddEquation;
+    mat.blendSrcAlpha = THREE.ZeroFactor;
+    mat.blendDstAlpha = THREE.OneFactor;
+    mat.opacityNode = texture(map).a;
+    // One shared clip, two sprites — player and enemy can burn at once.
+    fire.sprites = [0, 1].map(() => {
+      const sprite = new THREE.Sprite(mat);
+      sprite.center.set(0.5, 0.02);
+      sprite.visible = false;
+      sprite.frustumCulled = false;
+      sprite.renderOrder = 2;
+      this.scene.add(sprite);
+      return sprite;
+    });
+    this.damageFire = fire;
+    this._blitDamageFire(0);
   }
 
   _flashLight(pos, peak, { color = 0xffb060, distance = 40 } = {}) {
@@ -340,7 +504,7 @@ export class Effects {
     const mat = opts.additive
       ? emissiveSpriteMat(tex, color, { additive: true })
       : new THREE.SpriteMaterial({
-        map: tex, color, transparent: true, depthWrite: false,
+        map: tex, color, transparent: true, depthWrite: false, fog: false,
       });
     const s = new THREE.Sprite(mat);
     s.position.copy(pos);
@@ -430,7 +594,7 @@ export class Effects {
     d.x = dir.x; d.y = dir.y; d.z = dir.z;
     const ray = new R.Ray(o, d);
     const hit = this.world.castRayAndGetNormal(ray, 450, true, undefined, undefined, undefined, owner);
-    if (!hit) return;
+    if (!hit) return null;
     const point = pos.clone().addScaledVector(dir, hit.timeOfImpact);
     const normal = new THREE.Vector3(hit.normal.x, hit.normal.y, hit.normal.z);
     // Ground/dirt: near terrain height with an upward face (keeps tank/barrel hits as metal sparks)
@@ -442,6 +606,32 @@ export class Effects {
       owner,
       dir: dir.clone(),
       normal,
+    });
+    return hit.timeOfImpact;
+  }
+
+  /** Head of the streak sits on `pos`; the tail trails back along `dir`. */
+  _placeTracer(mesh, pos, dir, visLen, geoLen) {
+    mesh.scale.x = visLen / geoLen;
+    mesh.quaternion.setFromUnitVectors(_tracerFwd, dir);
+    mesh.position.copy(pos).addScaledVector(dir, -visLen * 0.5);
+  }
+
+  /** Visual .50 tracer. Damage stays on the hitscan; this is the streak you can see. */
+  _spawnMgTracer(pos, dir, maxDist) {
+    const d = dir.clone().normalize();
+    if (d.lengthSq() < 1e-8) return;
+    const origin = pos.clone().addScaledVector(d, MG_TRACER_CLEAR);
+    const mesh = new THREE.Mesh(this.mgTracerGeo, this.mgTracerMat);
+    this._placeTracer(mesh, origin, d, MG_TRACER_GEO_LEN, MG_TRACER_GEO_LEN);
+    this.scene.add(mesh);
+    const reach = maxDist == null ? 450 : Math.max(0.15, maxDist - MG_TRACER_CLEAR);
+    this.mgTracers.push({
+      mesh,
+      pos: origin,
+      dir: d,
+      traveled: 0,
+      maxDist: reach,
     });
   }
 
@@ -463,11 +653,15 @@ export class Effects {
     const n = dirt
       ? 6 + Math.floor(Math.random() * 3)   // ~50% of metal count
       : 12 + Math.floor(Math.random() * 6);
+    // Dirt: brown → darker earth; metal: hot gold → deep orange. Peak matches SPRITE_EMISSIVE.
+    const ramp = dirt
+      ? emissiveRamp([2.4, 1.25, 0.4], [0.45, 0.22, 0.08])
+      : emissiveRamp([20, 13, 5], [10, 1.8, 0.2]);
     for (let i = 0; i < n; i++) {
       const size = dirt ? 0.14 + Math.random() * 0.2 : 0.0675 + Math.random() * 0.105;
       const mat = emissiveSpriteMat(
         dirt ? this.flashTex : this.streakTex,
-        dirt ? new THREE.Color(2.2, 1.2, 0.45) : new THREE.Color(20, 13, 5),
+        new THREE.Color(...ramp.from),
         { additive: true },
       );
       const spark = new THREE.Sprite(mat);
@@ -489,9 +683,8 @@ export class Effects {
         size,
         spark: true,
         streak: !dirt,
-        // Dirt: brown → darker earth; metal: hot gold → deep orange
-        sparkFrom: dirt ? [2.4, 1.25, 0.4] : [20, 13, 5],
-        sparkTo: dirt ? [0.45, 0.22, 0.08] : [10, 1.8, 0.2],
+        sparkFrom: ramp.from,
+        sparkTo: ramp.to,
       });
     }
   }
@@ -536,7 +729,8 @@ export class Effects {
     stream.flashAge = 0;
     this._mgSmoke(pos, dir);
     this._ejectMgBrass(pos, dir);
-    this._traceMgBullet(pos, dir, stream.owner);
+    const reach = this._traceMgBullet(pos, dir, stream.owner);
+    this._spawnMgTracer(pos, dir, reach);
     this.onMgShot({ owner: stream.owner });
   }
 
@@ -606,65 +800,98 @@ export class Effects {
     }
   }
 
+  /** Front card sits across the muzzle. Its face is the barrel axis, so it reads head-on. */
+  _aimMuzzleFront(mesh, dir) {
+    const z = this._muzzleZ.copy(dir);
+    const y = this._muzzleY.set(0, 1, 0);
+    if (Math.abs(dir.dot(y)) > 0.98) y.set(1, 0, 0);
+    const x = this._muzzleX.crossVectors(y, z).normalize();
+    y.crossVectors(z, x).normalize();
+    this._mgMat.makeBasis(x, y, z);
+    mesh.quaternion.setFromRotationMatrix(this._mgMat);
+  }
+
+  /**
+   * Side card stands upright along the barrel.
+   * Texture-left is the pointed tip, so local -X aims downrange.
+   */
+  _aimMuzzleSide(mesh, dir) {
+    const x = this._muzzleX.copy(dir).negate();
+    const y = this._muzzleY.set(0, 1, 0);
+    y.addScaledVector(dir, -y.dot(dir));
+    if (y.lengthSq() < 1e-8) y.set(0, 0, 1);
+    y.normalize();
+    const z = this._muzzleZ.crossVectors(x, y);
+    this._mgMat.makeBasis(x, y, z);
+    mesh.quaternion.setFromRotationMatrix(this._mgMat);
+  }
+
+  /** One 4-frame strip. `side` lies along the barrel; the front card faces down it. */
+  _spawnMainMuzzle(atlas, pos, dir, side, scale = 1) {
+    const atlasImg = atlas?.image;
+    if (!atlasImg) return;
+    const cfg = MAIN_MUZZLE;
+    const cellW = Math.floor(atlasImg.width / cfg.cols);
+    const cellH = Math.floor(atlasImg.height / cfg.rows);
+    const canvas = document.createElement('canvas');
+    canvas.width = cellW;
+    canvas.height = cellH;
+    const ctx = canvas.getContext('2d', { alpha: true });
+    const map = new THREE.CanvasTexture(canvas);
+    map.colorSpace = THREE.SRGBColorSpace;
+    map.magFilter = THREE.LinearFilter;
+    map.minFilter = THREE.LinearFilter;
+    map.generateMipmaps = false;
+    map.wrapS = map.wrapT = THREE.ClampToEdgeWrapping;
+
+    const flipbook = {
+      map, ctx, cellW, cellH, atlasImg,
+      cols: cfg.cols, rows: cfg.rows, frames: cfg.frames, fps: cfg.fps,
+      frame: -1,
+    };
+    blitFlipbookFrame(flipbook, 0);
+
+    const hdr = new THREE.Color(cfg.emissive, cfg.emissive, cfg.emissive);
+    const h = cfg.height * scale;
+    const w = h * (cellW / cellH);
+    const mat = emissiveCardMat(map, hdr);
+    const obj = new THREE.Mesh(this.muzzleCardGeo, mat);
+    obj.scale.set(w, h, 1);
+    if (side) {
+      // Fat end of the blast sits on the muzzle; the point leads downrange.
+      obj.position.copy(pos).addScaledVector(dir, w * 0.35);
+      this._aimMuzzleSide(obj, dir);
+    } else {
+      obj.position.copy(pos).addScaledVector(dir, 0.2);
+      this._aimMuzzleFront(obj, dir);
+    }
+    obj.frustumCulled = false;
+    obj.renderOrder = 3;
+    this.scene.add(obj);
+    this.particles.push({
+      obj, life: cfg.frames / cfg.fps, age: 0, vel: new THREE.Vector3(),
+      grow: 1, size: w, fade: 1, drag: 0, rise: 0, opacity: 1,
+      flipbook,
+      muzzleDir: side ? dir.clone() : null,
+    });
+  }
+
   muzzleFlash(pos, dir) {
-    const fwd = pos.clone().addScaledVector(dir, 0.6);
-    this._sprite(this.flashTex, new THREE.Color(30, 18, 8), fwd, 2.6, 0.09, { additive: true, grow: 1.6 });
-    this._sprite(this.flashTex, new THREE.Color(14, 8, 3), pos.clone().addScaledVector(dir, 1.6), 1.6, 0.07, { additive: true });
-    // Brief yellow muzzle spill (~4 m) — same pool as impact flashes, retargeted per shot.
-    this._flashLight(fwd, 45, { color: 0xffcc33, distance: 4 });
-
-    // Placeholder anime-style muzzle plume: dense grey cloud at the breech that
-    // billows out along the barrel, then hangs and rises. Replace later with real VFX.
-    const side = new THREE.Vector3();
-    const up = new THREE.Vector3(0, 1, 0);
-    if (Math.abs(dir.dot(up)) > 0.9) up.set(1, 0, 0);
-    side.crossVectors(dir, up).normalize();
-    up.crossVectors(side, dir).normalize();
-
-    // −25% smoke count vs prior 22 / 8
-    for (let i = 0; i < 17; i++) {
-      const along = 0.3 + Math.random() * 2.4;
-      const spread = (0.4 + Math.random() * 1.1) * (0.35 + along * 0.25);
-      const a = Math.random() * Math.PI * 2;
-      const origin = pos.clone()
-        .addScaledVector(dir, along)
-        .addScaledVector(side, Math.cos(a) * spread * 0.35)
-        .addScaledVector(up, Math.sin(a) * spread * 0.25);
-      const v = dir.clone().multiplyScalar(1.2 + Math.random() * 3.5)
-        .addScaledVector(side, (Math.random() - 0.5) * 2.8)
-        .addScaledVector(up, 0.4 + Math.random() * 2.2);
-      const grey = 0.38 + Math.random() * 0.22;
-      this._sprite(
-        this.smokeTex,
-        new THREE.Color(grey, grey * 0.97, grey * 0.92),
-        origin,
-        1.4 + Math.random() * 1.8,
-        2.8 + Math.random() * 2.4,
-        { vel: v, grow: 4.5 + Math.random() * 3, rise: 0.9 + Math.random() * 0.8, opacity: 0.55 + Math.random() * 0.25, drag: 1.4 },
-      );
-    }
-    // Lingering core puff that stays near the muzzle and climbs
-    for (let i = 0; i < 6; i++) {
-      const v = new THREE.Vector3(
-        (Math.random() - 0.5) * 0.8,
-        1.2 + Math.random() * 1.6,
-        (Math.random() - 0.5) * 0.8,
-      ).addScaledVector(dir, 0.4 + Math.random());
-      this._sprite(
-        this.smokeTex,
-        new THREE.Color(0.48, 0.46, 0.43),
-        pos.clone().addScaledVector(dir, 0.5 + Math.random() * 0.6),
-        2.2 + Math.random(),
-        4 + Math.random() * 2,
-        { vel: v, grow: 6, rise: 1.4, opacity: 0.7, drag: 1.1 },
-      );
-    }
+    const d = dir.clone();
+    if (d.lengthSq() < 1e-8) d.set(1, 0, 0);
+    else d.normalize();
+    this._spawnMainMuzzle(this.mainMuzzleFront, pos, d, false);
+    this._spawnMainMuzzle(this.mainMuzzleSide, pos, d, true);
+    this._flashLight(pos.clone().addScaledVector(d, 0.8), 45, { color: 0xffcc33, distance: 4 });
   }
 
   /** `owner` is the firing tank's rigid body (its own hull is ignored by the shell). */
   fire({ pos, vel, owner = this.exclude }) {
     const mesh = new THREE.Mesh(this.shellGeo, this.shellMat);
-    mesh.position.copy(pos);
+    const dir = vel.clone();
+    if (dir.lengthSq() > 1e-8) dir.normalize();
+    else dir.set(1, 0, 0);
+    this._placeTracer(mesh, pos, dir, SHELL_GEO_LEN, SHELL_GEO_LEN);
     this.scene.add(mesh);
     this.shells.push({ mesh, pos: pos.clone(), vel: vel.clone(), age: 0, owner });
   }
@@ -672,6 +899,8 @@ export class Effects {
   clearShells() {
     for (const s of this.shells) this.scene.remove(s.mesh);
     this.shells.length = 0;
+    for (const t of this.mgTracers) this.scene.remove(t.mesh);
+    this.mgTracers.length = 0;
   }
 
   /** Destroyed-tank blast: a big flipbook burst plus a second, delayed-looking one above the hull. */
@@ -772,7 +1001,8 @@ export class Effects {
    * @param {THREE.Vector3} up world-space up (unit)
    */
   engineSmoke(pos, amount, back, up) {
-    if (amount < 0.02 || Math.random() > Math.min(1, amount * 1.4)) return;
+    // −25% spawn chance — same puff, fewer of them.
+    if (amount < 0.02 || Math.random() > Math.min(1, amount * 1.4) * 0.75) return;
     // Turret plume greys are ~0.38–0.60; diesel is half that, then another 25% darker.
     const grey = (0.38 + Math.random() * 0.22) * 0.5 * 0.75;
     const side = new THREE.Vector3().crossVectors(up, back).normalize();
@@ -800,25 +1030,35 @@ export class Effects {
 
   /**
    * Damaged-tank fire: flickering flames, black smoke and the odd ember. Call every frame.
+   * `embers` cuts the flame sprites by 80% and shrinks them into rising sparks (player, under the gif).
    * @param {THREE.Vector3} pos world origin of the fire (engine deck)
    * @param {number} dt frame time
    * @param {number} intensity 1 = damaged, >1 = burning wreck
+   * @param {boolean} embers
    */
-  burn(pos, dt, intensity = 1) {
+  burn(pos, dt, intensity = 1, embers = false) {
     const emit = (rate) => {
       const n = rate * intensity * dt;
       return Math.floor(n) + (Math.random() < n % 1 ? 1 : 0);
     };
     const jitter = (r) => pos.clone().add(new THREE.Vector3((Math.random() - 0.5) * r, Math.random() * 0.2, (Math.random() - 0.5) * r));
-    for (let i = emit(30); i > 0; i--) {
+    for (let i = emit(embers ? 6 : 30); i > 0; i--) {
       const heat = 0.7 + Math.random() * 0.6;
-      this._sprite(this.flashTex, new THREE.Color(4.5 * heat, 1.5 * heat, 0.3 * heat), jitter(0.9),
-        0.55 + Math.random() * 0.5 * intensity, 0.3 + Math.random() * 0.3, {
-          additive: true, grow: 0.35, drag: 2, rise: 4,
-          vel: new THREE.Vector3((Math.random() - 0.5) * 0.6, 1.2 + Math.random() * 1.2, (Math.random() - 0.5) * 0.6),
-        });
+      if (embers) {
+        this._sprite(this.flashTex, new THREE.Color(7 * heat, 2.4 * heat, 0.45 * heat), jitter(0.4),
+          0.07 + Math.random() * 0.08, 0.4 + Math.random() * 0.45, {
+            additive: true, grow: 0.35, drag: 1.1, rise: 1.5,
+            vel: new THREE.Vector3((Math.random() - 0.5) * 1.6, 2.4 + Math.random() * 2.2, (Math.random() - 0.5) * 1.6),
+          });
+      } else {
+        this._sprite(this.flashTex, new THREE.Color(4.5 * heat, 1.5 * heat, 0.3 * heat), jitter(0.9),
+          0.55 + Math.random() * 0.5 * intensity, 0.3 + Math.random() * 0.3, {
+            additive: true, grow: 0.35, drag: 2, rise: 4,
+            vel: new THREE.Vector3((Math.random() - 0.5) * 0.6, 1.2 + Math.random() * 1.2, (Math.random() - 0.5) * 0.6),
+          });
+      }
     }
-    for (let i = emit(10); i > 0; i--) {
+    for (let i = emit(10 * 0.75); i > 0; i--) {
       const g = 0.04 + Math.random() * 0.05;
       this._sprite(this.smokeTex, new THREE.Color(g, g, g), jitter(0.6).add(new THREE.Vector3(0, 0.6, 0)),
         0.9 + Math.random() * 0.5, 3 + Math.random() * 1.8, {
@@ -836,6 +1076,53 @@ export class Effects {
       const v = new THREE.Vector3((Math.random() - 0.5) * 4, 3 + Math.random() * 4, (Math.random() - 0.5) * 4);
       this.particles.push({ obj: spark, life: 0.7 + Math.random() * 0.8, age: 0, vel: v, size, spark: true });
     }
+  }
+
+  /** Engine fire for one tank. slot 0 = player, 1 = enemy. stage 0 hides; 1–4 grow with damage. */
+  setDamageFire(pos, stage, slot = 0) {
+    const sprite = this.damageFire?.sprites[slot];
+    if (!sprite) return;
+    const scale = DAMAGE_FIRE_SCALE[stage] ?? 0;
+    if (scale <= 0 || !pos) {
+      sprite.visible = false;
+      return;
+    }
+    sprite.visible = true;
+    sprite.position.copy(pos);
+    sprite.scale.set(scale, scale, 1);
+  }
+
+  _blitDamageFire(frame) {
+    const fire = this.damageFire;
+    if (!fire || frame === fire.frame) return;
+    fire.frame = frame;
+    const { gif, image } = fire;
+    const idx = gif.frames[frame];
+    const pal = gif.palettes[frame];
+    const px = image.data;
+    for (let i = 0; i < idx.length; i++) {
+      const p = idx[i];
+      const o = i * 4;
+      const c = p * 3;
+      px[o] = pal[c];
+      px[o + 1] = pal[c + 1];
+      px[o + 2] = pal[c + 2];
+      // Palette 0 is the black backdrop — punch it out so the quad doesn't cover the tank.
+      px[o + 3] = p === 0 ? 0 : 255;
+    }
+    fire.ctx.putImageData(image, 0, 0);
+    fire.map.needsUpdate = true;
+  }
+
+  _tickDamageFire(dt) {
+    const fire = this.damageFire;
+    if (!fire?.sprites.some((s) => s.visible)) return;
+    fire.acc += dt;
+    const delay = (fire.gif.delays[fire.frame] ?? 0.1) / DAMAGE_FIRE_SPEED;
+    if (fire.acc < delay) return;
+    fire.acc -= delay;
+    if (fire.acc > delay) fire.acc = 0;
+    this._blitDamageFire((fire.frame + 1) % fire.gif.frames.length);
   }
 
   _groundExplosion(point) {
@@ -863,14 +1150,25 @@ export class Effects {
     };
     blitFlipbookFrame(flipbook, 0);
 
-    const mat = new THREE.SpriteMaterial({
-      map,
-      color: new THREE.Color(1.35, 1.2, 0.95),
+    // Atlas stores the fire in RGB and the coverage in alpha. Straight alpha shows
+    // that pair; screen was remixing it into the wrong channel. Don't write the
+    // card's alpha into the target or the quad stamps a white square.
+    const sample = texture(map);
+    const mat = new THREE.SpriteNodeMaterial({
       transparent: true,
       depthWrite: false,
       opacity: 1,
-      toneMapped: false,
+      fog: false,
     });
+    mat.colorNode = vec4(0, 0, 0, sample.a);
+    mat.emissiveNode = sample.rgb.mul(uniform(toEmissiveLevel(new THREE.Color(1.35, 1.2, 0.95))));
+    mat.blending = THREE.CustomBlending;
+    mat.blendEquation = THREE.AddEquation;
+    mat.blendSrc = THREE.SrcAlphaFactor;
+    mat.blendDst = THREE.OneMinusSrcAlphaFactor;
+    mat.blendEquationAlpha = THREE.AddEquation;
+    mat.blendSrcAlpha = THREE.ZeroFactor;
+    mat.blendDstAlpha = THREE.OneFactor;
     const s = new THREE.Sprite(mat);
     const w = cfg.width;
     const h = w / cfg.aspect;
@@ -886,9 +1184,17 @@ export class Effects {
     });
   }
 
-  _explode(point, normal, dir, collider, { emissive = true } = {}) {
+  _explode(point, normal, dir, collider, { emissive = true, muzzle = false } = {}) {
     // Test: ground-explosion flipbook as the main impact read (kept large).
     this._groundExplosion(point);
+    // Main-gun hits reuse the turret firing cards. Plume points out of the surface.
+    if (muzzle) {
+      const out = normal.clone();
+      if (out.lengthSq() < 1e-8) out.copy(dir).negate();
+      else out.normalize();
+      this._spawnMainMuzzle(this.mainMuzzleFront, point, out, false, 2);
+      this._spawnMainMuzzle(this.mainMuzzleSide, point, out, true, 2);
+    }
     // Quick emissive glow-ball flash (placeholder texture, additive, fades over glowLife).
     if (emissive && this.impactGlowTex) {
       const glowSize = GROUND_EXPLOSION.glowSize;
@@ -918,8 +1224,8 @@ export class Effects {
     this._flashLight(point.clone().addScaledVector(normal, 1.5), 220);
 
     // Emissive sparks: fly out from center, bounce, white → red as they die.
-    for (let i = 0; emissive && i < 60; i++) {
-      const size = (0.45 + Math.random() * 0.55) * 0.5;
+    for (let i = 0; emissive && i < 30; i++) {
+      const size = (0.45 + Math.random() * 0.55) * 0.25;
       const mat = emissiveSpriteMat(this.flashTex, new THREE.Color(10, 10, 10), { additive: true });
       const spark = new THREE.Sprite(mat);
       spark.scale.setScalar(size);
@@ -932,10 +1238,10 @@ export class Effects {
       });
     }
 
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 3; i++) {
       const v = normal.clone().multiplyScalar(1.5 + Math.random() * 3)
         .add(new THREE.Vector3(Math.random() - 0.5, Math.random(), Math.random() - 0.5).multiplyScalar(3));
-      this._sprite(this.smokeTex, new THREE.Color(0.3, 0.27, 0.22), point.clone(), 1.2, 2.5 + Math.random() * 1.5,
+      this._sprite(this.smokeTex, new THREE.Color(0.3, 0.27, 0.22), point.clone(), 0.6, 2.5 + Math.random() * 1.5,
         { vel: v, grow: 3.5, rise: 0.7, opacity: 0.45, drag: 1.8 });
     }
     for (let i = 0; i < 10; i++) {
@@ -962,6 +1268,7 @@ export class Effects {
 
   update(dt, heightAt) {
     const R = this.RAPIER;
+    this._tickDamageFire(dt);
     if (this.camera) this.camera.getWorldQuaternion(this._camQInv).invert();
     for (let i = this.shells.length - 1; i >= 0; i--) {
       const s = this.shells[i];
@@ -975,7 +1282,7 @@ export class Effects {
         if (hit) {
           const p = s.pos.clone().addScaledVector(dir, hit.timeOfImpact);
           this.onShellHit({ point: p, collider: hit.collider, owner: s.owner, dir });
-          this._explode(p, new THREE.Vector3(hit.normal.x, hit.normal.y, hit.normal.z), dir, hit.collider);
+          this._explode(p, new THREE.Vector3(hit.normal.x, hit.normal.y, hit.normal.z), dir, hit.collider, { muzzle: true });
         }
         this.scene.remove(s.mesh);
         this.shells.splice(i, 1);
@@ -983,8 +1290,48 @@ export class Effects {
       }
       s.pos.add(step);
       s.vel.y -= GRAVITY * dt;
-      s.mesh.position.copy(s.pos);
-      s.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir);
+      const visLen = Math.min(SHELL_VIS_MAX, Math.max(SHELL_GEO_LEN, len * 0.38));
+      this._placeTracer(s.mesh, s.pos, dir, visLen, SHELL_GEO_LEN);
+    }
+
+    for (const stream of this._mgStreams.values()) {
+      stream.shotT += dt;
+      if (stream.shotT >= MG_FLASH.shotInterval) {
+        stream.shotT -= MG_FLASH.shotInterval;
+        this._triggerMgShot(stream);
+        // Leave it up for this render. Ageing here hid the flash before draw when dt >= flashLife.
+      } else {
+        stream.flashAge += dt;
+        const alive = stream.flashAge < MG_FLASH.flashLife;
+        this._layoutMgFlash(
+          stream.flash, stream.pose.pos, stream.pose.dir,
+          alive, stream.roll,
+        );
+        if (alive) {
+          const k = stream.flashAge / MG_FLASH.flashLife;
+          stream.flash.light.intensity *= Math.max(0, 1 - k * k);
+        } else {
+          stream.flash.light.intensity = 0;
+        }
+      }
+    }
+
+    for (let i = this.mgTracers.length - 1; i >= 0; i--) {
+      const t = this.mgTracers[i];
+      let step = MG_TRACER_SPEED * dt;
+      const remain = t.maxDist - t.traveled;
+      const done = step >= remain;
+      if (done) step = Math.max(0, remain);
+      t.traveled += step;
+      t.pos.addScaledVector(t.dir, step);
+      if (done) {
+        this.scene.remove(t.mesh);
+        this.mgTracers.splice(i, 1);
+        continue;
+      }
+      // Tail stays in front of the plume. Stretching back to the muzzle ate the flash.
+      const visLen = Math.min(MG_TRACER_LEN, Math.max(0.4 * 1.5, t.traveled));
+      this._placeTracer(t.mesh, t.pos, t.dir, visLen, MG_TRACER_GEO_LEN);
     }
 
     for (let i = this.particles.length - 1; i >= 0; i--) {
@@ -1034,8 +1381,8 @@ export class Effects {
           p.vel.y = Math.abs(p.vel.y) * 0.5;
         }
         // Metal: white → red. Dirt: brown → dark earth. Stay emissive either way.
-        const from = p.sparkFrom ?? [10, 10, 10];
-        const to = p.sparkTo ?? [8, 0.55, 0.06];
+        const from = p.sparkFrom ?? [SPRITE_EMISSIVE, SPRITE_EMISSIVE, SPRITE_EMISSIVE];
+        const to = p.sparkTo ?? [8, 0.55, 0.06].map((v) => v * (SPRITE_EMISSIVE / 10));
         const r = THREE.MathUtils.lerp(from[0], to[0], k);
         const gC = THREE.MathUtils.lerp(from[1], to[1], k);
         const b = THREE.MathUtils.lerp(from[2], to[2], k);
@@ -1065,6 +1412,7 @@ export class Effects {
         const fb = p.flipbook;
         const frame = Math.min(fb.frames - 1, Math.floor(p.age * fb.fps));
         blitFlipbookFrame(fb, frame);
+        if (p.muzzleDir) this._aimMuzzleSide(p.obj, p.muzzleDir);
         // Soft fade on the last ~15% so the last sparse frames don't hard-cut.
         p.obj.material.opacity = k > 0.85 ? (1 - (k - 0.85) / 0.15) : 1;
         continue;
@@ -1083,28 +1431,6 @@ export class Effects {
     for (const L of this.lights) {
       L.t += dt;
       L.light.intensity = L.t < 0.25 ? L.peak * (1 - L.t / 0.25) ** 2 : 0;
-    }
-
-    for (const stream of this._mgStreams.values()) {
-      stream.shotT += dt;
-      if (stream.shotT >= MG_FLASH.shotInterval) {
-        stream.shotT -= MG_FLASH.shotInterval;
-        this._triggerMgShot(stream);
-      } else {
-        this._layoutMgFlash(
-          stream.flash, stream.pose.pos, stream.pose.dir,
-          stream.flashAge < MG_FLASH.flashLife, stream.roll,
-        );
-      }
-      stream.flashAge += dt;
-      if (stream.flashAge >= MG_FLASH.flashLife) {
-        stream.flash.star.visible = false;
-        for (const p of stream.flash.plumes) p.visible = false;
-        stream.flash.light.intensity = 0;
-      } else {
-        const k = stream.flashAge / MG_FLASH.flashLife;
-        stream.flash.light.intensity *= Math.max(0, 1 - k * k);
-      }
     }
   }
 }

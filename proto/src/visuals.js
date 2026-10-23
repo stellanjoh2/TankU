@@ -4,6 +4,25 @@ import { VISUAL_DEFAULTS } from './visualDefaults.js';
 
 const SKY_CLOUD_SPEED = 0.00002; // SkyMesh default cloudSpeed = slider 1×
 
+// key, GLB material, slider label. Headlights and tail lamps stay on the baked map.
+const TANK_PBR = [
+  ['paint', 'M_Paint_Olive', 'Paint'],
+  ['metal', 'M_Metal_Dark', 'Metal'],
+  ['track', 'M_Track', 'Tracks'],
+  ['rubber', 'M_Rubber', 'Rubber'],
+];
+
+function tankFromJson(json) {
+  const src = json?.tank;
+  const out = {};
+  for (const [key] of TANK_PBR) {
+    const d = VISUAL_DEFAULTS.tank[key];
+    const s = src?.[key];
+    out[key] = { metal: s?.metal ?? d.metal, rough: s?.rough ?? d.rough };
+  }
+  return out;
+}
+
 function hexOf(c) {
   return `#${c.getHexString()}`;
 }
@@ -41,6 +60,7 @@ function hydrate(json) {
     ambient: json.ambient,
     lightProbe: json.lightProbe ?? 1,
     env: json.env,
+    tank: tankFromJson(json),
     ground: {
       grass: col(g.grass),
       dry: col(g.dry),
@@ -86,9 +106,33 @@ export function createVisualsEditor(ctx) {
     renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe,
     terrain, grass, vegetation, barrels, post, shadowTint, fx, clouds,
     getEnvIntensity, setEnvIntensity,
+    tanks = [],
     initial = VISUAL_DEFAULTS,
     game = null,
   } = ctx;
+
+  function applyTankPbr(state) {
+    if (!state) return;
+    for (const t of tanks) {
+      for (const [key, matName] of TANK_PBR) {
+        const s = state[key];
+        if (s) t.setPbr(matName, s.metal, s.rough);
+      }
+    }
+  }
+
+  function readTankPbr() {
+    const src = tanks[0];
+    const out = {};
+    for (const [key, matName] of TANK_PBR) {
+      const m = src?.pbrMats.get(matName)?.[0];
+      const d = VISUAL_DEFAULTS.tank[key];
+      out[key] = m
+        ? { metal: m.metalness, rough: m.roughness }
+        : { metal: d.metal, rough: d.rough };
+    }
+    return out;
+  }
 
   const fogColor = sky.userData.fogColor;
   const gU = grass.material.uniforms;
@@ -143,6 +187,7 @@ export function createVisualsEditor(ctx) {
       ambient: ambient.intensity,
       lightProbe: lightProbe?.intensity ?? 0,
       env: getEnvIntensity(),
+      tank: readTankPbr(),
       ground: {
         grass: terrain.palette.grass.clone(),
         dry: terrain.palette.dry.clone(),
@@ -198,6 +243,7 @@ export function createVisualsEditor(ctx) {
     ambient.intensity = s.ambient;
     if (lightProbe) lightProbe.intensity = s.lightProbe ?? 1;
     setEnvIntensity(s.env);
+    applyTankPbr(s.tank);
     terrain.setPalette(s.ground);
     grass.setColors({
       base: s.grassBase,
@@ -260,6 +306,7 @@ export function createVisualsEditor(ctx) {
       ambient: s.ambient,
       lightProbe: s.lightProbe,
       env: s.env,
+      tank: s.tank,
       ground: {
         grass: c(s.ground.grass),
         dry: c(s.ground.dry),
@@ -508,6 +555,28 @@ export function createVisualsEditor(ctx) {
     addColor(s, 'Hemi ground', () => hexOf(hemi.groundColor), (v) => hemi.groundColor.set(v));
     addSlider(s, 'Hemi strength', 0, 2, 0.02, () => hemi.intensity, (v) => { hemi.intensity = v; });
     addSlider(s, 'Ambient', 0, 1, 0.01, () => ambient.intensity, (v) => { ambient.intensity = v; });
+  }
+
+  if (tanks.length) {
+    const s = addSection('Tank');
+    for (const [key, matName, label] of TANK_PBR) {
+      addSlider(s, `${label} metallic`, 0, 1, 0.01,
+        () => readTankPbr()[key].metal,
+        (v) => {
+          for (const t of tanks) {
+            const rough = t.pbrMats.get(matName)?.[0]?.roughness ?? VISUAL_DEFAULTS.tank[key].rough;
+            t.setPbr(matName, v, rough);
+          }
+        });
+      addSlider(s, `${label} roughness`, 0, 1, 0.01,
+        () => readTankPbr()[key].rough,
+        (v) => {
+          for (const t of tanks) {
+            const metal = t.pbrMats.get(matName)?.[0]?.metalness ?? VISUAL_DEFAULTS.tank[key].metal;
+            t.setPbr(matName, metal, v);
+          }
+        });
+    }
   }
 
   // Ground

@@ -1,5 +1,7 @@
 // Stylized tropical vegetation pack (Serhii3D) — clustered along beaches / land.
 // Distance LODs come from vegetation_lods.glb (scripts/build_vegetation_lods.py).
+// Ground plants and rocks are InstancedMesh batches (one per prefab mesh / LOD).
+// Palms stay as skinned clones so each trunk can lean on its own phase.
 import * as THREE from 'three';
 import { PropertyBinding } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
@@ -21,10 +23,11 @@ const PREFABS = {
   Bush_02: { kind: 'plant', weight: 1.0 },
   Bush_03: { kind: 'plant', weight: 0.7 },
   Bush_04: { kind: 'plant', weight: 0.85 },
-  Plant_01: { kind: 'plant', weight: 0.9 },
-  Plant_02: { kind: 'plant', weight: 0.9 },
-  Plant_03: { kind: 'plant', weight: 1.0 },
-  Plant_04: { kind: 'plant', weight: 0.55 },
+  // Big leaf plants (banana / tall broad leaves). Count is thinned 20% after placement.
+  Plant_01: { kind: 'plant', weight: 0.9, big: true },
+  Plant_02: { kind: 'plant', weight: 0.9, big: true },
+  Plant_03: { kind: 'plant', weight: 1.0, big: true },
+  Plant_04: { kind: 'plant', weight: 0.55, big: true },
   Plant_05: { kind: 'plant', weight: 1.0 },
   Plant_06: { kind: 'plant', weight: 1.05 },
   Plant_07: { kind: 'plant', weight: 1.15 },
@@ -37,6 +40,7 @@ const PREFABS = {
 
 const GLOBAL_SCALE = 1.0;
 const TREE_SCALE = 1.375; // +10% vs prior 1.25
+const PALM_SINK = 0.25; // metres — trunks were floating above the ground
 const ROCK_SCALE = 1.5; // 50% larger than previous rock scales
 const SPAWN = { x: -8, z: -5 };
 const SPAWN_CLEAR = 14;
@@ -64,9 +68,9 @@ const COVER_MAX_FOOTPRINT = 15;
 const COVER_SPAWN_CLEAR = 18;
 const PALM_TRUNK_R = 0.4;
 
-/** Default visible palm count (previous ~28 + 25%). Slider 1.0 = this. */
+/** Visible palms at slider 1.0. −20% from the previous 35. */
 export const PALM_AMOUNT_DEFAULT = 1;
-const BASE_PALM_TARGET = 35;
+const BASE_PALM_TARGET = 28;
 const MAX_PALM_TARGET = Math.ceil(BASE_PALM_TARGET * 2);
 
 /** Default visible ground-plant count (+25% vs prior 200). Slider 1.0 = this; pool is 2× for headroom. */
@@ -80,19 +84,17 @@ export const PALM_BRIGHTNESS_DEFAULT = 1;
 export const WIND_DEFAULT = 0.085;
 /** Radians of total palm lean per unit of wind amp (distributed across upper bones). */
 const PALM_WIND_LEAN = 1.35;
-/** Radians of big-leaf / bush lean per unit of wind amp (shorter plants → less lean). */
-const PLANT_WIND_LEAN = 0.7;
 
 /**
- * Camera-distance band edges (m): LOD0 < 25, LOD1 < 45, LOD2 < 70, LOD3 beyond.
+ * Camera-distance band edges (m): LOD0 < 20, LOD1 < 36, LOD2 < 55, LOD3 beyond.
  * The chase cam sits 7–10 m behind the tank, so LOD0 must cover the player's surroundings.
  */
-const LOD_EDGES = [25, 45, 70];
+const LOD_EDGES = [20, 36, 55];
 const LOD_LEVELS = LOD_EDGES.length + 1;
 /** Big cover boulders are 3–5 m tall, so they step down at twice the distance. */
 const COVER_LOD_MUL = 2;
 /** Ground plants are fully hidden past this (palms and rocks never cull). */
-export const PLANT_CULL_DEFAULT = 120;
+export const PLANT_CULL_DEFAULT = 50;
 
 function seededRand(seed) {
   let s = seed >>> 0;
@@ -139,14 +141,15 @@ function isFoliageMaterial(m) {
 }
 
 /** Pack ships leaves as alphaMode:BLEND (depthWrite off) — force opaque cutouts. */
-function setupCutoutMaterial(m) {
+function setupCutoutMaterial(m, doubleSide) {
   m.transparent = false;
   m.opacity = 1;
   m.depthWrite = true;
   m.depthTest = true;
   m.alphaTest = 0.5;
   m.blending = THREE.NormalBlending;
-  m.side = THREE.DoubleSide;
+  // Palm fronds and big leaf cards are double-sided. Smaller foliage stays single-sided.
+  m.side = doubleSide ? THREE.DoubleSide : THREE.FrontSide;
   // Ensure map alpha drives the discard (not leftover BLEND state from GLTF).
   if (m.map) {
     m.map.colorSpace = THREE.SRGBColorSpace;
@@ -160,7 +163,7 @@ function setupCutoutMaterial(m) {
  * `lodNodes` maps `<mesh>_LOD<n>` → node from vegetation_lods.glb (world transforms match the source).
  * Every mesh gets `userData.lodRange = [min, max]`: it shows while the instance's LOD level is in range.
  */
-function extractPrefab(src, foliageMats, palmLeafMats, lodNodes) {
+function extractPrefab(src, foliageMats, palmLeafMats, lodNodes, doubleSideLeaves) {
   src.updateWorldMatrix(true, true);
   const group = new THREE.Group();
   group.name = src.name;
@@ -183,7 +186,7 @@ function extractPrefab(src, foliageMats, palmLeafMats, lodNodes) {
       else mesh.material = m;
       if (m.map) m.map.colorSpace = THREE.SRGBColorSpace;
       if (isFoliageMaterial(m)) {
-        setupCutoutMaterial(m);
+        setupCutoutMaterial(m, isPalmLeafMaterial(m) || doubleSideLeaves);
         if (!m.userData.baseColor) m.userData.baseColor = m.color.clone();
         if (isPalmLeafMaterial(m)) palmLeafMats.add(m);
         else foliageMats.add(m);
@@ -447,11 +450,13 @@ export async function buildVegetation(scene, { RAPIER, world }) {
       console.warn(`[vegetation] missing prefab ${name}`);
       continue;
     }
-    const extracted = extractPrefab(src, foliageMats, palmLeafMats, lodNodes);
+    const extracted = extractPrefab(src, foliageMats, palmLeafMats, lodNodes, !!meta.big);
     if (meta.kind === 'tree') {
       extracted.template = rigPalmTemplate(extracted.template, extracted.height);
     }
-    catalog[meta.kind].push({ name, meta, ...extracted });
+    catalog[meta.kind].push({
+      name, meta, ...extracted, plantRecs: [], rockRecs: [], coverRecs: [],
+    });
   }
   console.info(
     `[vegetation] catalog trees=${catalog.tree.length} rocks=${catalog.rock.length} plants=${catalog.plant.length}`,
@@ -483,12 +488,40 @@ export async function buildVegetation(scene, { RAPIER, world }) {
 
   function placeOne(item, x, z, scaleMul = 1) {
     if (count >= MAX_PLACED) return false;
-    const kindScale = item.meta.kind === 'tree' ? TREE_SCALE : 1;
+    const kind = item.meta.kind;
+    const kindScale = kind === 'tree' ? TREE_SCALE : 1;
     const scale = GLOBAL_SCALE * kindScale * scaleMul;
     const r = collisionRadius(item, scale);
     if (overlaps(placed, x, z, r)) return false;
 
-    const inst = item.meta.kind === 'tree' ? cloneSkinned(item.template) : item.template.clone(true);
+    const yaw = rand() * Math.PI * 2;
+    // Rocks: bury 50% of height so they sit in the ground, not float.
+    const y =
+      kind === 'rock'
+        ? lowestGround(x, z, r * 0.6) - item.height * scale * 0.5
+        : heightAt(x, z) - (kind === 'tree' ? PALM_SINK : 0);
+
+    if (kind !== 'tree') {
+      const rec = {
+        item, x, y, z, yaw, scale, kind,
+        windPhase: rand() * Math.PI * 2,
+        lod: 0,
+        visible: true,
+        rotX: 0,
+        rotZ: 0,
+      };
+      if (kind === 'plant') {
+        item.plantRecs.push(rec);
+        plants.push(rec);
+      } else {
+        item.rockRecs.push(rec);
+      }
+      placed.push({ x, z, r });
+      count++;
+      return true;
+    }
+
+    const inst = cloneSkinned(item.template);
     inst.traverse((c) => {
       if (c.isMesh) {
         c.castShadow = true;
@@ -497,28 +530,17 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     });
     initLod(inst);
 
-    const yaw = rand() * Math.PI * 2;
-    // Rocks: bury 50% of height so they sit in the ground, not float.
-    const y =
-      item.meta.kind === 'rock'
-        ? lowestGround(x, z, r * 0.6) - item.height * scale * 0.5
-        : heightAt(x, z);
     inst.position.set(x, y, z);
     inst.rotation.y = yaw;
     inst.scale.setScalar(scale);
-    inst.userData.kind = item.meta.kind;
-    if (item.meta.kind === 'tree' || item.meta.kind === 'plant') {
-      inst.userData.windPhase = rand() * Math.PI * 2;
-      inst.userData.yaw = yaw;
-    }
-    if (item.meta.kind === 'tree') {
-      inst.userData.palmBones = collectPalmBones(inst);
-    }
+    inst.userData.kind = kind;
+    inst.userData.windPhase = rand() * Math.PI * 2;
+    inst.userData.yaw = yaw;
+    inst.userData.palmBones = collectPalmBones(inst);
     root.add(inst);
     placed.push({ x, z, r });
     count++;
-    if (item.meta.kind === 'tree') palms.push(inst);
-    if (item.meta.kind === 'plant') plants.push(inst);
+    palms.push(inst);
     return true;
   }
 
@@ -546,21 +568,147 @@ export async function buildVegetation(scene, { RAPIER, world }) {
   let lodScale = 1;
   let plantCull = PLANT_CULL_DEFAULT;
 
-  /** Level -1 hides every mesh (plants past the cull distance). */
+  const staticBatches = [];
+  const plantBatches = [];
+  const _dummy = new THREE.Object3D();
+  const _m = new THREE.Matrix4();
+
+  function lodMeshesOf(template) {
+    const meshes = [];
+    template.traverse((c) => {
+      if (c.isMesh && c.userData.lodRange) meshes.push(c);
+    });
+    return meshes;
+  }
+
+  function composeRec(rec, local, dst) {
+    _dummy.position.set(rec.x, rec.y, rec.z);
+    _dummy.rotation.set(rec.rotX, rec.yaw, rec.rotZ);
+    _dummy.scale.setScalar(rec.scale);
+    _dummy.updateMatrix();
+    dst.multiplyMatrices(_dummy.matrix, local);
+  }
+
+  /** Pack the instances whose LOD is live into the front of each batch. */
+  function writeBatch(batch) {
+    for (const mesh of batch.parts) {
+      const [lo, hi] = mesh.userData.lodRange;
+      const local = mesh.userData.localMatrix;
+      let n = 0;
+      for (const rec of batch.recs) {
+        if (!rec.visible || rec.lod < lo || rec.lod > hi) continue;
+        composeRec(rec, local, _m);
+        mesh.setMatrixAt(n++, _m);
+      }
+      mesh.count = n;
+      mesh.visible = n > 0;
+      if (n > 0) mesh.instanceMatrix.needsUpdate = true;
+    }
+  }
+
+  /** Sphere must cover every record, including ones a later LOD pack leaves out. */
+  function sealBounds(batch) {
+    for (const mesh of batch.parts) {
+      const local = mesh.userData.localMatrix;
+      const recs = batch.recs;
+      for (let i = 0; i < recs.length; i++) {
+        composeRec(recs[i], local, _m);
+        mesh.setMatrixAt(i, _m);
+      }
+      mesh.count = recs.length;
+      mesh.computeBoundingSphere();
+      if (mesh.boundingSphere) mesh.boundingSphere.radius += 1.5;
+    }
+  }
+
+  function makeBatch(item, recs, parent, lodMul, castShadow = false) {
+    if (!recs.length) return null;
+    const parts = [];
+    for (const src of lodMeshesOf(item.template)) {
+      src.updateMatrix();
+      const mesh = new THREE.InstancedMesh(src.geometry, src.material, recs.length);
+      mesh.name = `${item.name}:${src.name}`;
+      mesh.castShadow = castShadow;
+      mesh.receiveShadow = true;
+      mesh.frustumCulled = true;
+      mesh.userData.lodRange = src.userData.lodRange.slice();
+      mesh.userData.localMatrix = src.matrix.clone();
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      mesh.count = 0;
+      mesh.visible = false;
+      parent.add(mesh);
+      parts.push(mesh);
+    }
+    if (!parts.length) return null;
+    const batch = { recs, parts, lodMul };
+    staticBatches.push(batch);
+    return batch;
+  }
+
+  function bakeStatic() {
+    for (const item of catalog.plant) {
+      const batch = makeBatch(item, item.plantRecs, root, 1, false);
+      if (batch) plantBatches.push(batch);
+    }
+    for (const item of catalog.rock) {
+      makeBatch(item, item.rockRecs, root, 1, false);
+      makeBatch(item, item.coverRecs, coverRoot, COVER_LOD_MUL, true);
+    }
+    for (const batch of staticBatches) {
+      sealBounds(batch);
+      writeBatch(batch);
+    }
+  }
+
+  function dropRec(list, rec) {
+    const i = list.indexOf(rec);
+    if (i >= 0) list.splice(i, 1);
+  }
+
+  /** Cover boulders remove the plants and pebbles they bury. Palms stay. */
+  function swallowStatic(x, z, swallow) {
+    for (let i = plants.length - 1; i >= 0; i--) {
+      const p = plants[i];
+      if (Math.hypot(p.x - x, p.z - z) >= swallow) continue;
+      plants.splice(i, 1);
+      dropRec(p.item.plantRecs, p);
+    }
+    for (const item of catalog.rock) {
+      const recs = item.rockRecs;
+      for (let i = recs.length - 1; i >= 0; i--) {
+        const p = recs[i];
+        if (Math.hypot(p.x - x, p.z - z) >= swallow) continue;
+        recs.splice(i, 1);
+      }
+    }
+  }
+
+  /** Level -1 hides every plant past the cull distance. Palms stay per-object. */
   function updateLod(camPos) {
     for (const inst of lodInstances) {
       if (!inst.visible || !inst.parent) continue;
-      const kind = inst.userData.kind;
       const d = inst.position.distanceTo(camPos);
       const cur = inst.userData.lod;
-      const cullPad = plantCull * 0.05;
-      let level;
-      if (kind === 'plant' && d > plantCull + (cur === -1 ? -cullPad : cullPad)) {
-        level = -1;
-      } else {
-        level = pickLod(d, LOD_EDGES, kind === 'cover' ? lodScale * COVER_LOD_MUL : lodScale, cur);
+      setLodLevel(inst, pickLod(d, LOD_EDGES, lodScale, cur));
+    }
+    const cullPad = plantCull * 0.05;
+    for (const batch of staticBatches) {
+      let changed = false;
+      for (const rec of batch.recs) {
+        const d = Math.hypot(rec.x - camPos.x, rec.y - camPos.y, rec.z - camPos.z);
+        const cur = rec.lod;
+        let level;
+        if (rec.kind === 'plant' && d > plantCull + (cur === -1 ? -cullPad : cullPad)) {
+          level = -1;
+        } else {
+          level = pickLod(d, LOD_EDGES, lodScale * batch.lodMul, cur);
+        }
+        if (level !== cur) {
+          rec.lod = level;
+          changed = true;
+        }
       }
-      setLodLevel(inst, level);
+      if (changed) writeBatch(batch);
     }
   }
 
@@ -587,15 +735,6 @@ export async function buildVegetation(scene, { RAPIER, world }) {
         bones[i].rotation.z = leanZ * k;
       }
     }
-    const plantLean = windAmp * PLANT_WIND_LEAN;
-    for (const p of plants) {
-      if (!p.visible || p.userData.lod === -1) continue;
-      const ph = p.userData.windPhase ?? 0;
-      p.rotation.y = p.userData.yaw ?? p.rotation.y;
-      // Slightly faster sway than palms — big leaves catch gusts quicker.
-      p.rotation.x = Math.sin(time * 1.35 + ph) * plantLean;
-      p.rotation.z = Math.sin(time * 1.55 + ph * 1.9) * plantLean * 0.9;
-    }
   }
 
   function applyPalmVisibility() {
@@ -610,7 +749,28 @@ export async function buildVegetation(scene, { RAPIER, world }) {
 
   function applyPlantVisibility() {
     const show = Math.round(BASE_PLANT_TARGET * plantAmount);
-    for (let i = 0; i < plants.length; i++) plants[i].visible = i < show;
+    for (let i = 0; i < plants.length; i++) {
+      // Culled big plants keep their slot so smaller plants don't backfill the gap.
+      plants[i].visible = i < show && !plants[i].culled;
+    }
+    for (const batch of plantBatches) writeBatch(batch);
+  }
+
+  /** Hide 20% of big-leaf plants, spread evenly so every part of the map thins together. */
+  function cullBigPlants() {
+    const big = [];
+    for (const p of plants) if (p.item.meta.big) big.push(p);
+    const remove = Math.round(big.length * 0.2);
+    if (remove <= 0) return;
+    const step = big.length / remove;
+    const used = new Set();
+    for (let k = 0; k < remove; k++) {
+      let i = Math.min(big.length - 1, Math.floor((k + 0.5) * step));
+      while (used.has(i) && i + 1 < big.length) i++;
+      if (used.has(i)) continue;
+      used.add(i);
+      big[i].culled = true;
+    }
   }
 
   function setPlantAmount(v) {
@@ -762,38 +922,34 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     const rockH = item.height * scale;
     // Bury 50% so big cover stones don't float on uneven ground
     const y = lowestGround(x, z, Math.min(hx, hz) * 0.8) - rockH * 0.5;
-    const inst = item.template.clone(true);
-    inst.position.set(x, y, z);
-    inst.rotation.y = yaw;
-    inst.scale.setScalar(scale);
-    inst.userData.kind = 'cover';
-    coverRoot.add(inst);
-    inst.updateMatrixWorld(true);
-    initLod(inst);
+    item.coverRecs.push({
+      item, x, y, z, yaw, scale, kind: 'cover',
+      windPhase: 0, lod: 0, visible: true, rotX: 0, rotZ: 0,
+    });
+
+    _dummy.position.set(x, y, z);
+    _dummy.rotation.set(0, yaw, 0);
+    _dummy.scale.setScalar(scale);
+    _dummy.updateMatrix();
 
     const pts = [];
-    inst.traverse((m) => {
-      if (!m.isMesh || m.userData.lodRange?.[0] > 0) return;
-      const p = m.geometry.attributes.position;
+    for (const src of lodMeshesOf(item.template)) {
+      if (src.userData.lodRange?.[0] > 0) continue;
+      src.updateMatrix();
+      _m.multiplyMatrices(_dummy.matrix, src.matrix);
+      const p = src.geometry.attributes.position;
       const stride = Math.max(1, Math.floor(p.count / 600));
       for (let i = 0; i < p.count; i += stride) {
-        v.fromBufferAttribute(p, i).applyMatrix4(m.matrixWorld);
+        v.fromBufferAttribute(p, i).applyMatrix4(_m);
         pts.push(v.x - x, v.y - y, v.z - z);
       }
-    });
+    }
     const body = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(x, y, z));
     const hull = RAPIER.ColliderDesc.convexHull(new Float32Array(pts));
     if (hull) world.createCollider(hull.setFriction(0.8), body);
 
     // Drop undergrowth / pebbles the boulder now swallows.
-    const swallow = Math.max(hx, hz);
-    for (const c of [...root.children]) {
-      if (c.userData.kind === 'tree') continue;
-      if (Math.hypot(c.position.x - x, c.position.z - z) >= swallow) continue;
-      root.remove(c);
-      const i = plants.indexOf(c);
-      if (i >= 0) plants.splice(i, 1);
-    }
+    swallowStatic(x, z, Math.max(hx, hz));
     coverRocks.push({ x, z, y, yaw, hx, hz, r: Math.max(hx, hz), height: item.size.y * scale });
   }
 
@@ -846,15 +1002,17 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     return list;
   }
 
+  cullBigPlants();
   applyPalmVisibility();
   applyPlantVisibility();
+  bakeStatic();
 
   console.info(
-    `[vegetation] ${count} instances (` +
+    `[vegetation] ${count} placed (` +
       `${palms.length} palms pooled, ${Math.round(BASE_PALM_TARGET * palmAmount)} visible; ` +
-      `${plants.length} plants pooled, ${Math.round(BASE_PLANT_TARGET * plantAmount)} visible) + ` +
-      `${rockGroups} gray-rock piles (${rockStoneCount} stones) + ` +
-      `${coverGroupCenters.length} cover outcrops (${coverRocks.length} boulders)`,
+      `${plants.length} plants instanced, ${Math.round(BASE_PLANT_TARGET * plantAmount)} visible) + ` +
+      `${rockGroups} gray-rock piles (${rockStoneCount} stones, instanced) + ` +
+      `${coverGroupCenters.length} cover outcrops (${coverRocks.length} boulders, instanced)`,
   );
 
   return {

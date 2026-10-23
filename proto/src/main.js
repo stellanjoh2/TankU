@@ -36,6 +36,16 @@ import './style.css';
 
 const FIXED_DT = 1 / 120;
 const MAX_SUBSTEPS = 4;
+const MAX_RENDER_W = 1920;
+const MAX_RENDER_H = 1080;
+
+/** Drawing buffer stays within 1920×1080. CSS canvas still fills the window. */
+function renderPixelRatio() {
+  const dpr = Math.min(devicePixelRatio || 1, 1.5);
+  const w = innerWidth * dpr;
+  const h = innerHeight * dpr;
+  return dpr * Math.min(1, MAX_RENDER_W / w, MAX_RENDER_H / h);
+}
 const sunDir = new THREE.Vector3(-0.45, 0.75, 0.48).normalize();
 const SHADOW_EXTENT = 38;
 const ENEMY_TINT = new THREE.Color(1.0, 0.72, 0.38);     // orange drab (keep channels ≤1 so bloom stays off)
@@ -55,7 +65,7 @@ async function main() {
   if (!renderer.backend.isWebGPUBackend) {
     throw new Error('WebGPU is required (WebGL2 fallback disabled for this proto).');
   }
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setPixelRatio(renderPixelRatio());
   renderer.setSize(innerWidth, innerHeight);
   // HDR scene → post bloom → ACES Filmic (same path as three.js webgpu_tonemapping).
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -107,7 +117,7 @@ async function main() {
 
   const sun = new THREE.DirectionalLight(new THREE.Color(1.0, 0.93, 0.82), 3.2);
   sun.castShadow = true;
-  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.mapSize.set(1024, 1024);
   Object.assign(sun.shadow.camera, { left: -SHADOW_EXTENT, right: SHADOW_EXTENT, top: SHADOW_EXTENT,
                                      bottom: -SHADOW_EXTENT, near: 1, far: 260 });
   sun.shadow.bias = -0.0004;
@@ -227,6 +237,7 @@ async function main() {
     renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe, terrain, grass, vegetation, barrels, post, shadowTint, fx, clouds,
     getEnvIntensity: () => scene.environmentIntensity,
     setEnvIntensity: (v) => { scene.environmentIntensity = v; },
+    tanks: [tank, enemy],
     game: {
       getSolo: () => game.solo,
       setSolo: (v) => match.setSolo(v),
@@ -258,6 +269,7 @@ async function main() {
 
   // ---------------------------------------------------------------- resize
   addEventListener('resize', () => {
+    renderer.setPixelRatio(renderPixelRatio());
     renderer.setSize(innerWidth, innerHeight);
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
@@ -353,6 +365,7 @@ async function main() {
 
   input.onPress = (code) => {
     if (code === 'KeyR' && !fly.enabled) { tank.reset(heightAt); snapCam(); }
+    if (code === 'KeyC' && !fly.enabled) resetCameraDefaults();
     // Space: hop upright only when flipped (ignored while upright / in freefly)
     if (code === 'Space' && !fly.enabled) tank.unflipJump(heightAt);
     if (code === 'KeyV') visuals.toggle();
@@ -448,7 +461,30 @@ async function main() {
   const EXHAUST_LOCAL = new THREE.Vector3(-2.55, 1.85, 0);
   const WRECK_LOCAL = new THREE.Vector3(-0.2, 2.6, 0);
   const BURN_LOCAL = new THREE.Vector3(-1.7, 2.05, 0.35);   // engine deck behind the turret
+  // Dark grille on the rear deck (Hull_Details, metal). Underside is ~1.88; flame base sits just under it.
+  const FIRE_LOCAL = new THREE.Vector3(-2.02, 1.82, 0);
   const burnPoint = new THREE.Vector3();
+  const firePoint = new THREE.Vector3();
+
+  /** 0 off, 1–3 = 25/50/75% damage, 4 = wreck. */
+  function damageStage(t) {
+    if (!t.alive) return 4;
+    if (t.hp >= t.maxHp) return 0;
+    if (t.hp > t.maxHp * 0.5) return 1;
+    if (t.hp > t.maxHp * 0.25) return 2;
+    return 3;
+  }
+
+  function setTankFire(t, stage) {
+    const slot = t === tank ? 0 : 1;
+    if (stage <= 0) {
+      fx.setDamageFire(null, 0, slot);
+      return;
+    }
+    t.model.updateMatrixWorld();
+    firePoint.copy(FIRE_LOCAL).applyMatrix4(t.model.matrixWorld);
+    fx.setDamageFire(firePoint, stage, slot);
+  }
 
   /** Track dust, diesel exhaust and track kick for one tank; damaged tanks burn, wrecks smoke. */
   function tankFx(t, dt) {
@@ -457,15 +493,17 @@ async function main() {
       // Hull is gone after obliterate — plume from the kill pose (body stays where it died).
       const p = t.body.translation();
       burnPoint.set(p.x - 0.4, p.y + 1.8, p.z);
-      fx.burn(burnPoint, dt, 1.6);
+      fx.burn(burnPoint, dt, 1.6, true);
       exhaustPoint.set(p.x, p.y + 2.4, p.z);
       exhaustUp.set(0, 1, 0);
       exhaustBack.set(-1, 0, 0).transformDirection(mw);
       if (exhaustBack.lengthSq() < 1e-6) exhaustBack.set(0, 0, 1);
       fx.engineSmoke(exhaustPoint, 1, exhaustBack, exhaustUp);
+      setTankFire(t, 4);
       return;
     }
-    if (t.hp < t.maxHp) fx.burn(burnPoint.copy(BURN_LOCAL).applyMatrix4(mw), dt, 1);
+    if (t.hp < t.maxHp) fx.burn(burnPoint.copy(BURN_LOCAL).applyMatrix4(mw), dt, 1, true);
+    setTankFire(t, damageStage(t));
     for (const s of t.sides) {
       const amount = Math.min(1, Math.abs(s.speed) / 8) * 0.5;
       if (t.grounded && amount > 0.05) {
@@ -591,7 +629,7 @@ async function main() {
       if (shot) {
         fx.fire({ ...shot, owner: tank.body });
         fx.muzzleFlash(shot.pos, shot.dir);
-        tankCam.kick(1.0, RELOAD);
+        tankCam.kick(0.5, RELOAD);
         sfx.fire();
         input.rumble(1.0, 0.8, 220);
         if (versus) ai.hearShot(shot.pos);
@@ -610,6 +648,8 @@ async function main() {
         }
       }
       tankFx(enemy, dt);
+    } else if (!versus) {
+      fx.setDamageFire(null, 0, 1);
     }
 
     // Roof .50 cal — player RMB/R1; enemy AI sprays sometimes while its main gun reloads

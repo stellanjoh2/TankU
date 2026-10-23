@@ -12,9 +12,9 @@ const CHUNK = 16;
  * Band edges (m) from camera to chunk edge. Bands 0–2 pick LOD00/01/02 geometry;
  * the outer bands keep LOD02 and only thin the clump count (BAND_DENSITY).
  */
-const LOD_EDGES = [25, 50, 85, 120];
-const BAND_DENSITY = [1, 1, 1, 0.85, 0.72];
-const DENSITY = 0.828; // clumps per m² on meadows (−10% vs 0.92)
+const LOD_EDGES = [20, 40, 65, 90];
+const BAND_DENSITY = [1, 1, 0.75, 0.5, 0.4];
+const DENSITY = 0.621; // clumps per m² on meadows (−25% vs prior 0.828)
 // LOD00 native height ≈ 0.14 m; ~0.5–1.0 m after scale (+15% vs prior 5.4).
 const BASE_SCALE = 6.21;
 const HALF = SIZE * 0.5;
@@ -120,7 +120,7 @@ export async function buildGrass(scene) {
       if (capacity < 8) continue;
 
       const mesh = new THREE.InstancedMesh(lodGeos[0], grassMat.material, capacity);
-      mesh.receiveShadow = true;
+      mesh.receiveShadow = false;
       mesh.castShadow = false;
       mesh.frustumCulled = true;
 

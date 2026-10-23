@@ -1,5 +1,4 @@
-// GIF89a frame decode (indexed pixels + global palette). Enough for fire.gif:
-// full-frame disposal, one global palette, no local tables.
+// GIF89a frame decode. fire.gif gives every frame after the first its own palette.
 
 function lzwDecode(src, minCodeSize, pixelCount) {
   const clearCode = 1 << minCodeSize;
@@ -79,7 +78,8 @@ function skipSubBlocks(bytes, i) {
 
 /**
  * @param {ArrayBuffer} buffer
- * @returns {{ width: number, height: number, frames: Uint8Array[], palette: Uint8Array, transparent: number, delays: number[] }}
+ * @returns {{ width: number, height: number, frames: Uint8Array[], palettes: Uint8Array[], transparent: number, delays: number[] }}
+ * `palettes[i]` is that frame's local color table, or the global one when the frame has none.
  * delays are seconds. `transparent` is the palette index to key out, or -1.
  */
 export function decodeGif(buffer) {
@@ -101,6 +101,7 @@ export function decodeGif(buffer) {
   }
 
   const frames = [];
+  const palettes = [];
   const delays = [];
   let pendingDelay = 0.1;
   let transparent = -1;
@@ -129,8 +130,10 @@ export function decodeGif(buffer) {
     if (b !== 0x2c) throw new Error(`bad GIF block ${b} at ${i - 1}`);
     i += 8; // x, y, w, h
     const ipacked = bytes[i++];
+    let framePalette = palette;
     if (ipacked & 0x80) {
       const n = 3 * (2 ** ((ipacked & 7) + 1));
+      framePalette = bytes.slice(i, i + n);
       i += n;
     }
     const minCodeSize = bytes[i++];
@@ -150,9 +153,10 @@ export function decodeGif(buffer) {
       o += c.length;
     }
     frames.push(lzwDecode(compressed, minCodeSize, pixelCount));
+    palettes.push(framePalette);
     delays.push(pendingDelay);
   }
 
   if (!palette || frames.length === 0) throw new Error('GIF has no frames');
-  return { width, height, frames, palette, transparent, delays };
+  return { width, height, frames, palettes, transparent, delays };
 }

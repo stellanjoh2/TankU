@@ -1,15 +1,14 @@
-// Backdrop P-51s: pairs orbit the map and occasionally dive into a low swoop.
+// Backdrop P-51: orbits the map and occasionally dives into a low swoop.
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { SIZE } from './terrain.js';
 
-const GROUPS = 1;                 // one pair (2 planes max)
+const GROUPS = 1;
 const RADIUS = SIZE * 0.72;       // wide orbit outside most of the playable area
 const ALT_CRUISE = 52;
 const ALT_SWOOP = 22;
 const SPEED = 36;                 // a bit slower so they pass less often
 const BANK = THREE.MathUtils.degToRad(18);
-const WINGMAN = { back: 14, side: 11, up: 2.5 };
 const SWOOP_CHANCE = 0.15;
 const SWOOP_COOLDOWN = 18;
 const SCALE = 1.0;
@@ -92,18 +91,15 @@ export async function buildPlanes(scene) {
   root.name = 'Planes';
   scene.add(root);
 
-  /** @type {{ lead: THREE.Object3D, wing: THREE.Object3D, leadProp: THREE.Object3D | null, wingProp: THREE.Object3D | null, angle: number, dir: number, phase: number, alt: number, pitch: number, swoopT: number, cool: number, cx: number, cz: number }[]} */
-  const pairs = [];
+  /** @type {{ mesh: THREE.Object3D, prop: THREE.Object3D | null, angle: number, dir: number, phase: number, alt: number, pitch: number, swoopT: number, cool: number, cx: number, cz: number }[]} */
+  const planes = [];
 
   for (let i = 0; i < GROUPS; i++) {
-    const lead = proto.clone(true);
-    const wing = proto.clone(true);
-    root.add(lead, wing);
-    pairs.push({
-      lead,
-      wing,
-      leadProp: findProp(lead),
-      wingProp: findProp(wing),
+    const mesh = proto.clone(true);
+    root.add(mesh);
+    planes.push({
+      mesh,
+      prop: findProp(mesh),
       angle: (i / GROUPS) * Math.PI * 2,
       dir: i % 2 === 0 ? 1 : -1,
       phase: i * 1.7,
@@ -125,9 +121,8 @@ export async function buildPlanes(scene) {
   function update(dt) {
     const tBob = performance.now() * 0.0004;
     const propSpin = PROP_RPS * Math.PI * 2 * dt;
-    for (const p of pairs) {
-      if (p.leadProp) p.leadProp.rotation.x += propSpin;
-      if (p.wingProp) p.wingProp.rotation.x += propSpin;
+    for (const p of planes) {
+      if (p.prop) p.prop.rotation.x += propSpin;
       p.cool = Math.max(0, p.cool - dt);
 
       if (p.swoopT <= 0) {
@@ -167,22 +162,7 @@ export async function buildPlanes(scene) {
       const faceYaw = Math.atan2(-vz, vx);
       const bank = BANK * p.dir;
 
-      place(p.lead, x, alt, z, faceYaw, p.pitch, bank);
-
-      const spd = Math.hypot(vx, vz) || 1;
-      const fx = vx / spd;
-      const fz = vz / spd;
-      const rx = -fz;
-      const rz = fx;
-      place(
-        p.wing,
-        x - fx * WINGMAN.back + rx * WINGMAN.side * p.dir,
-        alt + WINGMAN.up,
-        z - fz * WINGMAN.back + rz * WINGMAN.side * p.dir,
-        faceYaw,
-        p.pitch,
-        bank,
-      );
+      place(p.mesh, x, alt, z, faceYaw, p.pitch, bank);
     }
   }
 

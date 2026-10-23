@@ -446,19 +446,18 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   mesh.name = 'IslandTerrain';
   scene.add(mesh);
 
-  // WebGPU ocean placeholder (three.js WaterMesh / webgpu_ocean example).
-  // Seabed collider stays on the terrain mesh (shore skirt only after prune).
+  // WebGPU ocean (three.js WaterMesh). Seabed collider stays on the terrain mesh.
   const waterNormals = await new THREE.TextureLoader().loadAsync('./textures/waternormals.jpg');
   waterNormals.wrapS = waterNormals.wrapT = THREE.RepeatWrapping;
   const water = new WaterMesh(
-    new THREE.PlaneGeometry(SIZE * 6, SIZE * 6), // reaches past the backdrop islands (bgIsland.js)
+    new THREE.PlaneGeometry(SIZE * 6, SIZE * 6),
     {
       waterNormals,
       sunDirection: (sunDir || new THREE.Vector3(0.70707, 0.70707, 0)).clone().normalize(),
       sunColor: 0xffffff,
       waterColor: palette.water,
       distortionScale: 3.7,
-      size: 2.0, // world→UV multiplier: higher = smaller ripples
+      size: 2.0,
       timeScale: 0.5,
       resolutionScale: 0.5,
     },
