@@ -155,7 +155,7 @@ export function createVisualsEditor(ctx) {
       grassTip1: gU.uTipColor1.value.clone(),
       grassTip2: gU.uTipColor2.value.clone(),
       grassIntensity: gU.uGrassLightIntensity.value,
-      wind: gU.uWindAmp.value,
+      wind: vegetation?.getWind?.() ?? 0,
       palmAmount: vegetation?.getPalmAmount?.() ?? 1,
       plantAmount: vegetation?.getPlantAmount?.() ?? 1,
       palmBrightness: vegetation?.getPalmBrightness?.() ?? 1,
@@ -203,7 +203,7 @@ export function createVisualsEditor(ctx) {
       tip2: s.grassTip2,
       intensity: s.grassIntensity,
     });
-    gU.uWindAmp.value = s.wind;
+    // Grass wind is disabled; slider only drives vegetation lean.
     vegetation?.setWind?.(s.wind);
     vegetation?.setPalmAmount?.(s.palmAmount ?? 1);
     vegetation?.setPlantAmount?.(s.plantAmount ?? 1);
@@ -526,8 +526,7 @@ export function createVisualsEditor(ctx) {
     addSlider(s, 'Brightness', 0.2, 2.5, 0.05, () => gU.uGrassLightIntensity.value, (v) => {
       grass.setColors({ intensity: v });
     });
-    addSlider(s, 'Wind strength', 0, 0.15, 0.005, () => gU.uWindAmp.value, (v) => {
-      gU.uWindAmp.value = v;
+    addSlider(s, 'Wind strength', 0, 0.15, 0.005, () => vegetation?.getWind?.() ?? 0, (v) => {
       vegetation?.setWind?.(v);
     });
   }

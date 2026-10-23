@@ -6,7 +6,7 @@ import { GrassMaterial } from './GrassMaterial.js';
 import { SIZE, heightAt, isGrassable } from './terrain.js';
 
 const CHUNK = 32;
-const DENSITY = 1.15; // clumps per m² on meadows
+const DENSITY = 0.92; // clumps per m² on meadows (−20%)
 // LOD00 native height ≈ 0.14 m; ~0.45–0.9 m after scale (+50% vs prior 3.6).
 const BASE_SCALE = 5.4;
 const HALF = SIZE * 0.5;
@@ -61,7 +61,6 @@ export async function buildGrass(scene) {
     tipColor1: '#a8c45c',
     tipColor2: '#5a7838',
     heightAmp: 0.07,
-    windAmp: 0.045,
     terrainSize: SIZE,
     fogColor: new THREE.Color(0.55, 0.68, 0.74),
     fogNear: 70,
@@ -157,7 +156,7 @@ export async function buildGrass(scene) {
       mesh.count = written;
       mesh.instanceMatrix.needsUpdate = true;
       mesh.computeBoundingSphere();
-      // Pad so wind sway / tip height doesn't get frustum-culled at edges
+      // Pad so tip height doesn't get frustum-culled at edges
       if (mesh.boundingSphere) mesh.boundingSphere.radius += 1.5;
       root.add(mesh);
       total += written;
@@ -169,8 +168,8 @@ export async function buildGrass(scene) {
   return {
     root,
     material: grassMat,
-    update(time) {
-      grassMat.update(time);
+    update() {
+      grassMat.update();
     },
     setColors({ base, tip1, tip2, intensity } = {}) {
       if (base != null) grassMat.uniforms.uBaseColor.value.set(base);

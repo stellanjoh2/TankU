@@ -70,7 +70,7 @@ const MAX_PLANT_TARGET = Math.ceil(BASE_PLANT_TARGET * 2);
 
 export const FOLIAGE_BRIGHTNESS_DEFAULT = 1;
 export const PALM_BRIGHTNESS_DEFAULT = 1;
-/** Same units as grass `uWindAmp` (visuals Wind strength). */
+/** Units match visuals Wind strength (grass sway is off). */
 export const WIND_DEFAULT = 0.085;
 /** Radians of whole-tree lean per unit of wind amp. */
 const PALM_WIND_LEAN = 1.35;

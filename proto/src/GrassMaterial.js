@@ -1,7 +1,8 @@
-// TSL grass for WebGPU — UV flip, tip/base colors, alpha discard, world wind, shadow receive.
+// TSL grass for WebGPU — UV flip, tip/base colors, alpha discard, tip height, shadow receive.
+// Wind intentionally skipped (CPU/GPU savings); vegetation still sways via visuals Wind.
 import * as THREE from 'three/webgpu';
 import {
-  uv, texture, vec2, vec3, vec4, float, mix, uniform, sin, exp, dot, normalize,
+  uv, texture, vec2, vec3, vec4, float, mix, uniform, exp,
   positionLocal, modelWorldMatrix, modelWorldMatrixInverse,
   normalView, diffuseColor, BRDF_Lambert,
 } from 'three/tsl';
@@ -32,7 +33,6 @@ export class GrassMaterial {
     tipColor1 = '#8aa85a',
     tipColor2 = '#3a4f28',
     heightAmp = 0.06,
-    windAmp = 0.04,
     terrainSize = 500,
     fogColor = 0x8caebc,
     fogNear = 70,
@@ -44,9 +44,9 @@ export class GrassMaterial {
     const fogCol = fogColor.isColor ? fogColor : new THREE.Color(fogColor);
 
     this.uniforms = {
-      uTime: { value: 0 },
       uHeightAmp: { value: heightAmp },
-      uWindAmp: { value: windAmp },
+      // Kept at 0 so visuals/state that still read uWindAmp don't re-enable sway.
+      uWindAmp: { value: 0 },
       uTerrainSize: { value: terrainSize },
       uNoiseScale: { value: 1.2 },
       uGrassLightIntensity: { value: 1.35 },
@@ -61,9 +61,7 @@ export class GrassMaterial {
       shadowTint,
     };
 
-    this._uTime = uniform(0);
     this._uHeightAmp = uniform(heightAmp);
-    this._uWindAmp = uniform(windAmp);
     this._uTerrainSize = uniform(terrainSize);
     this._uNoiseScale = uniform(1.2);
     this._uIntensity = uniform(1.35);
@@ -83,11 +81,8 @@ export class GrassMaterial {
     this.material.setupLightingModel = () => grassLighting;
   }
 
-  update(time) {
-    this.uniforms.uTime.value = time;
-    this._uTime.value = time;
+  update() {
     this._uHeightAmp.value = this.uniforms.uHeightAmp.value;
-    this._uWindAmp.value = this.uniforms.uWindAmp.value;
     this._uTerrainSize.value = this.uniforms.uTerrainSize.value;
     this._uNoiseScale.value = this.uniforms.uNoiseScale.value;
     this._uIntensity.value = this.uniforms.uGrassLightIntensity.value;
@@ -116,24 +111,15 @@ export class GrassMaterial {
     this.material.opacityNode = this._alphaTex.sample(grassUv).r;
     this.material.alphaTestNode = float(0.15);
 
-    // World-space wind (same math as prior FluffyGrass GLSL).
+    // Static tip height only (no wind sway).
     const worldPos = modelWorldMatrix.mul(vec4(positionLocal, 1.0)).xyz.toVar();
     const globalUV = vec2(
       this._uTerrainSize.sub(worldPos.x),
       this._uTerrainSize.sub(worldPos.z),
     ).div(this._uTerrainSize);
-
-    const windNoise = this._noiseTex.sample(globalUV.add(this._uTime.mul(0.0008)));
     const tip = float(1).sub(uv().y);
-    const windDir = normalize(vec2(1.0, 0.65));
-    const sinWave = sin(
-      float(28).mul(dot(windDir, globalUV))
-        .add(windNoise.g.mul(4))
-        .add(this._uTime.mul(0.85)),
-    ).mul(this._uWindAmp).mul(tip);
-
     const heightNoise = this._noiseTex.sample(globalUV.mul(this._uNoiseScale)).r;
-    worldPos.assign(worldPos.add(vec3(sinWave, exp(heightNoise).mul(this._uHeightAmp).mul(tip), sinWave)));
+    worldPos.assign(worldPos.add(vec3(0, exp(heightNoise).mul(this._uHeightAmp).mul(tip), 0)));
 
     this.material.positionNode = modelWorldMatrixInverse.mul(vec4(worldPos, 1.0)).xyz;
 
