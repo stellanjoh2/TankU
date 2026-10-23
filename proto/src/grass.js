@@ -3,7 +3,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { GrassMaterial } from './GrassMaterial.js';
-import { SIZE, heightAt, isGrassable } from './terrain.js';
+import { SIZE, heightAt, isGrassable, grassCluster, GRASS_CLUSTER_CUT } from './terrain.js';
 import { pickLod } from './lod.js';
 
 // 16 m chunks so LOD bands (measured to the nearest chunk edge) stay meaningful.
@@ -14,7 +14,9 @@ const CHUNK = 16;
  */
 const LOD_EDGES = [20, 40, 65, 90];
 const BAND_DENSITY = [1, 1, 0.75, 0.5, 0.4];
-const DENSITY = 0.621; // clumps per m² on meadows (−25% vs prior 0.828)
+// Centre spacing ~1.34 m: the old scatter averaged ~1.27 m and stacked some clumps.
+// Cluster mask (GRASS_CLUSTER_CUT) drops another ~25% into bare zones between meadows.
+const CELL = 1.34;
 // LOD00 native height ≈ 0.14 m; ~0.5–1.0 m after scale (+15% vs prior 5.4).
 const BASE_SCALE = 6.21;
 const HALF = SIZE * 0.5;
@@ -115,22 +117,47 @@ export async function buildGrass(scene) {
       }
 
       const dist = Math.hypot(cxm + 8, czm + 5);
-      const dens = DENSITY * (0.55 + 0.45 * THREE.MathUtils.clamp(1 - dist / 90, 0.35, 1));
-      const capacity = Math.max(0, Math.floor(w * d * dens));
+      // Same radial thinning as before: full density near spawn, ~70% out at 90 m.
+      const edgeKeep = 0.55 + 0.45 * THREE.MathUtils.clamp(1 - dist / 90, 0.35, 1);
+      const nx = Math.ceil(w / CELL);
+      const nz = Math.ceil(d / CELL);
+      const capacity = nx * nz;
       if (capacity < 8) continue;
 
       const mesh = new THREE.InstancedMesh(lodGeos[0], grassMat.material, capacity);
-      mesh.receiveShadow = false;
+      mesh.receiveShadow = true;
       mesh.castShadow = false;
       mesh.frustumCulled = true;
 
       const rand = seededRand((cx * 73856093) ^ (cz * 19349663) ^ 0x9e3779b9);
+      const spots = [];
+      for (let iz = 0; iz < nz; iz++) {
+        for (let ix = 0; ix < nx; ix++) {
+          const jx = (hash2(cx * 100 + ix, cz * 100 + iz) - 0.5) * CELL * 0.42;
+          const jz = (hash2(cx * 100 + ix + 17, cz * 100 + iz + 3) - 0.5) * CELL * 0.42;
+          const x = x0 + (ix + 0.5) * CELL + jx;
+          const z = z0 + (iz + 0.5) * CELL + jz;
+          if (x < x0 || x >= x1 || z < z0 || z >= z1) continue;
+          if (!isGrassable(x, z)) continue;
+          if (grassCluster(x, z) < GRASS_CLUSTER_CUT) continue;
+          if (hash2(ix + cx * 13, iz + cz * 29) > edgeKeep) continue;
+          spots.push(x, z);
+        }
+      }
+      // Shuffle so an LOD prefix thins the chunk evenly, not from one corner.
+      for (let i = spots.length / 2 - 1; i > 0; i--) {
+        const j = Math.floor(rand() * (i + 1));
+        const ax = spots[i * 2], az = spots[i * 2 + 1];
+        spots[i * 2] = spots[j * 2];
+        spots[i * 2 + 1] = spots[j * 2 + 1];
+        spots[j * 2] = ax;
+        spots[j * 2 + 1] = az;
+      }
+
       let written = 0;
-      const tries = capacity * 4;
-      for (let t = 0; t < tries && written < capacity; t++) {
-        const x = x0 + rand() * w;
-        const z = z0 + rand() * d;
-        if (!isGrassable(x, z)) continue;
+      for (let i = 0; i < spots.length; i += 2) {
+        const x = spots[i];
+        const z = spots[i + 1];
 
         const y = heightAt(x, z);
         pos.set(x, y, z);
@@ -166,7 +193,7 @@ export async function buildGrass(scene) {
       // Pad so tip height doesn't get frustum-culled at edges
       if (mesh.boundingSphere) mesh.boundingSphere.radius += 1.5;
       root.add(mesh);
-      // Instances are written in random order, so any prefix is an even thinning of the chunk.
+      // Instances are shuffled, so any prefix is an even thinning of the chunk.
       chunks.push({ mesh, x0, z0, x1, z1, y: heightAt(cxm, czm), full: written, band: -1 });
       total += written;
     }

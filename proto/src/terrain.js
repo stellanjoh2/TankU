@@ -1,10 +1,12 @@
 import * as THREE from 'three';
+import { MeshStandardNodeMaterial } from 'three/webgpu';
+import { attribute, float, mix, normalMap, texture, uniform, uv, vec3 } from 'three/tsl';
 import { WaterMesh } from './WaterMesh.js';
 
-export const SIZE = 250;
+export const SIZE = 380;
 export const WATER_Y = 0.2;
-// −20% vs the old 220-seg grid; sea faces are pruned after displace
-const SEGS = 176;
+// Keep ~1.44 m cells after the map grew to fit the satellite island.
+const SEGS = 264;
 /** Keep a triangle if any corner is at least this far from shore (inland +, sea −). */
 const SEA_PRUNE = -10;
 
@@ -13,7 +15,25 @@ const HILLS = [
   [-35, -20, 18, 20], [22, -58, 15, 16], [-58, 42, 20, 22],
   [8, 58, 12, 14], [-72, -48, 16, 18], [42, 18, 13, 12],
   [-22, 72, 11, 12], [2, -78, 17, 18], [-48, -8, 14, 15],
+  // Satellite island: one rise on the far (SW) side, landing stays flat.
+  [-146.4, -147.4, 10, 15],
 ];
+
+/** Satellite SW of the main island. r ≈ 42 m → about ¼ the main land area. */
+export const ISLAND2 = { cx: -127.6, cz: -128.5, r: 42 };
+
+/**
+ * Slab bridge, main → satellite. Origin is deck-top centre; +X along the span.
+ * yaw maps local +X onto the world XZ direction (see three.js Y rotation).
+ */
+export const BRIDGE = {
+  x: -90.64,
+  z: -91.54,
+  yaw: 2.356194490192345,
+  length: 25,
+  deckW: 5.0,
+  deckY: 2.2,
+};
 
 // Flat-valley tracks only (open polylines). Never routed over hill flanks.
 // Each entry: { closed, pts: [[x,z],…] }
@@ -26,6 +46,14 @@ const ROAD_WAYS = [
   ] },
   // East meadow spur
   { closed: false, pts: [[-8, -5], [4, 0], [10, 12], [6, 26], [-4, 34]] },
+  // Satellite → bridge approach (plank deck is the water crossing)
+  { closed: false, pts: [
+    [ISLAND2.cx, ISLAND2.cz], [-121, -126], [-114, -118], [-108, -112], [-103, -106], [-100.5, -101.4],
+  ] },
+  // Far bank → south meadow, then the existing bowl track into the airfield
+  { closed: false, pts: [
+    [-80.7, -81.6], [-70, -80], [-58, -79], [-46, -75], [-34, -68], [-24, -56], [-14, -44], [-8, -36],
+  ] },
 ];
 export const ROAD_HALF_W = 4.2;
 
@@ -51,8 +79,8 @@ export const PORT = {
   wall: 2.8, // metres of horizontal drop for the quay face
 };
 
-/** Player spawn: meadow between the two southern hills, looking at the port. Flattened so the tank doesn't creep. */
-export const PLAYER_SPAWN = { x: -40, z: -62, padR: 5, padEdge: 7 };
+/** Player spawn: centre of the satellite, facing the bridge / main island. Flattened so the tank doesn't creep. */
+export const PLAYER_SPAWN = { x: ISLAND2.cx, z: ISLAND2.cz, padR: 5, padEdge: 7 };
 
 /** Concrete yard on dry land south of the quay deck (water tower stands here). */
 export const PORT_YARD = {
@@ -124,6 +152,16 @@ function hillStrength(x, z) {
   return s;
 }
 
+/** 0 on the flanks, 1 on the crown. Measured against each hill's own radius. */
+function hillCrown(x, z) {
+  let best = 0;
+  for (const [cx, cz, , rad] of HILLS) {
+    const t = Math.exp(-((x - cx) ** 2 + (z - cz) ** 2) / (rad * rad));
+    if (t > best) best = t;
+  }
+  return smooth(best, 0.6, 0.85);
+}
+
 function slopeAt(x, z, e = 1) {
   const dx = heightAt(x + e, z) - heightAt(x - e, z);
   const dz = heightAt(x, z + e) - heightAt(x, z - e);
@@ -147,7 +185,8 @@ export function roadDist(x, z) {
 
 /** Flat valley only — roads never climb the hills even if a segment grazes a flank. */
 function isRoadable(x, z) {
-  if (shoreSigned(x, z) < 10) return false;
+  if (onBridge(x, z, 1)) return false;
+  if (shoreSigned(x, z) < 1.5) return false;
   if (hillStrength(x, z) > 3.4) return false;
   if (ridgeHeight(x, z) > 4) return false;
   if (slopeAt(x, z) > 0.11) return false;
@@ -166,8 +205,8 @@ export function isOnRoad(x, z, margin = 0) {
   return roadDist(x, z) < ROAD_HALF_W + margin && isRoadable(x, z);
 }
 
-/** Signed distance-ish to shore: >0 inland, 0 at beach edge, <0 in water. */
-export function shoreSigned(x, z) {
+/** Signed distance-ish to the main C-island shore: >0 inland, 0 at beach, <0 in water. */
+function mainShoreSigned(x, z) {
   // C / crescent: land mass shifted west, deep bay opening east (matches ref).
   const lx = x + 18;
   const lz = z * 0.92;
@@ -188,6 +227,53 @@ export function shoreSigned(x, z) {
   // Soft eastern inlet fingers
   const inlet = Math.exp(-((ang - 0.15) ** 2) / 0.18) * 14;
   return landR - inlet - r;
+}
+
+function island2Signed(x, z) {
+  const dx = x - ISLAND2.cx;
+  const dz = z - ISLAND2.cz;
+  const r = Math.hypot(dx, dz);
+  const ang = Math.atan2(dz, dx);
+  const noise =
+    3.2 * Math.sin(ang * 4.6 + 1.2) +
+    1.6 * Math.sin(ang * 9.1 - 0.4) +
+    0.9 * Math.sin(ang * 15.0 + x * 0.05);
+  return ISLAND2.r + noise - r;
+}
+
+/** Signed distance-ish to shore: >0 inland, 0 at beach edge, <0 in water. */
+export function shoreSigned(x, z) {
+  return Math.max(mainShoreSigned(x, z), island2Signed(x, z));
+}
+
+/** Bridge-local XZ: +X along the span (main → satellite), +Z across. */
+export function bridgeLocal(x, z) {
+  const dx = x - BRIDGE.x, dz = z - BRIDGE.z;
+  const c = Math.cos(BRIDGE.yaw), s = Math.sin(BRIDGE.yaw);
+  return { lx: dx * c - dz * s, lz: dx * s + dz * c };
+}
+
+export function onBridge(x, z, margin = 0) {
+  const { lx, lz } = bridgeLocal(x, z);
+  return Math.abs(lx) < BRIDGE.length * 0.5 + margin && Math.abs(lz) < BRIDGE.deckW * 0.5 + margin;
+}
+
+/** Soft 0..1 pad on each bank so the deck meets flat ground. */
+function approachFactor(x, z) {
+  const { lx, lz } = bridgeLocal(x, z);
+  const half = BRIDGE.length * 0.5;
+  // Stay off the slab — the old 1.5 m overlap was the intersecting end-patches.
+  if (Math.abs(lx) < half) return 0;
+  const along = 9;
+  const halfW = 4;
+  const edge = 3.5;
+  const a0 = lx < 0 ? -(half + along) : half;
+  const a1 = lx < 0 ? -half : half + along;
+  const alongD = lx >= a0 && lx <= a1 ? 0 : Math.min(Math.abs(lx - a0), Math.abs(lx - a1));
+  const outside = Math.max(alongD, Math.max(0, Math.abs(lz) - halfW));
+  if (outside <= 0) return 1;
+  if (outside >= edge) return 0;
+  return 1 - smooth(outside, 0, edge);
 }
 
 /** 0 at/beyond waterline → 1 deep inland (past beach). */
@@ -218,7 +304,10 @@ function ridgeHeight(x, z) {
  * Island interior with dramatic hills; beach shelf; seabed below WATER_Y offshore.
  */
 function naturalHeightAt(x, z) {
-  const signed = shoreSigned(x, z);
+  const main = mainShoreSigned(x, z);
+  const sat = island2Signed(x, z);
+  const signed = Math.max(main, sat);
+  const onSat = sat > main;
 
   if (signed < -1.5) {
     // Seabed slopes away from shore
@@ -230,24 +319,28 @@ function naturalHeightAt(x, z) {
   const beach = clamp01(signed / 8); // 0 at water → 1 a short way inland
 
   // Base rolling relief (50% stronger than old map's ~1.6/0.8/0.3)
-  let h =
+  let roll =
     2.4 * Math.sin(x * 0.028 + 0.4) * Math.cos(z * 0.024 - 0.3) +
     1.35 * Math.sin(x * 0.055 + 1.3) * Math.sin(z * 0.048 + 0.7) +
     0.7 * Math.sin(x * 0.13 + 2.1) * Math.cos(z * 0.15 + 0.4);
 
+  let hills = 0;
   for (const [cx, cz, hh, rad] of HILLS) {
     const d2 = (x - cx) ** 2 + (z - cz) ** 2;
-    h += hh * Math.exp(-d2 / (rad * rad));
+    hills += hh * Math.exp(-d2 / (rad * rad));
   }
 
-  h += ridgeHeight(x, z);
-
-  // Micro relief / natural roughness
-  h += 0.18 * Math.sin(x * 0.31) * Math.cos(z * 0.27) + 0.1 * Math.sin(x * 0.72 + z * 0.55);
-
-  // Calm pocket near spawn meadow (west-central) — keep a driveable yard
-  const spawnR = Math.hypot(x + 8, z + 5);
-  h *= 0.4 + 0.6 * smooth(spawnR, 6, 22);
+  let h;
+  if (!onSat) {
+    h = roll + hills + ridgeHeight(x, z);
+    h += 0.18 * Math.sin(x * 0.31) * Math.cos(z * 0.27) + 0.1 * Math.sin(x * 0.72 + z * 0.55);
+    // Calm pocket near spawn meadow (west-central) — keep a driveable yard
+    const spawnR = Math.hypot(x + 8, z + 5);
+    h *= 0.4 + 0.6 * smooth(spawnR, 6, 22);
+  } else {
+    // Mostly flat satellite — keep a little roll; the one hill stays full-size.
+    h = 0.4 + roll * 0.22 + hills;
+  }
 
   // Beach shelf: low, sandy, mild slope into the sea
   const beachH = 0.35 + beach * 1.4 + inland * 0.4;
@@ -280,6 +373,9 @@ export function heightAt(x, z) {
   const spawnD = Math.hypot(x - PLAYER_SPAWN.x, z - PLAYER_SPAWN.z);
   if (spawnD < padR + padEdge) h = THREE.MathUtils.lerp(SPAWN_PAD_Y, h, smooth(spawnD, padR, padR + padEdge));
 
+  const approach = approachFactor(x, z);
+  if (approach > 0) h = THREE.MathUtils.lerp(h, BRIDGE.deckY - 0.2, approach);
+
   // Vertical-ish quay face: slam from deck height down to seabed just east of x1.
   const corridor = portCorridor(z);
   if (corridor > 0.01 && x > PORT.x1) {
@@ -294,6 +390,20 @@ export function heightAt(x, z) {
   return h;
 }
 
+/**
+ * 0..1 meadow patch. High values are grass zones (~48 m); low values are the open ground between them.
+ * Shared with grass placement so the vertex colour matches where clumps actually sit.
+ */
+export function grassCluster(x, z) {
+  const a = 0.5 + 0.5 * Math.sin(x * 0.105 + 1.15) * Math.cos(z * 0.097 - 0.55);
+  const b = 0.5 + 0.5 * Math.sin(x * 0.046 + z * 0.041 + 0.8);
+  const c = 0.5 + 0.5 * Math.sin(x * 0.19 - z * 0.16 + 2.4);
+  return a * 0.55 + b * 0.3 + c * 0.15;
+}
+
+/** Keep the upper ~75% of `grassCluster` — the other quarter of the meadow stays bare. */
+export const GRASS_CLUSTER_CUT = 0.373;
+
 /** Meadow mask: grass ground inland, not beach / hill rock / road / airfield / port. */
 export function isGrassable(x, z) {
   if (isAirfield(x, z) || isPort(x, z)) return false;
@@ -306,30 +416,95 @@ export function isGrassable(x, z) {
   return true;
 }
 
-function detailTexture() {
-  const n = 256;
-  const c = document.createElement('canvas');
-  c.width = c.height = n;
-  const g = c.getContext('2d');
-  const img = g.createImageData(n, n);
-  for (let i = 0; i < n * n; i++) {
-    const v = 200 + Math.random() * 55;
-    img.data.set([v, v, v * 0.97, 255], i * 4);
-  }
-  g.putImageData(img, 0, 0);
-  for (let k = 0; k < 900; k++) {
-    g.fillStyle = `rgba(${90 + Math.random() * 60},${80 + Math.random() * 50},60,${0.08 + Math.random() * 0.12})`;
-    const s = 2 + Math.random() * 10;
-    g.fillRect(Math.random() * n, Math.random() * n, s, s * (0.3 + Math.random()));
-  }
-  const tex = new THREE.CanvasTexture(c);
+/** World metres per repeat. AmbientCG CC0, 1K JPG downscaled to 256:
+ *  mud = Ground088, rock = Ground110, sand = Ground010. */
+export const GROUND_TILE_M = 4;
+
+/**
+ * Same splat the terrain mesh bakes per vertex: mud / rock / sand / concrete, plus shade and wet.
+ * `slope` is 0 on flat ground (1 − normal.y).
+ */
+export function groundSurfaceAt(x, z, y = heightAt(x, z), slope = slopeAt(x, z)) {
+  const signed = shoreSigned(x, z);
+  const ridge = ridgeHeight(x, z);
+  const hills = hillStrength(x, z);
+  const road = roadFactor(x, z);
+  const apron = Math.max(airfieldFactor(x, z), portFactor(x, z));
+
+  const beach = apron < 0.35 ? 1 - clamp01((signed - 4) / 10) : 0;
+  const cap = apron < 0.35 ? hillCrown(x, z) : 0;
+  const rocky = clamp01(slope * 2.8 + hills * 0.12 + ridge * 0.05 - 0.2);
+  const rock = clamp01((rocky - 0.15) / 0.5) * (1 - beach) * (1 - cap);
+  const sand = beach + cap * (1 - beach);
+  const mud = 1 - sand - rock;
+  const concrete = apron > 0.02 ? apron : 0;
+
+  let wet = 0;
+  if (beach > 0) wet = (signed < 0 ? 1 : clamp01(1 - signed / 12)) * beach;
+
+  let shade = 1;
+  if (wet > 0) shade *= 1 - wet * 0.35;
+  if (road > 0.02) shade *= 1 - road * 0.35;
+  if (y < WATER_Y) shade *= 0.65;
+
+  return { mud, rock, sand, concrete, shade, wet };
+}
+
+function prepGroundMap(tex, colorSpace) {
+  tex.colorSpace = colorSpace;
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.repeat.set(SIZE / 5, SIZE / 5);
-  tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = 8;
   return tex;
 }
 
+async function loadGroundSet(loader, name) {
+  const base = `./textures/ground/${name}`;
+  const [color, normal, roughAo] = await Promise.all([
+    loader.loadAsync(`${base}_color.jpg`),
+    loader.loadAsync(`${base}_normal.jpg`),
+    loader.loadAsync(`${base}_rough_ao.jpg`),
+  ]);
+  return {
+    color: prepGroundMap(color, THREE.SRGBColorSpace),
+    normal: prepGroundMap(normal, THREE.NoColorSpace),
+    // R = roughness, G = ambient occlusion. Packed so the splat stays under the sampler limit.
+    roughAo: prepGroundMap(roughAo, THREE.NoColorSpace),
+  };
+}
+
+function makeGroundMaterial(sets, concreteColor) {
+  const mapUv = uv().mul(SIZE / GROUND_TILE_M);
+  // xyz = mud, rock, sand (sum to 1). w = concrete apron overlay.
+  const biome = attribute('biome', 'vec4');
+  const shade = attribute('shade', 'float');
+  const wet = attribute('wet', 'float');
+  const rgb = (tex) => texture(tex).sample(mapUv).rgb;
+  const surface = (tex) => texture(tex).sample(mapUv);
+
+  const albedo = rgb(sets.mud.color).mul(biome.x)
+    .add(rgb(sets.rock.color).mul(biome.y))
+    .add(rgb(sets.sand.color).mul(biome.z));
+  const packedN = rgb(sets.mud.normal).mul(biome.x)
+    .add(rgb(sets.rock.normal).mul(biome.y))
+    .add(rgb(sets.sand.normal).mul(biome.z));
+  const mudS = surface(sets.mud.roughAo);
+  const rockS = surface(sets.rock.roughAo);
+  const sandS = surface(sets.sand.roughAo);
+  const rough = mudS.r.mul(biome.x).add(rockS.r.mul(biome.y)).add(sandS.r.mul(biome.z));
+  const ao = mudS.g.mul(biome.x).add(rockS.g.mul(biome.y)).add(sandS.g.mul(biome.z));
+
+  const mat = new MeshStandardNodeMaterial({ metalness: 0, roughness: 1 });
+  mat.colorNode = mix(albedo.mul(shade), uniform(concreteColor), biome.w);
+  mat.normalNode = normalMap(mix(packedN, vec3(0.5, 0.5, 1), biome.w));
+  // Gloss (1 − roughness) halved so the photo sets read less shiny. Concrete stays at 0.9.
+  const dulled = mix(rough.mul(float(1).sub(wet.mul(0.5))), float(1), float(0.5));
+  mat.roughnessNode = mix(dulled, float(0.9), biome.w);
+  mat.aoNode = mix(ao, float(1), biome.w);
+  return mat;
+}
+
+// Grass / sand / rock entries stay so saved visuals still load. The mesh uses the photo sets;
+// only concrete and water are still sampled as flat colours.
 export const DEFAULT_GROUND_PALETTE = {
   grass: '#3a5a22',   // meadow under the fluffy grass
   dry: '#6a6a38',
@@ -338,7 +513,7 @@ export const DEFAULT_GROUND_PALETTE = {
   sand: '#d2c49a',    // beach
   wetSand: '#9a8c68',
   rock: '#6e6a64',    // hills / stone
-  concrete: '#c4bda8', // airfield apron (beige / light gray)
+  concrete: '#908773', // apron edge, matched to Concrete047A
   water: '#2a6a88',
 };
 
@@ -364,11 +539,15 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   for (let i = 0; i < pos.count; i++) pos.setY(i, heightAt(pos.getX(i), pos.getZ(i)));
   pruneSeaFaces(geo);
   geo.computeVertexNormals();
+  geo.computeTangents();
 
   const nrm = geo.attributes.normal;
-  const colors = new Float32Array(pos.count * 3);
-  const colorAttr = new THREE.BufferAttribute(colors, 3);
-  geo.setAttribute('color', colorAttr);
+  const biomeArr = new Float32Array(pos.count * 4);
+  const shadeArr = new Float32Array(pos.count);
+  const wetArr = new Float32Array(pos.count);
+  geo.setAttribute('biome', new THREE.BufferAttribute(biomeArr, 4));
+  geo.setAttribute('shade', new THREE.BufferAttribute(shadeArr, 1));
+  geo.setAttribute('wet', new THREE.BufferAttribute(wetArr, 1));
 
   const palette = {
     grass: new THREE.Color(DEFAULT_GROUND_PALETTE.grass),
@@ -381,73 +560,35 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
     concrete: new THREE.Color(DEFAULT_GROUND_PALETTE.concrete),
     water: new THREE.Color(DEFAULT_GROUND_PALETTE.water),
   };
-  const c = new THREE.Color();
 
   function applyPalette() {
-    const grass = palette.grass, dry = palette.dry, dirt = palette.dirt, mud = palette.mud;
-    const sand = palette.sand, wetSand = palette.wetSand, rock = palette.rock;
-    const concrete = palette.concrete;
     for (let i = 0; i < pos.count; i++) {
       const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
-      const signed = shoreSigned(x, z);
-      const slope = 1 - nrm.getY(i);
-      const patch = 0.5 + 0.5 * Math.sin(x * 0.07 + Math.sin(z * 0.05) * 2.0) * Math.cos(z * 0.06);
-      const ridge = ridgeHeight(x, z);
-      const hills = hillStrength(x, z);
-      const road = roadFactor(x, z);
-      const apron = Math.max(airfieldFactor(x, z), portFactor(x, z));
-
-      // --- Biomes (intentional, little cross-bleed) ---
-      if (y < WATER_Y + 0.05 || signed < 0) {
-        // Intertidal / seabed
-        c.copy(wetSand).lerp(sand, clamp01((y - (WATER_Y - 1)) / 1.5));
-      } else if (signed < 12 && apron < 0.35) {
-        // Beach: sand only (wet → dry as you leave the water) — skipped under port
-        const t = clamp01(signed / 12);
-        c.copy(wetSand).lerp(sand, 0.35 + 0.65 * t);
-      } else {
-        // Inland: rock on hills, grass meadows in the flats
-        const rocky = clamp01(
-          slope * 2.8 + hills * 0.12 + ridge * 0.05 - 0.2,
-        );
-        if (rocky > 0.45) {
-          c.copy(rock).lerp(dirt, 0.15 + patch * 0.1);
-          c.lerp(sand, clamp01(slope - 0.15) * 0.12); // dusty stone
-        } else {
-          // Grass ground — fluffy grass draws on top of this
-          c.copy(grass).lerp(dry, patch * 0.4);
-          c.lerp(dirt, clamp01(slope * 2.5) * 0.25);
-          c.lerp(rock, rocky * 0.9); // soft foot-of-hill blend
-        }
-      }
-
-      // Mud road on flat valleys only (roadFactor already gated)
-      if (road > 0.02) {
-        const rut = 0.82 + 0.18 * Math.sin(x * 0.55 + z * 0.4);
-        c.lerp(mud, road * rut);
-        c.lerp(dirt, road * 0.3 * (1 - rut));
-      }
-      // Beige concrete under hangar apron + port deck
-      if (apron > 0.02) {
-        const slab = 0.92 + 0.08 * Math.sin(x * 1.1) * Math.cos(z * 1.05);
-        c.lerp(concrete, apron * slab);
-        c.lerp(dirt, apron * 0.12 * (1 - slab));
-      }
-      if (y < WATER_Y) c.multiplyScalar(0.65);
-      colors.set([c.r, c.g, c.b], i * 3);
+      const s = groundSurfaceAt(x, z, y, 1 - nrm.getY(i));
+      biomeArr.set([s.mud, s.rock, s.sand, s.concrete], i * 4);
+      shadeArr[i] = s.shade;
+      wetArr[i] = s.wet;
     }
-    colorAttr.needsUpdate = true;
+    geo.attributes.biome.needsUpdate = true;
+    geo.attributes.shade.needsUpdate = true;
+    geo.attributes.wet.needsUpdate = true;
   }
   applyPalette();
 
-  const mat = new THREE.MeshStandardMaterial({ vertexColors: true, map: detailTexture(), roughness: 0.97 });
+  const loader = new THREE.TextureLoader();
+  const [mudMaps, rockMaps, sandMaps] = await Promise.all([
+    loadGroundSet(loader, 'mud'),
+    loadGroundSet(loader, 'rock'),
+    loadGroundSet(loader, 'sand'),
+  ]);
+  const mat = makeGroundMaterial({ mud: mudMaps, rock: rockMaps, sand: sandMaps }, palette.concrete);
   const mesh = new THREE.Mesh(geo, mat);
   mesh.receiveShadow = true;
   mesh.name = 'IslandTerrain';
   scene.add(mesh);
 
   // WebGPU ocean (three.js WaterMesh). Seabed collider stays on the terrain mesh.
-  const waterNormals = await new THREE.TextureLoader().loadAsync('./textures/waternormals.jpg');
+  const waterNormals = await loader.loadAsync('./textures/waternormals.jpg');
   waterNormals.wrapS = waterNormals.wrapT = THREE.RepeatWrapping;
   const water = new WaterMesh(
     new THREE.PlaneGeometry(SIZE * 6, SIZE * 6),
@@ -479,6 +620,7 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
     mesh,
     water,
     palette,
+    groundSets: { mud: mudMaps, rock: rockMaps, sand: sandMaps },
     setPalette( partial ) {
       for (const [k, v] of Object.entries(partial)) {
         if (!palette[k]) continue;

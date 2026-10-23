@@ -2,7 +2,7 @@
 // Wind intentionally skipped (CPU/GPU savings); vegetation still sways via visuals Wind.
 import * as THREE from 'three/webgpu';
 import {
-  uv, texture, vec2, vec3, vec4, float, mix, uniform, exp,
+  uv, texture, vec2, vec3, vec4, float, mix, uniform, exp, Fn,
   positionLocal, modelWorldMatrix, modelWorldMatrixInverse,
   normalView, diffuseColor, BRDF_Lambert,
 } from 'three/tsl';
@@ -79,6 +79,9 @@ export class GrassMaterial {
       fog: true,
     });
     this.material.setupLightingModel = () => grassLighting;
+    // Same mix as shadowTint.js: full shadow goes to the tint, lit stays white.
+    const uShadowTint = uniform(shadowTint.value);
+    this.material.receivedShadowNode = Fn(([shadow]) => mix(uShadowTint, vec3(1, 1, 1), shadow));
   }
 
   update() {

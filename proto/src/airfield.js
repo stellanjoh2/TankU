@@ -2,7 +2,7 @@
 // Door clear opening is sized so a Sherman (~3.3 m wide × ~2.8 m tall) just fits.
 import * as THREE from 'three';
 import { AIRFIELD, AIRFIELD_Y, heightAt } from './terrain.js';
-import { concreteSlabMap } from './concreteTex.js';
+import { applyConcreteMaps, prepareSlabGeometry } from './concreteTex.js';
 
 // Sherman hull ≈ 3.24 m track-outer width, turret roof ≈ 2.81 m — leave a few cm.
 export const DOOR_W = 4.0;
@@ -92,13 +92,13 @@ export function buildAirfield(RAPIER, world, scene) {
   glass.transparent = true;
   glass.opacity = 0.45;
   const rust = mat(0x6b3a22, { metal: 0.3, rough: 0.85 });
-  const concrete = mat(0xffffff, { rough: 0.95 });
-  concrete.map = concreteSlabMap();
-  const concreteDark = mat(0xe2ddd4, { rough: 0.97 });
-  concreteDark.map = concrete.map;
+  const concrete = mat(0xffffff);
+  applyConcreteMaps(concrete);
+  const concreteDark = mat(0xe2ddd4);
+  applyConcreteMaps(concreteDark);
   const interior = mat(0x2a2c2e, { rough: 0.95 });
 
-  const unit = new THREE.BoxGeometry(1, 1, 1);
+  const unit = prepareSlabGeometry(new THREE.BoxGeometry(1, 1, 1));
   const hangar = new THREE.Group();
   hangar.name = 'Hangar';
   hangar.position.set(HANGAR.x, y0, HANGAR.z);

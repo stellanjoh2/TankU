@@ -5,6 +5,7 @@
 // + first-hit armor clang (Sounds/435681__eben-frostey__metallic-clang.mp3)
 // + MG metal hit (Sounds/446128__justinvoke__metal-clank-4.wav — pitched-down variants)
 // + in-game music (Sounds/Steel and Silence.mp3).
+// + reload ready (Sounds/418882__kierankeegan__tank-reload.wav).
 const SHOT_URLS = [
   './sounds/tank_shot_1.wav',
   './sounds/tank_shot_2.wav',
@@ -25,6 +26,8 @@ const MG_CLANK_RATES = [
 const MG_CLANK_DB = Math.pow(10, -6 / 20); // −6 dB vs raw sample
 const MUSIC_URL = './sounds/steel_and_silence.mp3';
 const NITRO_URL = './sounds/nitro_rev.wav';
+const RELOAD_URL = './sounds/418882__kierankeegan__tank-reload.wav';
+const RELOAD_DB = Math.pow(10, 5 / 20); // +5 dB
 const MUSIC_VOL_DEFAULT = 0.35; // ~25% above prior 0.28
 // Base rate (+20% vs sample); L/R offset ~1.5 semitones each way
 const TURRET_BASE = 1.2;
@@ -52,6 +55,7 @@ export class Sfx {
     this.mgClankBuf = null;
     this.musicBuf = null;
     this.nitroBuf = null;
+    this.reloadBuf = null;
     this.ready = false;
     this._last = -1;
     this._ricoLast = -1;
@@ -83,7 +87,7 @@ export class Sfx {
       const res = await fetch(url);
       return this.ctx.decodeAudioData(await res.arrayBuffer());
     };
-    const [shots, engine, mg, turret, hit, mgClank, music, nitro] = await Promise.all([
+    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload] = await Promise.all([
       Promise.all(SHOT_URLS.map(decode)),
       decode(ENGINE_URL),
       decode(MG50_URL),
@@ -92,6 +96,7 @@ export class Sfx {
       decode(MG_CLANK_URL),
       decode(MUSIC_URL),
       decode(NITRO_URL),
+      decode(RELOAD_URL),
     ]);
     this.shots = shots;
     this.engineBuf = engine;
@@ -101,6 +106,7 @@ export class Sfx {
     this.mgClankBuf = mgClank;
     this.musicBuf = music;
     this.nitroBuf = nitro;
+    this.reloadBuf = reload;
     this.ready = true;
   }
 
@@ -165,6 +171,20 @@ export class Sfx {
     src.playbackRate.value = 0.98 + Math.random() * 0.04;
     const g = this.ctx.createGain();
     g.gain.value = volume;
+    src.connect(g).connect(this.ctx.destination);
+    this._active.add(src);
+    src.onended = () => this._active.delete(src);
+    src.start();
+  }
+
+  /** Breech click when the main gun finishes reloading. */
+  reload(volume = 0.9) {
+    if (!this.ready || !this.reloadBuf) return;
+    this.unlock();
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.reloadBuf;
+    const g = this.ctx.createGain();
+    g.gain.value = volume * RELOAD_DB;
     src.connect(g).connect(this.ctx.destination);
     this._active.add(src);
     src.onended = () => this._active.delete(src);

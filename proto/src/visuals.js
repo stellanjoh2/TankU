@@ -68,7 +68,7 @@ function hydrate(json) {
       sand: col(g.sand),
       wetSand: col(g.wetSand),
       rock: col(g.rock),
-      concrete: col(g.concrete ?? '#c4bda8'),
+      concrete: col(g.concrete ?? '#908773'),
       water: col(g.water),
     },
     grassBase: col(json.grassBase),
@@ -91,6 +91,7 @@ function hydrate(json) {
     gradeMids: col(json.gradeMids ?? '#ffffff'),
     gradeHighlights: col(json.gradeHighlights ?? '#ffffff'),
     vignette: json.vignette,
+    fisheye: json.fisheye ?? VISUAL_DEFAULTS.fisheye,
     grain: json.grain,
     aberration: json.aberration,
     shadowIntensity: json.shadowIntensity ?? 1,
@@ -104,7 +105,7 @@ function hydrate(json) {
 export function createVisualsEditor(ctx) {
   const {
     renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe,
-    terrain, grass, vegetation, barrels, post, shadowTint, fx, clouds,
+    terrain, grass, vegetation, barrels, trucks, post, shadowTint, fx, clouds,
     getEnvIntensity, setEnvIntensity,
     tanks = [],
     initial = VISUAL_DEFAULTS,
@@ -218,6 +219,7 @@ export function createVisualsEditor(ctx) {
       gradeMids: grade.midtones.value.clone(),
       gradeHighlights: grade.highlights.value.clone(),
       vignette: grade.vignetteIntensity.value,
+      fisheye: grade.fisheye.value,
       grain: finish.grain.value,
       aberration: finish.aberration.value,
       shadowIntensity: sun.shadow.intensity,
@@ -269,6 +271,7 @@ export function createVisualsEditor(ctx) {
     if (s.gradeMids) grade.midtones.value.copy(s.gradeMids);
     if (s.gradeHighlights) grade.highlights.value.copy(s.gradeHighlights);
     grade.vignetteIntensity.value = s.vignette;
+    grade.fisheye.value = s.fisheye ?? VISUAL_DEFAULTS.fisheye;
     finish.grain.value = s.grain;
     finish.aberration.value = s.aberration;
     sun.shadow.intensity = s.shadowIntensity ?? 1;
@@ -337,6 +340,7 @@ export function createVisualsEditor(ctx) {
       gradeMids: c(s.gradeMids),
       gradeHighlights: c(s.gradeHighlights),
       vignette: s.vignette,
+      fisheye: s.fisheye,
       grain: s.grain,
       aberration: s.aberration,
       shadowIntensity: s.shadowIntensity,
@@ -582,13 +586,8 @@ export function createVisualsEditor(ctx) {
   // Ground
   {
     const s = addSection('Ground');
+    // Soil, rock and beach are photo maps. Concrete and water stay flat colours.
     for (const [key, label] of [
-      ['grass', 'Meadow'],
-      ['dry', 'Dry grass'],
-      ['dirt', 'Dirt'],
-      ['sand', 'Sand'],
-      ['wetSand', 'Wet sand'],
-      ['rock', 'Rock'],
       ['concrete', 'Concrete'],
       ['water', 'Water'],
     ]) {
@@ -639,9 +638,14 @@ export function createVisualsEditor(ctx) {
     addSlider(s, 'Plant cull (m)', 10, 400, 5, () => vegetation.getPlantCull(), (v) => vegetation.setPlantCull(v));
   }
 
-  if (barrels) {
+  if (barrels || trucks) {
     const s = addSection('Props');
-    addSlider(s, 'Barrel LOD distance ×', 0.25, 4, 0.05, () => barrels.getLodScale(), (v) => barrels.setLodScale(v));
+    if (barrels) {
+      addSlider(s, 'Barrel LOD distance ×', 0.25, 4, 0.05, () => barrels.getLodScale(), (v) => barrels.setLodScale(v));
+    }
+    if (trucks) {
+      addSlider(s, 'Truck LOD distance ×', 0.25, 4, 0.05, () => trucks.getLodScale(), (v) => trucks.setLodScale(v));
+    }
   }
 
   // Grading — whole-image look
@@ -664,6 +668,9 @@ export function createVisualsEditor(ctx) {
   // Post
   {
     const s = addSection('Post');
+    addSlider(s, 'Fisheye', 0, 2, 0.01, () => grade.fisheye.value, (v) => {
+      grade.fisheye.value = v;
+    });
     addSlider(s, 'Bloom', 0, 2.5, 0.05, () => bloom.strength, (v) => { bloom.strength = v; });
     addSlider(s, 'Bloom radius', 0, 1.5, 0.05, () => bloom.radius, (v) => { bloom.radius = v; });
     addSlider(s, 'Bloom thresh', 0, 1.5, 0.05, () => bloom.threshold, (v) => { bloom.threshold = v; });

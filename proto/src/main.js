@@ -6,7 +6,7 @@ import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader.js';
 import { LightProbeGenerator } from 'three/examples/jsm/lights/LightProbeGenerator.js';
 import { SkyMesh } from 'three/examples/jsm/objects/SkyMesh.js';
 import { createPost } from './post.js';
-import { buildTerrain, heightAt, isGrassable, PLAYER_SPAWN } from './terrain.js';
+import { buildTerrain, heightAt, isGrassable, PLAYER_SPAWN, BRIDGE } from './terrain.js';
 import { buildProps } from './props.js';
 import { buildAirfield } from './airfield.js';
 import { buildPort } from './port.js';
@@ -29,17 +29,20 @@ import { FreeFlight } from './freeflight.js';
 import { buildPlanes } from './planes.js';
 import { buildShip } from './ship.js';
 import { buildBgIsland } from './bgIsland.js';
-import { buildWaterTower, WATER_TOWER } from './watertower.js';
+import { buildWaterTower } from './watertower.js';
+import { buildBridge } from './bridge.js';
 import { buildFlag } from './flag.js';
 import { buildBarrels } from './barrels.js';
+import { buildTrucks } from './truck.js';
+import { buildPebbles } from './pebbles.js';
 import './style.css';
 
 const FIXED_DT = 1 / 120;
 const MAX_SUBSTEPS = 4;
-const MAX_RENDER_W = 1920;
-const MAX_RENDER_H = 1080;
+const MAX_RENDER_W = 960;
+const MAX_RENDER_H = 540;
 
-/** Drawing buffer stays within 1920×1080. CSS canvas still fills the window. */
+/** 540p drawing buffer (960×540). The canvas stretches it to the window with bilinear filtering. */
 function renderPixelRatio() {
   const dpr = Math.min(devicePixelRatio || 1, 1.5);
   const w = innerWidth * dpr;
@@ -141,7 +144,7 @@ async function main() {
   buildProps(RAPIER, world, scene);
   const airfield = buildAirfield(RAPIER, world, scene);
   const port = buildPort(RAPIER, world, scene);
-  const [grass, vegetation, planes, , waterTower, flag, barrels] = await Promise.all([
+  const [grass, vegetation, planes, , waterTower, flag, barrels, trucks, bridge] = await Promise.all([
     buildGrass(scene),
     buildVegetation(scene, { RAPIER, world }),
     buildPlanes(scene),
@@ -149,7 +152,10 @@ async function main() {
     buildWaterTower(scene, { RAPIER, world }),
     buildFlag(scene, { RAPIER, world }),
     buildBarrels(scene, { RAPIER, world }),
+    buildTrucks(scene, { RAPIER, world }),
+    buildBridge(scene, { RAPIER, world }),
   ]);
+  await buildPebbles(scene, vegetation.pebbleAnchors, terrain.groundSets, terrain.palette.concrete);
 
   const loader = new GLTFLoader();
   const [gltf, enemyGltf] = await Promise.all([
@@ -157,7 +163,7 @@ async function main() {
     loader.loadAsync('./models/sherman.glb'),
   ]);
   const { x: sx, z: sz } = PLAYER_SPAWN;
-  const spawn = { x: sx, y: heightAt(sx, sz) + 0.6, z: sz, yaw: Math.atan2(-(WATER_TOWER.z - sz), WATER_TOWER.x - sx) };
+  const spawn = { x: sx, y: heightAt(sx, sz) + 0.6, z: sz, yaw: Math.atan2(-(BRIDGE.z - sz), BRIDGE.x - sx) };
   const tank = new Tank(gltf, RAPIER, world, spawn);
   scene.add(tank.model);
   const fx = new Effects(scene, RAPIER, world, tank.body, barrels.dynamic);
@@ -167,6 +173,7 @@ async function main() {
   nav.setObstacles([
     ...vegetation.navObstacles(), ...airfield.navObstacles(),
     ...port.navObstacles(), ...waterTower.navObstacles(), ...flag.navObstacles(),
+    ...trucks.navObstacles(),
   ]);
   const enemySpawn = pickSpawn(nav, spawn, MIN_SPAWN_GAP);
   const enemy = new Tank(enemyGltf, RAPIER, world, enemySpawn, { tint: ENEMY_TINT });
@@ -175,7 +182,7 @@ async function main() {
   const hud = createHud();
 
   const tankCam = new TankCamera(camera);
-  tankCam.setColliders([terrain.mesh, vegetation.coverRoot]);
+  tankCam.setColliders([terrain.mesh, vegetation.coverRoot, bridge.root, trucks.root]);
   const sfx = new Sfx();
   await Promise.all([sfx.load(), fx.load()]);
   sfx.setMusicMuted(localStorage.getItem(MUSIC_MUTE_KEY) === '1');
@@ -194,7 +201,7 @@ async function main() {
 
   const match = createMatch({
     tank, enemy, ai, nav, fx, hud, sfx, tankCam, input,
-    vegetation, airfield, port, waterTower, barrels, spawn,
+    vegetation, airfield, port, waterTower, barrels, trucks, spawn,
     onRestart: (opts) => onMatchRestart(opts),
   });
   match.wireFx();
@@ -234,7 +241,7 @@ async function main() {
 
   patchShadowTint(scene);
   const visuals = createVisualsEditor({
-    renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe, terrain, grass, vegetation, barrels, post, shadowTint, fx, clouds,
+    renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe, terrain, grass, vegetation, barrels, trucks, post, shadowTint, fx, clouds,
     getEnvIntensity: () => scene.environmentIntensity,
     setEnvIntensity: (v) => { scene.environmentIntensity = v; },
     tanks: [tank, enemy],
@@ -277,7 +284,11 @@ async function main() {
   });
 
   // ---------------------------------------------------------------- camera + aim helpers
-  // Mouse look drives TankCamera's turret blend; hull yaw is body heading (+X forward).
+  // Mouse look drives TankCamera. Hull yaw is body heading (+X forward).
+  // The view may lead the barrel, but only by this much — a fast swipe cannot
+  // orbit the camera off the turret. Past the lead the view locks and the
+  // barrel catches the reticle (Battlefield turret cam).
+  const TURRET_CAM_LEAD = THREE.MathUtils.degToRad(20);
   let lookYaw = spawn.yaw;
   let lookPitch = -0.08;
   const viewDir = new THREE.Vector3();
@@ -299,6 +310,18 @@ async function main() {
     return _euler.x;
   }
 
+  const wrapYaw = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+
+  /** World yaw of the barrel. Null once the turret has been blown off the hull. */
+  function turretAimYaw() {
+    if (tank.debris.length) return null;
+    tank.model.position.copy(tank.body.translation());
+    tank.model.quaternion.copy(tank.body.rotation());
+    tank.turret.updateWorldMatrix(true, false);
+    _fwd.set(1, 0, 0).applyQuaternion(tank.turret.getWorldQuaternion(_q));
+    return Math.atan2(-_fwd.z, _fwd.x);
+  }
+
   function camState(turretTurn = 0) {
     return {
       position: camPos.copy(tank.body.translation()),
@@ -314,7 +337,7 @@ async function main() {
   }
 
   function snapCam() {
-    lookYaw = bodyYaw();
+    lookYaw = turretAimYaw() ?? bodyYaw();
     lookPitch = -0.08;
     prevLookYaw = lookYaw;
     tankCam.snap(camState());
@@ -385,13 +408,23 @@ async function main() {
       return;
     }
 
-    lookYaw -= inp.aimX;
+    // One frame of mouse can be several full turns. Cap the sample first so it
+    // can't wrap onto the opposite direction, then keep the view on the barrel.
+    // Past the lead, extra mouse is dropped; the window slides with the turret
+    // so a held turn keeps going at traverse speed.
+    lookYaw -= THREE.MathUtils.clamp(inp.aimX, -TURRET_CAM_LEAD, TURRET_CAM_LEAD);
     lookPitch = THREE.MathUtils.clamp(lookPitch - inp.aimY, -0.75, 0.45);
+
+    const gunYaw = turretAimYaw();
+    if (gunYaw != null) {
+      lookYaw = gunYaw + THREE.MathUtils.clamp(wrapYaw(lookYaw - gunYaw), -TURRET_CAM_LEAD, TURRET_CAM_LEAD);
+    }
 
     if (inp.zoom) {
       const k = 1 + inp.zoom * 0.08;
-      tankCam.cfg.distanceMin = THREE.MathUtils.clamp(tankCam.cfg.distanceMin * k, 4, 16);
-      tankCam.cfg.distanceMax = THREE.MathUtils.clamp(tankCam.cfg.distanceMax * k, tankCam.cfg.distanceMin + 1, 22);
+      const d = THREE.MathUtils.clamp(tankCam.cfg.distanceMin * k, 4, 16);
+      tankCam.cfg.distanceMin = d;
+      tankCam.cfg.distanceMax = d;
     }
 
     const turretTurn = THREE.MathUtils.clamp(
@@ -442,6 +475,11 @@ async function main() {
       }
     }
     hud.setNitro(tank.nitroCharge, tank.nitroActive);
+    hud.setReload(tank.alive ? tank.reload : 0, RELOAD);
+    hud.setStress(
+      tank.alive ? tank.stressMissChance : 0,
+      !game.solo && enemy.alive ? enemy.stressMissChance : 0,
+    );
     // Hide while driving, on gamepad, or while the visuals editor has the cursor
     $('overlay').classList.toggle('hidden', input.locked || !!inp.pad || visuals.open);
   }
@@ -621,6 +659,8 @@ async function main() {
     castFrom(camera.position, viewDir, 1200, aimPoint);
     // Freefly owns the look — leave the turret alone so the hull doesn't track the ghost cam
     if (!paused) tank.update(dt, tank.alive ? aimPoint : null);
+    if (tank.reloadDone && tank.alive) sfx.reload();
+    tank.reloadDone = false;
     const m = tank.muzzle();
     castFrom(m.pos, m.dir, 1200, gunPoint);
 
@@ -672,9 +712,12 @@ async function main() {
     grass.updateLod(camera.position);
     vegetation?.updateLod?.(camera.position);
     barrels.updateLod(camera.position);
+    trucks.updateLod(camera.position);
     if (!paused) {
       fx.update(dt, heightAt);
       barrels.update(dt, fx);
+      waterTower.update(dt, fx);
+      trucks.update(dt, fx);
       grass.update(elapsed);
       vegetation?.update?.(elapsed);
       flag.update(elapsed, vegetation?.getWind?.());

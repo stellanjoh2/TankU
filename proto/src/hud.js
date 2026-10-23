@@ -4,8 +4,11 @@ export function createHud() {
   root.id = 'hud';
   root.innerHTML = `
     <div class="hp" data-who="player"><span>YOU</span><div class="hp-bar"><i></i></div><b>100%</b></div>
+    <div class="stress hidden" data-who="player-stress"><span>STRESS</span><b>−0%</b></div>
     <div class="nitro" data-who="nitro"><span>NITRO</span><div class="nitro-bar"><i></i></div><b>100%</b></div>
+    <div class="reload hidden" data-who="reload"><span>RELOAD</span><div class="reload-bar"><i></i></div><b>0.0s</b></div>
     <div class="hp enemy" data-who="enemy"><span>ENEMY</span><div class="hp-bar"><i></i></div><b>100%</b></div>
+    <div class="stress hidden" data-who="enemy-stress"><span>STRESS</span><b>−0%</b></div>
     <div class="ai-debug hidden"></div>`;
   const banner = document.createElement('div');
   banner.id = 'banner';
@@ -31,6 +34,9 @@ export function createHud() {
     player: root.querySelector('[data-who="player"]'),
     enemy: root.querySelector('[data-who="enemy"]'),
     nitro: root.querySelector('[data-who="nitro"]'),
+    reload: root.querySelector('[data-who="reload"]'),
+    playerStress: root.querySelector('[data-who="player-stress"]'),
+    enemyStress: root.querySelector('[data-who="enemy-stress"]'),
   };
   const debug = root.querySelector('.ai-debug');
 
@@ -42,10 +48,30 @@ export function createHud() {
     row.classList.toggle('dead', pct <= 0);
   }
 
+  function setStressRow(row, chance) {
+    const on = chance > 0.001;
+    row.classList.toggle('hidden', !on);
+    if (on) row.querySelector('b').textContent = `−${Math.round(chance * 100)}%`;
+  }
+
   return {
     setHealth(player, enemy) {
       setBar(rows.player, player);
       if (enemy != null) setBar(rows.enemy, enemy);
+    },
+    /** Miss chance from Stress, 0..1. Hidden at 0. */
+    setStress(player, enemy) {
+      setStressRow(rows.playerStress, player);
+      setStressRow(rows.enemyStress, enemy ?? 0);
+    },
+    /** Seconds left on the main gun. Hidden when the gun is ready. */
+    setReload(remaining, total) {
+      const on = remaining > 0.05 && total > 0;
+      rows.reload.classList.toggle('hidden', !on);
+      if (!on) return;
+      const ready = 1 - remaining / total;
+      rows.reload.querySelector('i').style.width = `${Math.round(Math.max(0, ready) * 100)}%`;
+      rows.reload.querySelector('b').textContent = `${remaining.toFixed(1)}s`;
     },
     setNitro(frac, active = false) {
       const pct = Math.round(Math.max(0, Math.min(1, frac)) * 100);

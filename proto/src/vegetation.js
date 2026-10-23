@@ -6,7 +6,7 @@ import * as THREE from 'three';
 import { PropertyBinding } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
-import { SIZE, WATER_Y, heightAt, shoreSigned, isOnRoad, isAirfield, isPort } from './terrain.js';
+import { SIZE, WATER_Y, heightAt, shoreSigned, isOnRoad, isAirfield, isPort, ISLAND2, PLAYER_SPAWN } from './terrain.js';
 import { pickLod } from './lod.js';
 
 const PREFABS = {
@@ -42,7 +42,7 @@ const GLOBAL_SCALE = 1.0;
 const TREE_SCALE = 1.375; // +10% vs prior 1.25
 const PALM_SINK = 0.25; // metres — trunks were floating above the ground
 const ROCK_SCALE = 1.5; // 50% larger than previous rock scales
-const SPAWN = { x: -8, z: -5 };
+const SPAWN = PLAYER_SPAWN;
 const SPAWN_CLEAR = 14;
 const HALF = SIZE * 0.5;
 
@@ -347,6 +347,7 @@ function canPlaceTree(x, z) {
   if (slopeAt(x, z) > 0.12) return false;
   if (nearSpawn(x, z)) return false;
   if (isAirfield(x, z) || isPort(x, z)) return false;
+  if (isOnRoad(x, z, 1.5)) return false;
   return true;
 }
 
@@ -357,6 +358,7 @@ function canPlacePlant(x, z) {
   if (slopeAt(x, z) > 0.28) return false;
   if (nearSpawn(x, z)) return false;
   if (isAirfield(x, z) || isPort(x, z)) return false;
+  if (isOnRoad(x, z, 1.5)) return false;
   return true;
 }
 
@@ -813,6 +815,21 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     clusterCenters.push({ x, z, shore });
   }
 
+  // Satellite island — the main radial scatter never reaches this far SW.
+  let satTries = 0;
+  const satWant = 6;
+  const satTarget = clusterCenters.length + satWant;
+  while (clusterCenters.length < satTarget && satTries < 80) {
+    satTries++;
+    const ang = rand() * Math.PI * 2;
+    const rad = 12 + rand() * (ISLAND2.r - 18);
+    const x = ISLAND2.cx + Math.cos(ang) * rad;
+    const z = ISLAND2.cz + Math.sin(ang) * rad;
+    if (!canPlacePlant(x, z) && !canPlaceTree(x, z)) continue;
+    if (clusterCenters.some((c) => Math.hypot(c.x - x, c.z - z) < 8)) continue;
+    clusterCenters.push({ x, z, shore: shoreSigned(x, z) });
+  }
+
   for (const c of clusterCenters) {
     const treeOk = canPlaceTree(c.x, c.z);
     const nTrees = treeOk ? 1 + (rand() < 0.55 ? 1 : 0) : 0;
@@ -1007,6 +1024,41 @@ export async function buildVegetation(scene, { RAPIER, world }) {
   applyPlantVisibility();
   bakeStatic();
 
+  const pebbleAnchors = [];
+  for (const item of catalog.rock) {
+    for (const rec of item.rockRecs) {
+      pebbleAnchors.push({
+        x: rec.x, z: rec.z,
+        r: Math.max(0.3, item.radius * rec.scale * 0.55),
+        kind: 'rock',
+      });
+    }
+    for (const rec of item.coverRecs) {
+      pebbleAnchors.push({
+        x: rec.x, z: rec.z,
+        r: Math.max(item.size.x, item.size.z) * 0.5 * rec.scale * 0.92,
+        kind: 'cover',
+      });
+    }
+  }
+  for (const p of palms) {
+    if (!p.visible) continue;
+    const t = p.userData.trunk;
+    if (!t) continue;
+    pebbleAnchors.push({ x: t.x, z: t.z, r: 0.42, kind: 'palm' });
+  }
+  for (const rec of plants) {
+    if (!rec.visible || rec.culled) continue;
+    if (!rec.item.name.startsWith('Bush') && !rec.item.meta.big) continue;
+    // About half the bushes — pebbles at every stem would read as gravel.
+    if (Math.abs(Math.sin(rec.x * 12.9898 + rec.z * 78.233)) > 0.5) continue;
+    pebbleAnchors.push({
+      x: rec.x, z: rec.z,
+      r: THREE.MathUtils.clamp(rec.item.radius * rec.scale * 0.22, 0.18, 0.55),
+      kind: 'plant',
+    });
+  }
+
   console.info(
     `[vegetation] ${count} placed (` +
       `${palms.length} palms pooled, ${Math.round(BASE_PALM_TARGET * palmAmount)} visible; ` +
@@ -1019,6 +1071,7 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     root,
     coverRoot,
     coverRocks,
+    pebbleAnchors,
     navObstacles,
     count,
     getPalmAmount: () => palmAmount,

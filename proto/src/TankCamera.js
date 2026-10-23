@@ -9,19 +9,23 @@ import * as THREE from 'three';
 export const CAMERA_CONFIG = {
   // ---------- Base rig (where the camera sits) ----------
   pivotHeight: 1.6,          // height above tank origin the camera orbits/looks around
-  distanceMin: 7.0,          // distance behind tank when standing still
-  distanceMax: 10.5,         // distance behind tank at top speed
+  distanceMin: 7.0,          // distance behind the hull (standstill and at speed)
+  distanceMax: 7.0,          // do not reel the camera backward as speed builds
   heightMin: 2.8,            // camera height above pivot at standstill
   heightMax: 2.2,            // camera height at top speed (lower = more "racing")
   lookAheadStatic: 6.0,      // how far in front of the tank the camera aims at rest
   lookAheadSpeed: 0.35,      // extra look-ahead per m/s of speed
   lookAtHeight: 0.6,         // vertical offset of the look target (raise to see more sky)
 
-  // ---------- Follow lag (racing feel comes from this) ----------
-  followLambdaXZ: 7.0,       // position follow, horizontal. Lower = more trailing/lag
-  followLambdaY: 5.0,        // position follow, vertical (smooths bumps/hills)
-  yawLambda: 3.5,            // how fast camera swings to new heading. LOW = you see the tank's side in turns
-  yawLambdaFast: 2.5,        // yaw lambda at top speed (even lazier when fast)
+  // ---------- Follow (stay on the hull) ----------
+  // XZ is copied from the vehicle every frame. Damping it trails at ~speed/lambda
+  // and, once you're moving, cuts corners so the rig strays off the tank.
+  followLambdaY: 8.0,        // vertical only (smooths bumps)
+  maxPivotLagY: 1.25,        // metres — Y smooth can't leave the camera hanging
+  yawLambda: 12.0,           // heading follow. High = camera stays behind the hull
+  yawLambdaFast: 16.0,       // tighter at speed. A lazy fast yaw swings the cam off the tank
+  maxYawLagDeg: 8,           // hard cap on smoothed heading error
+  maxAimLagDeg: 10,          // hard cap on look-target smoothing
   steerYawOffsetDeg: 14,     // camera swings toward outside of a turn by this much at full steer + speed
   reverseFlip: false,        // true: camera swings to look the other way when reversing
   reverseThreshold: 1.5,     // m/s before reverse counts as reversing
@@ -69,7 +73,7 @@ export const CAMERA_CONFIG = {
   kickRollDeg: 2.4,          // bank/tilt on fire (sign flips per shot)
   kickFovDeg: 7.5,           // FOV punch on fire (cheap, effective)
   kickAttackDuration: 0.28,  // seconds to ease into peak shove (not a snap)
-  kickReturnDuration: 2.0,   // total fire→rest window; match tank RELOAD
+  kickReturnDuration: 4.0,   // total fire→rest window; match tank RELOAD
   kickShake: 0.45,           // trauma added to shake on fire (0..1)
   // Soft peak trauma refreshed each .50 round (snap, don’t stack — stacking becomes an earthquake).
   mgShake: 0.3,
@@ -289,10 +293,12 @@ export class TankCamera {
       this.initialised = true;
     }
 
-    // ----- pivot follow (horizontal vs vertical lag separate) -----
-    this.pivot.x = damp(this.pivot.x, s.position.x, c.followLambdaXZ, dt);
-    this.pivot.z = damp(this.pivot.z, s.position.z, c.followLambdaXZ, dt);
+    // ----- pivot: locked to the hull on XZ. Only Y is smoothed, and capped. -----
+    this.pivot.x = s.position.x;
+    this.pivot.z = s.position.z;
     this.pivot.y = damp(this.pivot.y, s.position.y, c.followLambdaY, dt);
+    const yErr = this.pivot.y - s.position.y;
+    if (Math.abs(yErr) > c.maxPivotLagY) this.pivot.y = s.position.y + Math.sign(yErr) * c.maxPivotLagY;
 
     // ----- yaw: heading blended with turret, lagged, steer-offset -----
     let baseYaw = s.heading;
@@ -302,14 +308,23 @@ export class TankCamera {
     desiredYaw += -steer * deg(c.steerYawOffsetDeg) * speedT; // swing to outside of turn
     const yawLambda = lerp(c.yawLambda, c.yawLambdaFast, speedT);
     this.yaw = dampAngle(this.yaw, desiredYaw, yawLambda, dt);
-    this.aimYaw = dampAngle(this.aimYaw, lerpAngle(baseYaw, turretYaw, c.turretLookWeight), c.turretYawLambda, dt);
+    const yawErr = wrapAngle(desiredYaw - this.yaw);
+    const maxYawLag = deg(c.maxYawLagDeg);
+    if (Math.abs(yawErr) > maxYawLag) this.yaw = wrapAngle(desiredYaw - Math.sign(yawErr) * maxYawLag);
+    const desiredAim = lerpAngle(baseYaw, turretYaw, c.turretLookWeight);
+    this.aimYaw = dampAngle(this.aimYaw, desiredAim, c.turretYawLambda, dt);
+    const aimErr = wrapAngle(desiredAim - this.aimYaw);
+    const maxAimLag = deg(c.maxAimLagDeg);
+    if (Math.abs(aimErr) > maxAimLag) this.aimYaw = wrapAngle(desiredAim - Math.sign(aimErr) * maxAimLag);
 
     // ----- speed / brake FOV (±fovDelta around fovBase) -----
     const targetFov = braking
       ? c.fovBase - c.fovDelta * brakeT
       : c.fovBase + c.fovDelta * speedT;
     this.fov = damp(this.fov, targetFov, c.fovLambda, dt);
-    const targetDist = lerp(c.distanceMin, c.distanceMax, speedT);
+    // Boom stays at distanceMin. Lerping out to a longer distance at speed is
+    // what reels the camera off the hull after you've been driving.
+    const targetDist = c.distanceMin;
     this.distance = damp(this.distance, targetDist, c.fovLambda, dt);
     const height = lerp(c.heightMin, c.heightMax, speedT);
 

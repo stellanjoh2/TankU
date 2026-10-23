@@ -27,7 +27,7 @@ const MOODS = {
   cautious: { threat: 12,  avoidR: 50, avoidW: 8, range: [50, 95], hide: [2.5, 4.5], react: [1.2, 2.0] },
 };
 // Gunnery difficulty
-const SHOT_GAP = [4.5, 7];        // s between the AI's shots (the gun itself reloads in 2)
+const SHOT_GAP = [4.5, 7];        // s between the AI's shots (the gun itself reloads in 4)
 const SCORED_PAUSE = [7, 10];     // s of holding fire after it hits you
 const BASE_SPREAD = 1.0;          // m aim error at 60 m with both tanks still
 const RANGING = [2.2, 1.5, 1.15]; // spread multiplier for the 1st/2nd/3rd shot at a fresh sighting

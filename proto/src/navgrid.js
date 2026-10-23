@@ -6,7 +6,7 @@
 //    ray-cast exposure map ("can the enemy see this cell?") plus a proximity term, so one search
 //    gives sneaky covered routes when outgunned and direct ones when it has the edge.
 //  * String-pulling smooths the grid path but never cuts through blocked or more-exposed cells.
-import { SIZE, WATER_Y, heightAt, shoreSigned } from './terrain.js';
+import { SIZE, WATER_Y, heightAt, shoreSigned, onBridge } from './terrain.js';
 
 export const CELL = 2;
 const N = Math.ceil(SIZE / CELL);
@@ -85,7 +85,7 @@ export class NavGrid {
         this.height[k] = h;
         this.grade[k] = grade;
         const edge = Math.max(Math.abs(x), Math.abs(z)) > HALF - 6;
-        const wet = shoreSigned(x, z) < 3 || h < WATER_Y + 0.6;
+        const wet = !onBridge(x, z, 3) && (shoreSigned(x, z) < 3 || h < WATER_Y + 0.6);
         this.terrainBlocked[k] = edge || wet || grade > MAX_GRADE ? 1 : 0;
       }
     }

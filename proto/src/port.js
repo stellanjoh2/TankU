@@ -2,7 +2,7 @@
 // plus a slab yard south of the deck for the water tower.
 import * as THREE from 'three';
 import { AIRFIELD_Y, PORT, PORT_YARD, WATER_Y } from './terrain.js';
-import { concreteSlabMap } from './concreteTex.js';
+import { applyConcreteMaps, prepareSlabGeometry } from './concreteTex.js';
 
 const SLAB = 4.0;
 const SLAB_GAP = 0.08;
@@ -41,11 +41,11 @@ export function buildPort(RAPIER, world, scene) {
   scene.add(root);
 
   const y0 = AIRFIELD_Y;
-  const unit = new THREE.BoxGeometry(1, 1, 1);
-  const concrete = mat(0xffffff, { rough: 0.95 });
-  concrete.map = concreteSlabMap();
-  const concreteDark = mat(0xe2ddd4, { rough: 0.97 });
-  concreteDark.map = concrete.map;
+  const unit = prepareSlabGeometry(new THREE.BoxGeometry(1, 1, 1));
+  const concrete = mat(0xffffff);
+  applyConcreteMaps(concrete);
+  const concreteDark = mat(0xe2ddd4);
+  applyConcreteMaps(concreteDark);
   const wood = mat(0x6b4a2e, { rough: 0.92 });
   const woodDark = mat(0x4a3220, { rough: 0.95 });
   const woodWet = mat(0x3d2a1a, { rough: 0.88 });

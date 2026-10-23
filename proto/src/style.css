@@ -37,17 +37,27 @@ canvas { display: block; }
   display: flex; flex-direction: column; gap: 7px; letter-spacing: 0.06em;
 }
 #hud .hp,
-#hud .nitro { display: grid; grid-template-columns: 56px 160px 40px; align-items: center; gap: 8px; }
+#hud .nitro,
+#hud .reload { display: grid; grid-template-columns: 56px 160px 44px; align-items: center; gap: 8px; }
+#hud .stress { display: grid; grid-template-columns: 56px 1fr; align-items: center; gap: 8px; margin-top: -4px; }
 #hud .hp span,
-#hud .nitro span {
+#hud .nitro span,
+#hud .reload span,
+#hud .stress span {
   font-family: "Bebas Neue", sans-serif; font-size: 16px; font-weight: 400;
   line-height: 1; letter-spacing: 0.06em; opacity: 0.85; text-shadow: 0 1px 3px #000;
 }
 #hud .hp[data-who="player"] span { color: #ffd278; opacity: 1; }
 #hud .hp b,
-#hud .nitro b { font-weight: 600; font-size: 12px; text-align: right; text-shadow: 0 1px 3px #000; }
+#hud .nitro b,
+#hud .reload b { font-weight: 600; font-size: 12px; text-align: right; text-shadow: 0 1px 3px #000; }
+#hud .stress b {
+  font-weight: 600; font-size: 12px; text-align: left; color: #ff6a4a; text-shadow: 0 1px 3px #000;
+}
+#hud .stress span { color: #ff6a4a; opacity: 1; }
 #hud .hp-bar,
-#hud .nitro-bar {
+#hud .nitro-bar,
+#hud .reload-bar {
   height: 10px; background: rgba(0, 0, 0, 0.5); border: 1px solid rgba(232, 228, 216, 0.35);
   border-radius: 2px; overflow: hidden;
 }
@@ -65,6 +75,10 @@ canvas { display: block; }
 }
 #hud .nitro.active .nitro-bar i { background: linear-gradient(90deg, #2bc8d4, #7cf7ff); }
 #hud .nitro.empty .nitro-bar i { background: #1a4a52; box-shadow: none; }
+#hud .reload-bar i {
+  display: block; height: 100%; width: 0%;
+  background: #e0a030; transition: width 0.08s linear;
+}
 #hud .ai-debug { font-size: 11px; opacity: 0.75; text-shadow: 0 1px 3px #000; white-space: pre; }
 
 #banner {

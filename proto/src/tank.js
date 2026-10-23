@@ -35,7 +35,8 @@ const MG_TRAVERSE = THREE.MathUtils.degToRad(90);
 const MG_ELEVATE = THREE.MathUtils.degToRad(60);
 const MG_ELEV_MIN = THREE.MathUtils.degToRad(-20);
 const MG_ELEV_MAX = THREE.MathUtils.degToRad(70);
-export const RELOAD = 2.0;
+export const RELOAD = 4.0;
+const STRESS_MISS = 0.15;   // per main-gun hit taken: chance the next shell throws wide of a good aim
 export const SHELL_SPEED = 260 * 0.8;
 export const MAX_HP = 4;     // main-gun hits to destroy
 export const MG_DAMAGE = 0.01; // .50 cal chip damage (−80%; ~100 rounds / full bar)
@@ -66,6 +67,8 @@ const ANT_ACCEL_SMOOTH = 25; // 1/s, low-pass on the measured acceleration
 
 const _v = new THREE.Vector3();
 const _q = new THREE.Quaternion();
+const _up = new THREE.Vector3(0, 1, 0);
+const _side = new THREE.Vector3();
 const _box = new THREE.Box3();
 const _size = new THREE.Vector3();
 const _center = new THREE.Vector3();
@@ -193,6 +196,17 @@ function nitroEnvelope(age) {
   return Math.max(0, 1 - u * u);
 }
 
+/** Panic throw: yaw hard enough to miss a hull at duel range. Mutates `dir`. */
+function deflectShell(dir) {
+  const yaw = (Math.random() < 0.5 ? -1 : 1) * (0.26 + Math.random() * 0.12);
+  dir.applyAxisAngle(_up, yaw);
+  _side.crossVectors(_up, dir);
+  if (_side.lengthSq() > 1e-8) {
+    dir.applyAxisAngle(_side.normalize(), (Math.random() - 0.4) * 0.08);
+  }
+  return dir.normalize();
+}
+
 /** Damped spring on a 2D value (pos, vel: Vector2) towards target, semi-implicit Euler. */
 function springStep(pos, vel, target, { hz, zeta }, dt) {
   const w = 2 * Math.PI * hz;
@@ -213,6 +227,7 @@ export class Tank {
     this.hitFlashFrames = 0;
     this.hp = MAX_HP;
     this.maxHp = MAX_HP;
+    this.stress = 0;          // main-gun hits taken this round; each one is −15% direct-hit chance
     this.model.traverse((o) => {
       if (!o.isMesh) return;
       o.castShadow = o.receiveShadow = true;
@@ -322,6 +337,7 @@ export class Tank {
 
     this.cmd = { throttle: 0, turn: 0 };
     this.reload = 0;
+    this.reloadDone = false;
     this.recoilT = 1;
     this.grounded = 0;
     this.yawAim = 0;
@@ -406,6 +422,8 @@ export class Tank {
 
   get position() { return this.body.translation(); }
   get alive() { return this.hp > 0; }
+  /** Chance a well-aimed main-gun shell still misses, from Stress. */
+  get stressMissChance() { return this.stress * STRESS_MISS; }
 
   /** Remove from (or return to) the world without destroying it — used by solo mode. */
   setActive(on) {
@@ -732,7 +750,9 @@ export class Tank {
       this.turretSlew = 0;
     }
 
+    const wasReloading = this.reload > 0;
     this.reload = Math.max(0, this.reload - dt);
+    this.reloadDone = wasReloading && this.reload === 0;
     this.recoilT = Math.min(1, this.recoilT + dt);
     const r = this.recoilT;
     const k = r < 0.05 ? r / 0.05 : Math.pow(1 - Math.min(1, (r - 0.05) / 0.8), 2);
@@ -807,11 +827,14 @@ export class Tank {
     this.reload = RELOAD;
     this.recoilT = 0;
     const { pos, dir } = this.muzzle();
+    const shotDir = (this.stressMissChance > 0 && Math.random() < this.stressMissChance)
+      ? deflectShell(dir.clone())
+      : dir;
     const lv = this.body.linvel();
-    const vel = dir.clone().multiplyScalar(SHELL_SPEED).add(new THREE.Vector3(lv.x, lv.y, lv.z));
+    const vel = shotDir.clone().multiplyScalar(SHELL_SPEED).add(new THREE.Vector3(lv.x, lv.y, lv.z));
     const at = this.turret.getWorldPosition(new THREE.Vector3());
     this.body.applyImpulseAtPoint(dir.clone().multiplyScalar(-RECOIL_IMPULSE), at, true);
-    return { pos, dir, vel };
+    return { pos, dir: shotDir, vel };
   }
 
   /** True when the hull is on its side / roof (tracks no longer under it). */
@@ -859,9 +882,11 @@ export class Tank {
     this.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
     this.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
     this.reload = 0;
+    this.reloadDone = false;
     this.recoilT = 1;
     this.prevVel = null;
     this.hp = this.maxHp;
+    this.stress = 0;
     this.hitFlashFrames = 0;
     this._applyHitFlash(false);
     this.cmd.throttle = this.cmd.turn = 0;

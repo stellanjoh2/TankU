@@ -917,6 +917,30 @@ export class Effects {
     this._explode(pos.clone(), up, up.clone().negate(), null);
   }
 
+  /** Dark smoke rising off a wreck. A handful of puffs a second. */
+  plume(pos, dt) {
+    const n = 8 * dt;
+    let count = Math.floor(n);
+    if (Math.random() < n - count) count += 1;
+    for (let i = 0; i < count; i++) {
+      const g = 0.08 + Math.random() * 0.07;
+      this._sprite(
+        this.smokeTex,
+        new THREE.Color(g, g, g),
+        pos.clone().add(new THREE.Vector3((Math.random() - 0.5) * 1.6, Math.random() * 0.5, (Math.random() - 0.5) * 1.6)),
+        2.2 + Math.random() * 1.4,
+        3.2 + Math.random() * 1.6,
+        {
+          vel: new THREE.Vector3((Math.random() - 0.5) * 0.7, 1.8 + Math.random() * 1.1, (Math.random() - 0.5) * 0.7),
+          grow: 5,
+          rise: 1.1,
+          opacity: 0.5,
+          drag: 0.55,
+        },
+      );
+    }
+  }
+
   dust(pos, amount) {
     if (Math.random() > amount) return;
     this._sprite(this.smokeTex, new THREE.Color(0.42, 0.36, 0.26), pos, 0.8, 1.6 + Math.random(), {

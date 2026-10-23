@@ -1,12 +1,16 @@
-// WebGPU post: scene → motion blur → bloom → grade → ACES Filmic.
+// WebGPU post: scene → motion blur → bloom → fisheye/aberration → grade → grain → ACES Filmic.
 // Bloom is the full beauty image plus the emissive attachment, so HDR sprites
 // (emissiveNode, black albedo) glow with the rest of the frame.
+// Fisheye resamples that frame. The warp is scaled so the screen corner lands
+// on the texture corner — no black edges, and no extra pass when blur is off.
+// Aberration is the old finish pass: radial RGB split in UV units (slider 0–0.008).
+// At 0 the extra taps are skipped. Grain is animated and added after the grade.
 // Grade (contrast, saturation, temperature, shadow/mid/highlight tint, vignette)
 // runs in linear HDR. Exposure is renderer.toneMappingExposure inside the tone map.
-// Grain / aberration / FXAA still unused.
+// FXAA still unused.
 // Tone map matches three.js webgpu_tonemapping: renderer.toneMapping + toneMappingExposure.
 import * as THREE from 'three/webgpu';
-import { pass, mrt, output, emissive, velocity, uniform, vec2, vec3, vec4, float, mix, smoothstep, dot, screenUV, luminance, saturation } from 'three/tsl';
+import { pass, mrt, output, emissive, velocity, uniform, vec2, vec3, vec4, float, mix, smoothstep, dot, length, normalize, rand, screenUV, screenSize, luminance, saturation, convertToTexture } from 'three/tsl';
 import { bloom as bloomNode } from 'three/examples/jsm/tsl/display/BloomNode.js';
 import { motionBlur } from 'three/examples/jsm/tsl/display/MotionBlur.js';
 
@@ -32,6 +36,31 @@ export function createPost(renderer, scene, camera) {
   const uMids = uniform(new THREE.Color(1, 1, 1));
   const uHighlights = uniform(new THREE.Color(1, 1, 1));
   const uVignette = uniform(0.35);
+  // 0 = rectilinear. Higher bulges the center. Corner scale keeps samples in-frame.
+  const uFisheye = uniform(0.5);
+  // Finish uniforms. Same .value objects the Visuals sliders write.
+  const uAberration = uniform(0.0012);
+  const uTime = uniform(0);
+  const uGrain = uniform(0.035);
+  const uGrainScale = uniform(1);
+  const uGrainTint = uniform(new THREE.Color(1, 1, 1));
+  // Extra RGB taps only while the slider is above zero.
+  let aberrationOn = false;
+
+  // Circular in pixels. Dividing by the corner factor zooms out just enough
+  // that the screen corner samples the texture corner.
+  function lensUv() {
+    const aspect = screenSize.x.div(screenSize.y.max(1));
+    const ratio = vec2(aspect, 1);
+    const centered = screenUV.sub(0.5).mul(ratio);
+    const r2 = dot(centered, centered);
+    const corner = ratio.mul(0.5);
+    const cornerR2 = dot(corner, corner);
+    const k = uFisheye.max(0);
+    const fit = float(1).add(k.mul(cornerR2));
+    const factor = float(1).add(k.mul(r2)).div(fit);
+    return centered.mul(factor).div(ratio).add(0.5);
+  }
 
   function tintMul(col, weight) {
     const peak = col.r.max(col.g.max(col.b));
@@ -70,6 +99,17 @@ export function createPost(renderer, scene, camera) {
     return vec4(rgb, color.a);
   }
 
+  // Old FinishShader: hash noise, stronger on brighter pixels, tinted.
+  function applyGrain(color) {
+    const coord = screenUV.mul(float(800).mul(uGrainScale)).add(uTime.mul(0.05));
+    const noise = rand(coord).mul(2).sub(1);
+    const lum = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+    const weight = mix(float(0.3), float(1), smoothstep(0, 0.5, lum));
+    const tint = vec3(uGrainTint.r, uGrainTint.g, uGrainTint.b);
+    const rgb = color.rgb.add(tint.mul(noise.mul(uGrain).mul(0.5).mul(weight)));
+    return vec4(rgb, color.a);
+  }
+
   function view() {
     const targets = {
       output,
@@ -96,7 +136,20 @@ export function createPost(renderer, scene, camera) {
     // Beauty is the whole frame. Emissive is added only into the bloom extract
     // so sprites that store their glow there still bloom; the sharp image stays beauty.
     bloomPass = bloomNode(color.add(vec4(glow.rgb, 0)), bloomStrength, bloomRadius, bloomThresh);
-    pipeline.outputNode = gradeFrame(color.add(bloomPass));
+    const uv = lensUv();
+    // Beauty is already a pass texture (free resample). Motion blur is a
+    // computed node, so it is copied to a texture only while that effect is on.
+    const sceneTex = convertToTexture(color);
+    const bloomTex = bloomPass.getTextureNode();
+    const sampleAt = (sampleUv) => sceneTex.sample(sampleUv).add(bloomTex.sample(sampleUv));
+    let frame = sampleAt(uv);
+    if (aberrationOn) {
+      // shift = normalize(dir) * aberration * length(dir) * 2, from the old finish pass.
+      const dir = uv.sub(0.5);
+      const shift = normalize(dir.add(vec2(1e-6, 1e-6))).mul(uAberration.mul(length(dir)).mul(2));
+      frame = vec4(sampleAt(uv.add(shift)).r, frame.g, sampleAt(uv.sub(shift)).b, frame.a);
+    }
+    pipeline.outputNode = applyGrain(gradeFrame(frame));
     // RenderPipeline keeps the previous output shader until this is set.
     pipeline.needsUpdate = true;
   }
@@ -142,16 +195,26 @@ export function createPost(renderer, scene, camera) {
       highlights: uHighlights,
       vignetteIntensity: uVignette,
       vignetteColor: { value: new THREE.Color(0.03, 0.03, 0.03) },
+      fisheye: uFisheye,
     },
   };
 
   const finish = {
     uniforms: {
-      aberration: { value: 0.0012 },
-      time: { value: 0 },
-      grain: { value: 0.035 },
-      grainScale: { value: 1.0 },
-      grainTint: { value: new THREE.Color(1, 1, 1) },
+      aberration: {
+        get value() { return uAberration.value; },
+        set value(v) {
+          uAberration.value = +v;
+          const on = uAberration.value > 1e-6;
+          if (on === aberrationOn) return;
+          aberrationOn = on;
+          rebuild();
+        },
+      },
+      time: uTime,
+      grain: uGrain,
+      grainScale: uGrainScale,
+      grainTint: uGrainTint,
     },
   };
 
