@@ -73,6 +73,23 @@ const TURRET_PITCH = 0.09;
 
 const damp = (a, b, lambda, dt) => a + (b - a) * (1 - Math.exp(-lambda * dt));
 
+/** One loop voice: damp gain (and optional playback rate) toward the targets `prep` just set. */
+function stepVoice(v, dt) {
+  if (v.run) {
+    v.run(dt);
+    return;
+  }
+  if (v.prep) v.prep(v, dt);
+  if (!v.gain) return;
+  v.vol = damp(v.vol, v.target, v.lambda, dt);
+  v.gain.gain.value = v.vol;
+  if (v.targetRate != null && v.src) {
+    v.rate = damp(v.rate, v.targetRate, v.rateLambda, dt);
+    v.src.playbackRate.value = v.rate;
+  }
+  if (v.after) v.after(v, dt);
+}
+
 /**
  * Distance → 0..1 gain. Squared so far hits drop fast (linear floors were keeping
  * MG clanks audible across the whole ~250 m island). Returns 0 beyond `maxDist`.
@@ -174,6 +191,20 @@ export class Sfx {
     this._fanfare = null;
     this._repair = null;
     this._c47 = null;
+    this._drive = { speed: 0, throttle: 0, maxSpeed: 12.5, turretSlew: 0 };
+    this._voices = [{
+      run: (dt) => {
+        if (!this._musicGain || this._musicDuck === this._musicDuckTarget) return;
+        this._musicDuck = damp(this._musicDuck, this._musicDuckTarget, 4, dt);
+        if (Math.abs(this._musicDuck - this._musicDuckTarget) < 0.001) this._musicDuck = this._musicDuckTarget;
+        this._applyMusicGain();
+      },
+    }];
+  }
+
+  _track(voice) {
+    this._voices.push(voice);
+    return voice;
   }
 
   async load() {
@@ -281,6 +312,21 @@ export class Sfx {
     src.start();
     this._engine = src;
     this._engineGain = g;
+    this._track({
+      src, gain: g, vol: 0, rate: 1, target: 0, lambda: 6, targetRate: 1, rateLambda: 5,
+      prep: (v) => {
+        const { speed, throttle, maxSpeed } = this._drive;
+        const absSpd = Math.abs(speed);
+        const spdT = Math.min(1, absSpd / maxSpeed);
+        const throttleT = Math.min(1, Math.abs(throttle));
+        const reversing = speed < -0.4 || throttle < -0.15;
+        const activity = Math.max(spdT, throttleT * 0.85);
+        v.target = 0.12 + activity * 0.55;
+        v.lambda = 6;
+        v.targetRate = reversing ? 0.72 + spdT * 0.12 : 0.92 + spdT * 0.28 + throttleT * 0.06;
+        v.rateLambda = 5;
+      },
+    });
   }
 
   /** One-shot engine rev for a nitro burst (matches tank nitro envelope). */
@@ -397,6 +443,13 @@ export class Sfx {
     src.start();
     this._mg = src;
     this._mgGain = g;
+    this._track({
+      src, gain: g, vol: 0, rate: 1, target: 0, lambda: 10, targetRate: null, rateLambda: 5,
+      prep: (v) => {
+        v.target = this._mgWant ? 0.72 : 0;
+        v.lambda = this._mgWant ? 18 : 10;
+      },
+    });
   }
 
   /** Hold-to-fire .50 cal loop for the player. Call each frame with pressed state. */
@@ -418,7 +471,7 @@ export class Sfx {
       return;
     }
     this._hmgDist = dist;
-    if (this._hmgVol < 0.02) this._hmgCut = distantCutoff(dist, MG_HEAR, MG_FLOOR_HZ);
+    if ((this._hmgVoice?.vol ?? 0) < 0.02) this._hmgCut = distantCutoff(dist, MG_HEAR, MG_FLOOR_HZ);
     this.unlock();
     this._ensureHostileMg();
   }
@@ -440,6 +493,22 @@ export class Sfx {
     this._hmg = src;
     this._hmgLp = lp;
     this._hmgGain = g;
+    this._hmgVoice = this._track({
+      src, gain: g, vol: 0, rate: 1, target: 0, lambda: 8, targetRate: null, rateLambda: 5,
+      prep: (v) => {
+        const d = this._hmgDist;
+        const on = d != null;
+        v.target = on ? HOSTILE_MG_VOL * distGain(d, MG_HEAR) : 0;
+        v.lambda = on ? 14 : 8;
+        v._on = on;
+        v._dist = d;
+      },
+      after: (v, dt) => {
+        if (!v._on) return;
+        this._hmgCut = damp(this._hmgCut, distantCutoff(v._dist, MG_HEAR, MG_FLOOR_HZ), 8, dt);
+        this._hmgLp.frequency.value = this._hmgCut;
+      },
+    });
   }
 
   /** One-shot → destination. Lowpass when `dist` is a metre value past HEAR_OPEN_M. */
@@ -494,6 +563,13 @@ export class Sfx {
     src.start();
     this._p51Orbit = src;
     this._p51OrbitGain = g;
+    this._track({
+      src, gain: g, vol: 0, rate: 1, target: 0, lambda: 3, targetRate: null, rateLambda: 5,
+      prep: (v) => {
+        v.target = this._p51OrbitWant * P51_ORBIT_VOL;
+        v.lambda = v.target > v.vol ? 5 : 3;
+      },
+    });
   }
 
   /**
@@ -747,6 +823,14 @@ export class Sfx {
     src.start();
     this._fire = src;
     this._fireGain = g;
+    this._track({
+      src, gain: g, vol: 0, rate: 1, target: 0, lambda: 4, targetRate: null, rateLambda: 5,
+      prep: (v) => {
+        const want = this._fireWant || 0;
+        v.target = want * FIRE_VOL;
+        v.lambda = want > 0.02 ? 6 : 4;
+      },
+    });
   }
 
   _ensureTurret() {
@@ -760,6 +844,18 @@ export class Sfx {
     src.start();
     this._turret = src;
     this._turretGain = g;
+    this._track({
+      src, gain: g, vol: 0, rate: TURRET_BASE, target: 0, lambda: 8, targetRate: TURRET_BASE, rateLambda: 10,
+      prep: (v) => {
+        const slewT = Math.max(-1, Math.min(1, this._drive.turretSlew / 0.7));
+        const moving = Math.abs(slewT) > 0.04;
+        if (moving) this.unlock();
+        v.target = moving ? 0.177 + Math.abs(slewT) * 0.139 : 0;
+        v.lambda = moving ? 14 : 8;
+        v.targetRate = TURRET_BASE - slewT * TURRET_PITCH;
+        v.rateLambda = 10;
+      },
+    });
   }
 
   /**
@@ -774,83 +870,15 @@ export class Sfx {
     if (this._ricoCool > 0) this._ricoCool = Math.max(0, this._ricoCool - dt);
     if (this._thumpCool > 0) this._thumpCool = Math.max(0, this._thumpCool - dt);
     if (this._flybyCool > 0) this._flybyCool = Math.max(0, this._flybyCool - dt);
-    if (this._musicGain && this._musicDuck !== this._musicDuckTarget) {
-      this._musicDuck = damp(this._musicDuck, this._musicDuckTarget, 4, dt);
-      if (Math.abs(this._musicDuck - this._musicDuckTarget) < 0.001) this._musicDuck = this._musicDuckTarget;
-      this._applyMusicGain();
-    }
+    this._drive.speed = speed;
+    this._drive.throttle = throttle;
+    this._drive.maxSpeed = maxSpeed;
+    this._drive.turretSlew = turretSlew;
     this._ensureEngine();
-    if (this._engine && this._engineGain) {
-      const absSpd = Math.abs(speed);
-      const spdT = Math.min(1, absSpd / maxSpeed);
-      const throttleT = Math.min(1, Math.abs(throttle));
-      const reversing = speed < -0.4 || throttle < -0.15;
-
-      // idle floor so the engine is always faintly there once unlocked
-      const activity = Math.max(spdT, throttleT * 0.85);
-      const targetVol = 0.12 + activity * 0.55;
-
-      let targetRate;
-      if (reversing) {
-        targetRate = 0.72 + spdT * 0.12;
-      } else {
-        targetRate = 0.92 + spdT * 0.28 + throttleT * 0.06;
-      }
-
-      this._vol = damp(this._vol, targetVol, 6, dt);
-      this._rate = damp(this._rate, targetRate, 5, dt);
-      this._engineGain.gain.value = this._vol;
-      this._engine.playbackRate.value = this._rate;
-    }
-
     this._ensureMg();
-    if (this._mg && this._mgGain) {
-      const target = this._mgWant ? 0.72 : 0;
-      this._mgVol = damp(this._mgVol, target, this._mgWant ? 18 : 10, dt);
-      this._mgGain.gain.value = this._mgVol;
-    }
-
-    if (this._hmg && this._hmgGain) {
-      const d = this._hmgDist;
-      const on = d != null;
-      const target = on ? HOSTILE_MG_VOL * distGain(d, MG_HEAR) : 0;
-      this._hmgVol = damp(this._hmgVol, target, on ? 14 : 8, dt);
-      this._hmgGain.gain.value = this._hmgVol;
-      if (on) {
-        this._hmgCut = damp(this._hmgCut, distantCutoff(d, MG_HEAR, MG_FLOOR_HZ), 8, dt);
-        this._hmgLp.frequency.value = this._hmgCut;
-      }
-    }
-
     this._ensureFire();
-    if (this._fire && this._fireGain) {
-      const want = this._fireWant || 0;
-      const target = want * FIRE_VOL;
-      this._fireVol = damp(this._fireVol, target, want > 0.02 ? 6 : 4, dt);
-      this._fireGain.gain.value = this._fireVol;
-    }
-
     this._ensureP51Orbit();
-    if (this._p51Orbit && this._p51OrbitGain) {
-      const target = this._p51OrbitWant * P51_ORBIT_VOL;
-      this._p51OrbitVol = damp(this._p51OrbitVol, target, target > this._p51OrbitVol ? 5 : 3, dt);
-      this._p51OrbitGain.gain.value = this._p51OrbitVol;
-    }
-
     this._ensureTurret();
-    if (this._turret && this._turretGain) {
-      // +slew = left (CCW); TRAVERSE ≈ 0.73 rad/s → normalize
-      const slewT = Math.max(-1, Math.min(1, turretSlew / 0.7));
-      const moving = Math.abs(slewT) > 0.04;
-      if (moving) this.unlock();
-      // −4 dB vs prior levels (× 10^(−4/20) ≈ 0.631)
-      const targetVol = moving ? 0.177 + Math.abs(slewT) * 0.139 : 0;
-      // left (− pitch) / right (+ pitch)
-      const targetRate = TURRET_BASE - slewT * TURRET_PITCH;
-      this._turretVol = damp(this._turretVol, targetVol, moving ? 14 : 8, dt);
-      this._turretRate = damp(this._turretRate, targetRate, 10, dt);
-      this._turretGain.gain.value = this._turretVol;
-      this._turret.playbackRate.value = this._turretRate;
-    }
+    for (const v of this._voices) stepVoice(v, dt);
   }
 }

@@ -118,6 +118,29 @@ export class NavGrid {
   gradeAt(x, z) { return this.grade[this.index(x, z)]; }
 
   /**
+   * Bilinear height from the baked cell grid. Placement and the terrain mesh
+   * still call the analytic heightAt; per-frame FX and AI use this.
+   */
+  sampleHeight(x, z) {
+    const fx = (x + HALF) / CELL - 0.5;
+    const fz = (z + HALF) / CELL - 0.5;
+    const x0 = Math.floor(fx);
+    const z0 = Math.floor(fz);
+    const tx = fx - x0;
+    const tz = fz - z0;
+    const h = (i, j) => {
+      const ii = Math.min(N - 1, Math.max(0, i));
+      const jj = Math.min(N - 1, Math.max(0, j));
+      return this.height[jj * N + ii];
+    };
+    const a = h(x0, z0);
+    const b = h(x0 + 1, z0);
+    const c = h(x0, z0 + 1);
+    const d = h(x0 + 1, z0 + 1);
+    return a * (1 - tx) * (1 - tz) + b * tx * (1 - tz) + c * (1 - tx) * tz + d * tx * tz;
+  }
+
+  /**
    * @param {Array<{type:'circle',x:number,z:number,r:number}|{type:'box',x:number,z:number,hx:number,hz:number,yaw:number}>} list
    */
   setObstacles(list) {

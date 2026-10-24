@@ -21,6 +21,9 @@ const HULL_H = 1.3;         // aim at hull centre
 const TURRET_H = 2.3;       // …or at the turret when the hull is behind a crest
 const SPOT_EYE_H = 2.3;     // height that must be hidden for a spot to count as cover
 const THINK_EVERY = 0.2;
+// Fresh exposure rays allowed on one replan. Cells past the budget count as
+// exposed so a cautious route keeps avoiding ground it hasn't checked.
+const EXPOSURE_RAYS = 192;
 const REPLAN_EVERY = 2.0;
 const LOOKAHEAD = 7;
 const ARRIVE_R = 3.5;
@@ -129,7 +132,7 @@ export class TankAI {
     this.speedScale = 1;
     this.face = null;
     const t = this.tank.body.translation();
-    this.known = { x: t.x, z: t.z, eyeY: heightAt(t.x, t.z) + EYE_H };
+    this.known = { x: t.x, z: t.z, eyeY: this.nav.sampleHeight(t.x, t.z) + EYE_H };
     this.visible = false;
     this.aimH = HULL_H;
     this.seenFor = 0;
@@ -299,20 +302,22 @@ export class TankAI {
   _learn(x, z, noise) {
     this.known.x = x + rnd(-noise, noise);
     this.known.z = z + rnd(-noise, noise);
-    this.known.eyeY = heightAt(this.known.x, this.known.z) + EYE_H;
+    this.known.eyeY = this.nav.sampleHeight(this.known.x, this.known.z) + EYE_H;
   }
 
   /** Would a tank at the last-known enemy position see a turret at (x, z)? */
   _seenFromKnown(x, z) {
     const k = this.known;
     if (Math.hypot(x - k.x, z - k.z) > SIGHT_RANGE) return false;
-    return this._clear(k.x, k.eyeY, k.z, x, heightAt(x, z) + SPOT_EYE_H, z);
+    return this._clear(k.x, k.eyeY, k.z, x, this.nav.sampleHeight(x, z) + SPOT_EYE_H, z);
   }
 
   // ------------------------------------------------------------------ threat-aware planning
   _exposed(k) {
     let v = this.exposure[k];
     if (v < 0) {
+      if (this._rayBudget <= 0) return 1;
+      this._rayBudget--;
       const { nav, known } = this;
       const x = nav.xOf(k), z = nav.zOf(k);
       v = Math.hypot(x - known.x, z - known.z) < SIGHT_RANGE
@@ -343,6 +348,7 @@ export class TankAI {
   }
 
   _plan() {
+    this._rayBudget = EXPOSURE_RAYS;
     const k = this.known;
     if (Math.hypot(k.x - this.exposureFrom.x, k.z - this.exposureFrom.z) > 4) {
       this.exposure.fill(-1);

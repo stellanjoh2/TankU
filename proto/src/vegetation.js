@@ -603,20 +603,50 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     dst.multiplyMatrices(_dummy.matrix, local);
   }
 
-  /** Pack the instances whose LOD is live into the front of each batch. */
-  function writeBatch(batch) {
-    for (const mesh of batch.parts) {
+  /** Drop one instance and swap the tail into its slot. One matrix write. */
+  function hidePart(mesh, rec, partIndex) {
+    const slot = rec.slots[partIndex];
+    if (slot < 0) return;
+    const last = mesh.count - 1;
+    const slotRec = mesh.userData.slotRec;
+    if (slot !== last) {
+      const moved = slotRec[last];
+      mesh.getMatrixAt(last, _m);
+      mesh.setMatrixAt(slot, _m);
+      moved.slots[partIndex] = slot;
+      slotRec[slot] = moved;
+    }
+    slotRec[last] = null;
+    rec.slots[partIndex] = -1;
+    mesh.count = last;
+    mesh.visible = last > 0;
+    mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  function showPart(mesh, rec, partIndex) {
+    if (rec.slots[partIndex] >= 0) return;
+    const slot = mesh.count;
+    mesh.userData.slotRec[slot] = rec;
+    rec.slots[partIndex] = slot;
+    composeRec(rec, mesh.userData.localMatrix, _m);
+    mesh.setMatrixAt(slot, _m);
+    mesh.count = slot + 1;
+    mesh.visible = true;
+    mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  /** Show this record on the LOD parts that should draw it. Other parts are left alone. */
+  function syncRec(batch, rec) {
+    if (!rec.slots || rec.slots.length !== batch.parts.length) {
+      rec.slots = batch.parts.map(() => -1);
+    }
+    for (let p = 0; p < batch.parts.length; p++) {
+      const mesh = batch.parts[p];
       const [lo, hi] = mesh.userData.lodRange;
-      const local = mesh.userData.localMatrix;
-      let n = 0;
-      for (const rec of batch.recs) {
-        if (!rec.visible || rec.lod < lo || rec.lod > hi) continue;
-        composeRec(rec, local, _m);
-        mesh.setMatrixAt(n++, _m);
-      }
-      mesh.count = n;
-      mesh.visible = n > 0;
-      if (n > 0) mesh.instanceMatrix.needsUpdate = true;
+      const show = !!(rec.visible && rec.lod >= lo && rec.lod <= hi);
+      const shown = rec.slots[p] >= 0;
+      if (show && !shown) showPart(mesh, rec, p);
+      else if (!show && shown) hidePart(mesh, rec, p);
     }
   }
 
@@ -632,6 +662,9 @@ export async function buildVegetation(scene, { RAPIER, world }) {
       mesh.count = recs.length;
       mesh.computeBoundingSphere();
       if (mesh.boundingSphere) mesh.boundingSphere.radius += 1.5;
+      mesh.userData.slotRec = new Array(recs.length);
+      mesh.count = 0;
+      mesh.visible = false;
     }
   }
 
@@ -670,7 +703,7 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     }
     for (const batch of staticBatches) {
       sealBounds(batch);
-      writeBatch(batch);
+      for (const rec of batch.recs) syncRec(batch, rec);
     }
   }
 
@@ -707,7 +740,6 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     }
     const cullPad = plantCull * 0.05;
     for (const batch of staticBatches) {
-      let changed = false;
       for (const rec of batch.recs) {
         const d = Math.hypot(rec.x - camPos.x, rec.y - camPos.y, rec.z - camPos.z);
         const cur = rec.lod;
@@ -719,10 +751,9 @@ export async function buildVegetation(scene, { RAPIER, world }) {
         }
         if (level !== cur) {
           rec.lod = level;
-          changed = true;
+          syncRec(batch, rec);
         }
       }
-      if (changed) writeBatch(batch);
     }
   }
 
@@ -782,7 +813,9 @@ export async function buildVegetation(scene, { RAPIER, world }) {
       // Culled big plants keep their slot so smaller plants don't backfill the gap.
       plants[i].visible = i < show && !plants[i].culled;
     }
-    for (const batch of plantBatches) writeBatch(batch);
+    for (const batch of plantBatches) {
+      for (const rec of batch.recs) syncRec(batch, rec);
+    }
   }
 
   /** Hide 20% of big-leaf plants, spread evenly so every part of the map thins together. */
@@ -1110,26 +1143,43 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     return true;
   }
 
+  const _ramDir = new THREE.Vector3();
+  const _ramPoint = new THREE.Vector3();
+  const _ramBodies = [];
+  const RAM_REACH_SQ = 10 * 10;
+
   /** After world.step: a tank hull touching a standing palm knocks it over. */
   function checkRams(bodies) {
     if (!bodies?.length) return;
-    const handles = new Set();
-    for (const b of bodies) if (b) handles.add(b.handle);
-    if (!handles.size) return;
-    const dir = new THREE.Vector3();
-    const point = new THREE.Vector3();
+    _ramBodies.length = 0;
+    for (const b of bodies) if (b) _ramBodies.push(b);
+    if (!_ramBodies.length) return;
     for (const p of palms) {
       if (!p.visible || p.userData.fallen) continue;
       const col = p.userData.collider;
       if (!col) continue;
+      const px = p.position.x;
+      const pz = p.position.z;
+      let close = false;
+      for (const b of _ramBodies) {
+        const t = b.translation();
+        const dx = px - t.x;
+        const dz = pz - t.z;
+        if (dx * dx + dz * dz < RAM_REACH_SQ) { close = true; break; }
+      }
+      if (!close) continue;
       let rammer = null;
       world.contactPairsWith(col, (other) => {
         const ob = other.parent();
-        if (ob && handles.has(ob.handle)) rammer = ob;
+        if (!ob) return;
+        for (const b of _ramBodies) {
+          if (b.handle === ob.handle) rammer = ob;
+        }
       });
       if (!rammer) continue;
       const vel = rammer.linvel();
       const speed = Math.hypot(vel.x, vel.y, vel.z);
+      const dir = _ramDir;
       dir.set(vel.x, Math.max(0, vel.y * 0.2), vel.z);
       if (dir.lengthSq() < 0.35) {
         const t = rammer.translation();
@@ -1138,6 +1188,7 @@ export async function buildVegetation(scene, { RAPIER, world }) {
       if (dir.lengthSq() < 1e-6) continue;
       dir.normalize();
       const trunk = p.userData.trunk;
+      const point = _ramPoint;
       point.set(trunk.x, p.position.y + 1.25, trunk.z);
       knockPalm(p, dir, point, PALM_RAM_BASE + PALM_RAM_PER_SPEED * Math.max(speed, 1.2));
     }

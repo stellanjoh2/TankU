@@ -5,6 +5,9 @@ import { float, smoothstep, texture, uniform, uv, vec4 } from 'three/tsl';
 import { heightAt as terrainHeightAt } from './terrain.js';
 import { VISUAL_DEFAULTS } from './visualDefaults.js';
 import { decodeGif } from './gif.js';
+import {
+  createBillboard, createMeshPool, releaseSlot, stepBillboards, stepMeshPool, takeBillboard, takeMesh,
+} from './fxPools.js';
 
 /** Shared glow. Peak channel is this; a tint keeps its hue. */
 const SPRITE_EMISSIVE = 2.6;
@@ -384,6 +387,35 @@ export class Effects {
     this._muzzleX = new THREE.Vector3();
     this._muzzleY = new THREE.Vector3();
     this._muzzleZ = new THREE.Vector3();
+    this._camQ = new THREE.Quaternion();
+    this._shellStep = new THREE.Vector3();
+    this._shellDir = new THREE.Vector3();
+    this._hitPoint = new THREE.Vector3();
+    this._hitNormal = new THREE.Vector3();
+    this._puffTint = new THREE.Color(0.3, 0.27, 0.22);
+    this._shellHit = new THREE.Vector3();
+    this._boomPos = new THREE.Vector3();
+    this._boomN = new THREE.Vector3();
+    this._boomDir = new THREE.Vector3();
+    this._shellOrigin = { x: 0, y: 0, z: 0 };
+    this._shellDirN = { x: 1, y: 0, z: 0 };
+    this._shellRay = new this.RAPIER.Ray(this._shellOrigin, this._shellDirN);
+    this._mgRay = new this.RAPIER.Ray(this._mgRayOrigin, this._mgRayDir);
+    this._yAxis = new THREE.Vector3(0, 1, 0);
+
+    // One material per batch. Slots are reused for the whole match.
+    this._smokeBoard = createBillboard(scene, this.smokeTex, 320, { renderOrder: 1 });
+    this._flashBoard = createBillboard(scene, this.flashTex, 256, { emissive: true, renderOrder: 3 });
+    this._streakBoard = createBillboard(scene, this.streakTex, 160, { emissive: true, renderOrder: 3 });
+    this._burstBoards = this.burstTexs.map((tex) => createBillboard(scene, tex, 8, { emissive: true, renderOrder: 4 }));
+    this._glowBoard = null;
+    this._shellPool = createMeshPool(scene, this.shellGeo, this.shellMat, 16);
+    this._tracerPool = createMeshPool(scene, this.mgTracerGeo, this.mgTracerMat, 128);
+    this._brassPool = createMeshPool(scene, this.brassGeo, this.brassMat, 96);
+    this._debrisPool = createMeshPool(scene, this.debrisGeo, this.debrisMat, 48);
+    this._grassPool = createMeshPool(scene, this.grassBitGeo, this.grassBitMat, 48);
+    this.shells = [];
+    this.mgTracers = [];
   }
 
   async load() {
@@ -533,20 +565,54 @@ export class Effects {
     L.peak = peak;
   }
 
+  /** Soft puff. Additive flames share the flash billboard; smoke shares one material. */
   _sprite(tex, color, pos, size, life, opts = {}) {
-    const mat = opts.additive
-      ? emissiveSpriteMat(tex, color, { additive: true })
-      : new THREE.SpriteMaterial({
-        map: tex, color, transparent: true, depthWrite: false, fog: false,
-      });
-    const s = new THREE.Sprite(mat);
-    s.position.copy(pos);
-    s.scale.setScalar(size);
-    this.scene.add(s);
-    this.particles.push({
-      obj: s, life, age: 0, vel: opts.vel ?? new THREE.Vector3(), grow: opts.grow ?? 1,
-      size, fade: opts.fade ?? 1, drag: opts.drag ?? 1.5, rise: opts.rise ?? 0, opacity: opts.opacity ?? 1,
-    });
+    const additive = !!opts.additive;
+    const board = additive ? this._flashBoard : this._smokeBoard;
+    const s = takeBillboard(board);
+    s.mode = 'puff';
+    s.pos.copy(pos);
+    if (opts.vel) s.vel.copy(opts.vel);
+    s.life = life;
+    s.size = size;
+    s.grow = opts.grow ?? 1;
+    s.opacity = opts.opacity ?? 1;
+    s.drag = opts.drag ?? 1.5;
+    s.rise = opts.rise ?? 0;
+    s.fadeLinear = !!opts.fadeLinear;
+    s.scaleToZero = !!opts.scaleToZero;
+    if (additive) {
+      const peak = Math.max(color.r, color.g, color.b);
+      s.color.copy(color);
+      if (peak > 0) s.color.multiplyScalar(SPRITE_EMISSIVE / peak);
+    } else {
+      s.color.copy(color);
+    }
+  }
+
+  /**
+   * Hot spark on the flash or streak billboard. `from` / `to` are already emissive-scaled.
+   */
+  _spawnSpark(point, vel, size, life, from, to, { streak = false } = {}) {
+    const board = streak ? this._streakBoard : this._flashBoard;
+    const s = takeBillboard(board);
+    s.mode = 'spark';
+    s.pos.copy(point);
+    s.vel.copy(vel);
+    s.life = life;
+    s.size = size;
+    s.streak = streak;
+    s.pivotY = streak ? 0.9 : 0.5;
+    if (from) s.color.setRGB(from[0], from[1], from[2]);
+    else s.color.setRGB(SPRITE_EMISSIVE, SPRITE_EMISSIVE, SPRITE_EMISSIVE);
+    if (to) {
+      s.sparkTo.setRGB(to[0], to[1], to[2]);
+      s.hasSparkTo = true;
+    } else {
+      const k = SPRITE_EMISSIVE / 10;
+      s.sparkTo.setRGB(8 * k, 0.55 * k, 0.06 * k);
+      s.hasSparkTo = true;
+    }
   }
 
   /**
@@ -628,7 +694,7 @@ export class Effects {
     const d = this._mgRayDir;
     o.x = pos.x; o.y = pos.y; o.z = pos.z;
     d.x = dir.x; d.y = dir.y; d.z = dir.z;
-    const ray = new R.Ray(o, d);
+    const ray = this._mgRay;
     const hit = this.world.castRayAndGetNormal(ray, 450, true, undefined, undefined, undefined, owner);
     if (!hit) return null;
     const point = pos.clone().addScaledVector(dir, hit.timeOfImpact);
@@ -742,21 +808,17 @@ export class Effects {
     const ramp = emissiveRamp([2.2, 1.3, 0.45], [0.4, 0.22, 0.08]);
     for (let i = 0; i < gritN; i++) {
       const size = (0.08 + Math.random() * 0.1) * 1.5;
-      const mat = emissiveSpriteMat(this.flashTex, new THREE.Color(...ramp.from), { additive: true });
-      const spark = new THREE.Sprite(mat);
-      spark.scale.setScalar(size);
-      spark.position.copy(point).add(new THREE.Vector3((Math.random() - 0.5) * 0.15, 0.04, (Math.random() - 0.5) * 0.15));
-      this.scene.add(spark);
-      this.particles.push({
-        obj: spark,
-        life: 0.2 + Math.random() * 0.25,
-        age: 0,
-        vel: new THREE.Vector3((Math.random() - 0.5) * 3, 7 + Math.random() * 8, (Math.random() - 0.5) * 3),
+      this._hitPoint.copy(point).add(this._shellStep.set(
+        (Math.random() - 0.5) * 0.15, 0.04, (Math.random() - 0.5) * 0.15,
+      ));
+      this._spawnSpark(
+        this._hitPoint,
+        this._shellDir.set((Math.random() - 0.5) * 3, 7 + Math.random() * 8, (Math.random() - 0.5) * 3),
         size,
-        spark: true,
-        sparkFrom: ramp.from,
-        sparkTo: ramp.to,
-      });
+        0.2 + Math.random() * 0.25,
+        ramp.from,
+        ramp.to,
+      );
     }
   }
 
@@ -769,20 +831,18 @@ export class Effects {
 
   /** Visual .50 tracer. Damage stays on the hitscan; this is the streak you can see. */
   _spawnMgTracer(pos, dir, maxDist) {
-    const d = dir.clone().normalize();
+    const d = this._shellDir.copy(dir);
     if (d.lengthSq() < 1e-8) return;
-    const origin = pos.clone().addScaledVector(d, MG_TRACER_CLEAR);
-    const mesh = new THREE.Mesh(this.mgTracerGeo, this.mgTracerMat);
-    this._placeTracer(mesh, origin, d, MG_TRACER_GEO_LEN, MG_TRACER_GEO_LEN);
-    this.scene.add(mesh);
-    const reach = maxDist == null ? 450 : Math.max(0.15, maxDist - MG_TRACER_CLEAR);
-    this.mgTracers.push({
-      mesh,
-      pos: origin,
-      dir: d,
-      traveled: 0,
-      maxDist: reach,
-    });
+    d.normalize();
+    const s = takeMesh(this._tracerPool);
+    const listed = this.mgTracers.indexOf(s);
+    if (listed >= 0) this.mgTracers.splice(listed, 1);
+    s.pos.copy(pos).addScaledVector(d, MG_TRACER_CLEAR);
+    s.dir.copy(d);
+    s.traveled = 0;
+    s.maxDist = maxDist == null ? 450 : Math.max(0.15, maxDist - MG_TRACER_CLEAR);
+    this._placeTracer(s.mesh, s.pos, s.dir, MG_TRACER_GEO_LEN, MG_TRACER_GEO_LEN);
+    this.mgTracers.push(s);
   }
 
   /** Impact sparks — white-hot on metal, fewer brown flecks on dirt. */
@@ -809,60 +869,39 @@ export class Effects {
       : emissiveRamp([20, 13, 5], [10, 1.8, 0.2]);
     for (let i = 0; i < n; i++) {
       const size = dirt ? 0.14 + Math.random() * 0.2 : 0.0675 + Math.random() * 0.105;
-      const mat = emissiveSpriteMat(
-        dirt ? this.flashTex : this.streakTex,
-        new THREE.Color(...ramp.from),
-        { additive: true },
-      );
-      const spark = new THREE.Sprite(mat);
-      spark.scale.setScalar(size);
       // Pivot near the hot head so the tail trails behind the direction of travel.
-      if (!dirt) spark.center.set(0.5, 0.9);
-      spark.position.copy(point).addScaledVector(normal, 0.04 + Math.random() * 0.08);
-      this.scene.add(spark);
+      this._hitPoint.copy(point).addScaledVector(normal, 0.04 + Math.random() * 0.08);
       const along = dirt ? 5 + Math.random() * 9 : 10 + Math.random() * 18;
       const spray = dirt ? 4 + Math.random() * 7 : 8 + Math.random() * 14;
-      const v = bounce.clone().multiplyScalar(along * (0.55 + Math.random() * 0.45))
+      const v = this._shellDir.copy(bounce).multiplyScalar(along * (0.55 + Math.random() * 0.45))
         .addScaledVector(normal, (dirt ? 1 : 2) + Math.random() * (dirt ? 4 : 7))
-        .add(new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.15, Math.random() - 0.5).multiplyScalar(spray));
-      this.particles.push({
-        obj: spark,
-        life: (dirt ? 0.22 : 0.28) + Math.random() * (dirt ? 0.35 : 0.45),
-        age: 0,
-        vel: v,
-        size,
-        spark: true,
-        streak: !dirt,
-        sparkFrom: ramp.from,
-        sparkTo: ramp.to,
-      });
+        .add(this._shellStep.set(Math.random() - 0.5, Math.random() - 0.15, Math.random() - 0.5).multiplyScalar(spray));
+      this._spawnSpark(
+        this._hitPoint, v, size,
+        (dirt ? 0.22 : 0.28) + Math.random() * (dirt ? 0.35 : 0.45),
+        ramp.from, ramp.to,
+        { streak: !dirt },
+      );
     }
   }
 
   /** Brief spray-shaped flash at a metal hit, fanned along the on-screen ricochet direction. */
   _mgSparkBurst(point, normal, bounce) {
-    const tex = this.burstTexs[Math.floor(Math.random() * this.burstTexs.length)];
-    const mat = emissiveSpriteMat(tex, new THREE.Color(12, 7, 2.2), { additive: true });
+    const i = Math.floor(Math.random() * this._burstBoards.length);
+    const s = takeBillboard(this._burstBoards[i]);
+    s.mode = 'burst';
+    s.pivotX = BURST_ORIGIN_U;
     let ang = Math.random() * Math.PI * 2;
     if (this.camera) {
-      const v = this._streakV.copy(bounce)
-        .applyQuaternion(this.camera.getWorldQuaternion(this._camQInv).invert());
+      const v = this._streakV.copy(bounce).applyQuaternion(this._camQInv);
       if (Math.hypot(v.x, v.y) > 0.15) ang = Math.atan2(v.y, v.x);
     }
-    mat.rotation = ang + (Math.random() - 0.5) * 0.3;
-    const burst = new THREE.Sprite(mat);
-    burst.center.set(BURST_ORIGIN_U, 0.5);
-    burst.position.copy(point).addScaledVector(normal, 0.06);
-    const size = 1.1 + Math.random() * 0.5;
-    burst.scale.set(size, size * 0.5, 1);
-    this.scene.add(burst);
-    this.particles.push({
-      obj: burst,
-      life: 0.09 + Math.random() * 0.05,
-      age: 0,
-      size,
-      burst: true,
-    });
+    s.rot = ang + (Math.random() - 0.5) * 0.3;
+    s.pos.copy(point).addScaledVector(normal, 0.06);
+    s.size = 1.1 + Math.random() * 0.5;
+    s.life = 0.09 + Math.random() * 0.05;
+    const peak = Math.max(12, 7, 2.2);
+    s.color.setRGB(12, 7, 2.2).multiplyScalar(SPRITE_EMISSIVE / peak);
   }
 
   _triggerMgShot(stream) {
@@ -895,31 +934,27 @@ export class Effects {
   _ejectMgBrass(pos, dir) {
     const right = gunRight(dir, this._brassRight);
     const up = this._brassUp.set(0, 1, 0);
-    const origin = pos.clone()
+    const origin = this._hitPoint.copy(pos)
       .addScaledVector(dir, -MG_FLASH.brassBack)
       .addScaledVector(right, MG_FLASH.brassSide)
       .addScaledVector(up, -0.04);
-    const vel = right.clone().multiplyScalar(MG_FLASH.brassSpeed + Math.random() * 2.5)
+    const vel = this._shellDir.copy(right).multiplyScalar(MG_FLASH.brassSpeed + Math.random() * 2.5)
       .addScaledVector(up, MG_FLASH.brassUp + Math.random() * 2.2)
       .addScaledVector(dir, -1.2 + Math.random() * 2.4);
-    const mesh = new THREE.Mesh(this.brassGeo, this.brassMat);
-    mesh.position.copy(origin);
-    mesh.castShadow = true;
+    const s = takeMesh(this._brassPool);
+    s.brass = true;
+    s.life = MG_FLASH.brassLife + Math.random() * 0.8;
+    s.vel.copy(vel);
+    s.spin.set(
+      (Math.random() - 0.5) * 36,
+      (Math.random() - 0.5) * 48,
+      (Math.random() - 0.5) * 36,
+    );
+    s.mesh.position.copy(origin);
     // Start roughly aligned with eject arc so the silhouette reads as a casing.
-    mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), vel.clone().normalize());
-    this.scene.add(mesh);
-    this.particles.push({
-      obj: mesh,
-      life: MG_FLASH.brassLife + Math.random() * 0.8,
-      age: 0,
-      vel,
-      brass: true,
-      spin: new THREE.Vector3(
-        (Math.random() - 0.5) * 36,
-        (Math.random() - 0.5) * 48,
-        (Math.random() - 0.5) * 36,
-      ),
-    });
+    this._hitNormal.copy(vel).normalize();
+    s.mesh.quaternion.setFromUnitVectors(this._yAxis, this._hitNormal);
+    s.mesh.rotation.setFromQuaternion(s.mesh.quaternion);
   }
 
   /** Small grey puffs out of the .50 cal muzzle each round. */
@@ -983,54 +1018,107 @@ export class Effects {
     mesh.quaternion.setFromRotationMatrix(this._mgMat);
   }
 
+  /** Built once per atlas. Later shots reuse the canvas and the node material. */
+  _ensureCardPool(key, atlasImg, { cols, rows, frames, fps, blast = false }) {
+    if (!this._cardPools) this._cardPools = new Map();
+    let pool = this._cardPools.get(key);
+    if (pool) return pool;
+    const cellW = Math.floor(atlasImg.width / cols);
+    const cellH = Math.floor(atlasImg.height / rows);
+    const n = blast ? 4 : 4;
+    const slots = [];
+    for (let i = 0; i < n; i++) {
+      const canvas = document.createElement('canvas');
+      canvas.width = cellW;
+      canvas.height = cellH;
+      const ctx = canvas.getContext('2d', { alpha: true });
+      const map = new THREE.CanvasTexture(canvas);
+      map.colorSpace = THREE.SRGBColorSpace;
+      map.magFilter = THREE.LinearFilter;
+      map.minFilter = THREE.LinearFilter;
+      map.generateMipmaps = false;
+      map.wrapS = map.wrapT = THREE.ClampToEdgeWrapping;
+      const flipbook = {
+        map, ctx, cellW, cellH, atlasImg,
+        cols, rows, frames, fps, frame: -1, height: 0,
+      };
+      let obj;
+      if (blast) {
+        const sample = texture(map);
+        const mat = new THREE.SpriteNodeMaterial({
+          transparent: true, depthWrite: false, opacity: 1, fog: false,
+        });
+        mat.colorNode = vec4(0, 0, 0, sample.a);
+        mat.emissiveNode = sample.rgb.mul(uniform(toEmissiveLevel(new THREE.Color(1.35, 1.2, 0.95))));
+        mat.blending = THREE.CustomBlending;
+        mat.blendEquation = THREE.AddEquation;
+        mat.blendSrc = THREE.SrcAlphaFactor;
+        mat.blendDst = THREE.OneMinusSrcAlphaFactor;
+        mat.blendEquationAlpha = THREE.AddEquation;
+        mat.blendSrcAlpha = THREE.ZeroFactor;
+        mat.blendDstAlpha = THREE.OneFactor;
+        obj = new THREE.Sprite(mat);
+      } else {
+        const hdr = new THREE.Color(MAIN_MUZZLE.emissive, MAIN_MUZZLE.emissive, MAIN_MUZZLE.emissive);
+        obj = new THREE.Mesh(this.muzzleCardGeo, emissiveCardMat(map, hdr));
+        obj.renderOrder = 3;
+      }
+      obj.frustumCulled = false;
+      obj.visible = false;
+      this.scene.add(obj);
+      slots.push({
+        obj, flipbook, pool: null, idle: true, age: 0,
+        life: frames / fps, muzzleDir: null,
+      });
+    }
+    pool = { free: slots.slice(), slots };
+    for (const s of slots) s.pool = pool;
+    this._cardPools.set(key, pool);
+    return pool;
+  }
+
+  _takeCard(pool) {
+    let s = pool.free.pop();
+    if (!s) {
+      s = pool.slots[0];
+      for (const c of pool.slots) if (c.age > s.age) s = c;
+      const idx = this.particles.indexOf(s);
+      if (idx >= 0) this.particles.splice(idx, 1);
+    }
+    s.idle = false;
+    s.age = 0;
+    s.muzzleDir = null;
+    s.flipbook.frame = -1;
+    s.obj.visible = true;
+    s.obj.material.opacity = 1;
+    this.particles.push(s);
+    return s;
+  }
+
   /** One 4-frame strip. `side` lies along the barrel; the front card faces down it. */
   _spawnMainMuzzle(atlas, pos, dir, side, scale = 1) {
     const atlasImg = atlas?.image;
     if (!atlasImg) return;
     const cfg = MAIN_MUZZLE;
-    const cellW = Math.floor(atlasImg.width / cfg.cols);
-    const cellH = Math.floor(atlasImg.height / cfg.rows);
-    const canvas = document.createElement('canvas');
-    canvas.width = cellW;
-    canvas.height = cellH;
-    const ctx = canvas.getContext('2d', { alpha: true });
-    const map = new THREE.CanvasTexture(canvas);
-    map.colorSpace = THREE.SRGBColorSpace;
-    map.magFilter = THREE.LinearFilter;
-    map.minFilter = THREE.LinearFilter;
-    map.generateMipmaps = false;
-    map.wrapS = map.wrapT = THREE.ClampToEdgeWrapping;
-
-    const flipbook = {
-      map, ctx, cellW, cellH, atlasImg,
-      cols: cfg.cols, rows: cfg.rows, frames: cfg.frames, fps: cfg.fps,
-      frame: -1,
-    };
-    blitFlipbookFrame(flipbook, 0);
-
-    const hdr = new THREE.Color(cfg.emissive, cfg.emissive, cfg.emissive);
+    const key = side ? 'muzzle-side' : 'muzzle-front';
+    const pool = this._ensureCardPool(key, atlasImg, cfg);
+    const card = this._takeCard(pool);
+    const { cellW, cellH } = card.flipbook;
     const h = cfg.height * scale;
     const w = h * (cellW / cellH);
-    const mat = emissiveCardMat(map, hdr);
-    const obj = new THREE.Mesh(this.muzzleCardGeo, mat);
+    const obj = card.obj;
     obj.scale.set(w, h, 1);
     if (side) {
       // Fat end of the blast sits on the muzzle; the point leads downrange.
       obj.position.copy(pos).addScaledVector(dir, w * 0.35);
       this._aimMuzzleSide(obj, dir);
+      if (!card._dir) card._dir = new THREE.Vector3();
+      card.muzzleDir = card._dir.copy(dir);
     } else {
       obj.position.copy(pos).addScaledVector(dir, 0.2);
       this._aimMuzzleFront(obj, dir);
     }
-    obj.frustumCulled = false;
-    obj.renderOrder = 3;
-    this.scene.add(obj);
-    this.particles.push({
-      obj, life: cfg.frames / cfg.fps, age: 0, vel: new THREE.Vector3(),
-      grow: 1, size: w, fade: 1, drag: 0, rise: 0, opacity: 1,
-      flipbook,
-      muzzleDir: side ? dir.clone() : null,
-    });
+    blitFlipbookFrame(card.flipbook, 0);
   }
 
   muzzleFlash(pos, dir) {
@@ -1044,19 +1132,24 @@ export class Effects {
 
   /** `owner` is the firing tank's rigid body (its own hull is ignored by the shell). */
   fire({ pos, vel, owner = this.exclude }) {
-    const mesh = new THREE.Mesh(this.shellGeo, this.shellMat);
-    const dir = vel.clone();
+    const s = takeMesh(this._shellPool);
+    const listed = this.shells.indexOf(s);
+    if (listed >= 0) this.shells.splice(listed, 1);
+    s.pos.copy(pos);
+    s.vel.copy(vel);
+    s.owner = owner;
+    s.age = 0;
+    const dir = this._shellDir.copy(vel);
     if (dir.lengthSq() > 1e-8) dir.normalize();
     else dir.set(1, 0, 0);
-    this._placeTracer(mesh, pos, dir, SHELL_GEO_LEN, SHELL_GEO_LEN);
-    this.scene.add(mesh);
-    this.shells.push({ mesh, pos: pos.clone(), vel: vel.clone(), age: 0, owner });
+    this._placeTracer(s.mesh, s.pos, dir, SHELL_GEO_LEN, SHELL_GEO_LEN);
+    this.shells.push(s);
   }
 
   clearShells() {
-    for (const s of this.shells) this.scene.remove(s.mesh);
+    for (const s of this.shells) releaseSlot(this._shellPool, s);
     this.shells.length = 0;
-    for (const t of this.mgTracers) this.scene.remove(t.mesh);
+    for (const t of this.mgTracers) releaseSlot(this._tracerPool, t);
     this.mgTracers.length = 0;
   }
 
@@ -1219,24 +1312,18 @@ export class Effects {
     const mats = [this.grassBitMat, this.grassBitMatB, this.grassBitMatC];
     for (let i = 0; i < n; i++) {
       const mat = mats[(Math.random() * mats.length) | 0];
-      const m = new THREE.Mesh(this.grassBitGeo, mat);
-      m.position.copy(pos).addScaledVector(out, (Math.random() - 0.5) * 0.25);
-      m.position.y += 0.06;
-      m.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
-      const s = (0.65 + Math.random() * 0.7) * 1.5;
-      m.scale.set(s * (0.7 + Math.random() * 0.5), s, 1);
-      this.scene.add(m);
-      const v = back.clone().multiplyScalar(2.2 + Math.random() * 4.5)
-        .addScaledVector(out, 0.6 + Math.random() * 2.8)
-        .add(new THREE.Vector3(0, 2.2 + Math.random() * 3.5, 0));
-      this.particles.push({
-        obj: m,
-        life: 1.0 + Math.random() * 0.9,
-        age: 0,
-        vel: v,
-        debris: true,
-        spin: new THREE.Vector3().randomDirection().multiplyScalar(10 + Math.random() * 14),
-      });
+      const bit = takeMesh(this._grassPool);
+      bit.mesh.material = mat;
+      bit.life = 1.0 + Math.random() * 0.9;
+      bit.mesh.position.copy(pos).addScaledVector(out, (Math.random() - 0.5) * 0.25);
+      bit.mesh.position.y += 0.06;
+      bit.mesh.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+      const sc = (0.65 + Math.random() * 0.7) * 1.5;
+      bit.mesh.scale.set(sc * (0.7 + Math.random() * 0.5), sc, 1);
+      bit.vel.copy(back).multiplyScalar(2.2 + Math.random() * 4.5)
+        .addScaledVector(out, 0.6 + Math.random() * 2.8);
+      bit.vel.y += 2.2 + Math.random() * 3.5;
+      bit.spin.randomDirection().multiplyScalar(10 + Math.random() * 14);
     }
   }
 
@@ -1341,13 +1428,12 @@ export class Effects {
     }
     for (let i = emit(4); i > 0; i--) {
       const size = 0.1 + Math.random() * 0.14;
-      const mat = emissiveSpriteMat(this.flashTex, new THREE.Color(10, 10, 10), { additive: true });
-      const spark = new THREE.Sprite(mat);
-      spark.scale.setScalar(size);
-      spark.position.copy(jitter(0.8));
-      this.scene.add(spark);
-      const v = new THREE.Vector3((Math.random() - 0.5) * 4, 3 + Math.random() * 4, (Math.random() - 0.5) * 4);
-      this.particles.push({ obj: spark, life: 0.7 + Math.random() * 0.8, age: 0, vel: v, size, spark: true });
+      this._spawnSpark(
+        jitter(0.8),
+        this._shellDir.set((Math.random() - 0.5) * 4, 3 + Math.random() * 4, (Math.random() - 0.5) * 4),
+        size,
+        0.7 + Math.random() * 0.8,
+      );
     }
   }
 
@@ -1419,67 +1505,29 @@ export class Effects {
     const cfg = GROUND_EXPLOSION;
     const atlas = this.groundExplosionAtlas;
     if (!atlas?.image) return;
-
-    const atlasImg = atlas.image;
-    const cellW = Math.floor(atlasImg.width / cfg.cols);
-    const cellH = Math.floor(atlasImg.height / cfg.rows);
-    const canvas = document.createElement('canvas');
-    canvas.width = cellW;
-    canvas.height = cellH;
-    const ctx = canvas.getContext('2d', { alpha: true });
-    const map = new THREE.CanvasTexture(canvas);
-    map.colorSpace = THREE.SRGBColorSpace;
-    map.magFilter = THREE.LinearFilter;
-    map.minFilter = THREE.LinearFilter;
-    map.generateMipmaps = false;
-
-    const flipbook = {
-      map, ctx, cellW, cellH, atlasImg,
-      cols: cfg.cols, rows: cfg.rows, frames: cfg.frameCount, fps: cfg.fps,
-      frame: -1, height: 0,
-    };
-    blitFlipbookFrame(flipbook, 0);
-
-    // Atlas stores the fire in RGB and the coverage in alpha. Straight alpha shows
-    // that pair; screen was remixing it into the wrong channel. Don't write the
-    // card's alpha into the target or the quad stamps a white square.
-    const sample = texture(map);
-    const mat = new THREE.SpriteNodeMaterial({
-      transparent: true,
-      depthWrite: false,
-      opacity: 1,
-      fog: false,
+    const pool = this._ensureCardPool('blast', atlas.image, {
+      cols: cfg.cols, rows: cfg.rows, frames: cfg.frameCount, fps: cfg.fps, blast: true,
     });
-    mat.colorNode = vec4(0, 0, 0, sample.a);
-    mat.emissiveNode = sample.rgb.mul(uniform(toEmissiveLevel(new THREE.Color(1.35, 1.2, 0.95))));
-    mat.blending = THREE.CustomBlending;
-    mat.blendEquation = THREE.AddEquation;
-    mat.blendSrc = THREE.SrcAlphaFactor;
-    mat.blendDst = THREE.OneMinusSrcAlphaFactor;
-    mat.blendEquationAlpha = THREE.AddEquation;
-    mat.blendSrcAlpha = THREE.ZeroFactor;
-    mat.blendDstAlpha = THREE.OneFactor;
-    const s = new THREE.Sprite(mat);
+    const card = this._takeCard(pool);
     const w = cfg.width;
     const h = w / cfg.aspect;
-    flipbook.height = h;
-    s.scale.set(w, h, 1);
+    card.flipbook.height = h;
+    card.obj.scale.set(w, h, 1);
     // Atlas cells are bottom-aligned; sprites are centered — lift so contact sits on the ground.
-    s.position.set(point.x, point.y + h * 0.5, point.z);
-    this.scene.add(s);
-    const life = cfg.frameCount / cfg.fps;
-    this.particles.push({
-      obj: s, life, age: 0, vel: new THREE.Vector3(), grow: 1, size: w, fade: 1, drag: 0, rise: 0, opacity: 1,
-      flipbook,
-    });
+    card.obj.position.set(point.x, point.y + h * 0.5, point.z);
+    blitFlipbookFrame(card.flipbook, 0);
   }
 
   _explode(point, normal, dir, collider, { emissive = true, muzzle = false } = {}) {
+    // Copy off the caller's scratches. Spawns below reuse those vectors.
+    point = this._boomPos.copy(point);
+    normal = this._boomN.copy(normal);
+    dir = this._boomDir.copy(dir);
     // Test: ground-explosion flipbook as the main impact read (kept large).
     this._groundExplosion(point);
     // Main-gun hits reuse the turret firing cards. Plume points out of the surface.
     if (muzzle) {
-      const out = normal.clone();
+      const out = this._hitNormal.copy(normal);
       if (out.lengthSq() < 1e-8) out.copy(dir).negate();
       else out.normalize();
       this._spawnMainMuzzle(this.mainMuzzleFront, point, out, false, 2);
@@ -1487,61 +1535,50 @@ export class Effects {
     }
     // Quick emissive glow-ball flash (placeholder texture, additive, fades over glowLife).
     if (emissive && this.impactGlowTex) {
-      const glowSize = GROUND_EXPLOSION.glowSize;
-      const mat = emissiveSpriteMat(this.impactGlowTex, new THREE.Color(21, 10.5, 2.4), {
-        additive: true, depthTest: false,
-      });
-      const glow = new THREE.Sprite(mat);
-      glow.renderOrder = 5;
-      glow.scale.setScalar(glowSize);
-      glow.position.copy(point).addScaledVector(normal, 2.5);
-      this.scene.add(glow);
-      this.particles.push({
-        obj: glow,
-        life: GROUND_EXPLOSION.glowLife,
-        age: 0,
-        vel: new THREE.Vector3(),
-        grow: 0, // scale: size → 0 over life
-        size: glowSize,
-        fade: 1,
-        drag: 0,
-        rise: 0,
-        opacity: 1,
-        fadeLinear: true,
-        scaleToZero: true,
-      });
+      if (!this._glowBoard) {
+        this._glowBoard = createBillboard(this.scene, this.impactGlowTex, 8, {
+          emissive: true, renderOrder: 5, depthTest: false,
+        });
+      }
+      const glow = takeBillboard(this._glowBoard);
+      glow.mode = 'puff';
+      glow.scaleToZero = true;
+      glow.fadeLinear = true;
+      glow.drag = 0;
+      glow.rise = 0;
+      glow.grow = 0;
+      glow.opacity = 1;
+      glow.size = GROUND_EXPLOSION.glowSize;
+      glow.life = GROUND_EXPLOSION.glowLife;
+      glow.pos.copy(point).addScaledVector(normal, 2.5);
+      const peak = Math.max(21, 10.5, 2.4);
+      glow.color.setRGB(21, 10.5, 2.4).multiplyScalar(SPRITE_EMISSIVE / peak);
     }
-    this._flashLight(point.clone().addScaledVector(normal, 1.5), 220);
+    this._flashLight(this._hitPoint.copy(point).addScaledVector(normal, 1.5), 220);
 
     // Emissive sparks: fly out from center, bounce, white → red as they die.
     for (let i = 0; emissive && i < 30; i++) {
       const size = (0.45 + Math.random() * 0.55) * 0.25;
-      const mat = emissiveSpriteMat(this.flashTex, new THREE.Color(10, 10, 10), { additive: true });
-      const spark = new THREE.Sprite(mat);
-      spark.scale.setScalar(size);
-      spark.position.copy(point).addScaledVector(normal, 0.5 + Math.random() * 0.4);
-      this.scene.add(spark);
-      const v = normal.clone().multiplyScalar(6 + Math.random() * 10)
-        .add(new THREE.Vector3(Math.random() - 0.5, Math.random() * 0.35, Math.random() - 0.5).multiplyScalar(14));
-      this.particles.push({
-        obj: spark, life: 1.1 + Math.random() * 0.9, age: 0, vel: v, size, spark: true,
-      });
+      this._hitPoint.copy(point).addScaledVector(normal, 0.5 + Math.random() * 0.4);
+      const v = this._shellDir.copy(normal).multiplyScalar(6 + Math.random() * 10)
+        .add(this._shellStep.set(Math.random() - 0.5, Math.random() * 0.35, Math.random() - 0.5).multiplyScalar(14));
+      this._spawnSpark(this._hitPoint, v, size, 1.1 + Math.random() * 0.9);
     }
 
     for (let i = 0; i < 3; i++) {
-      const v = normal.clone().multiplyScalar(1.5 + Math.random() * 3)
-        .add(new THREE.Vector3(Math.random() - 0.5, Math.random(), Math.random() - 0.5).multiplyScalar(3));
-      this._sprite(this.smokeTex, new THREE.Color(0.3, 0.27, 0.22), point.clone(), 0.6, 2.5 + Math.random() * 1.5,
+      const v = this._shellDir.copy(normal).multiplyScalar(1.5 + Math.random() * 3)
+        .add(this._shellStep.set(Math.random() - 0.5, Math.random(), Math.random() - 0.5).multiplyScalar(3));
+      this._sprite(this.smokeTex, this._puffTint, point, 0.6, 2.5 + Math.random() * 1.5,
         { vel: v, grow: 3.5, rise: 0.7, opacity: 0.45, drag: 1.8 });
     }
     for (let i = 0; i < 10; i++) {
-      const m = new THREE.Mesh(this.debrisGeo, this.debrisMat);
-      m.position.copy(point).addScaledVector(normal, 0.2);
-      m.castShadow = true;
-      this.scene.add(m);
-      const v = normal.clone().multiplyScalar(5 + Math.random() * 8)
-        .add(new THREE.Vector3(Math.random() - 0.5, Math.random() * 0.5, Math.random() - 0.5).multiplyScalar(9));
-      this.particles.push({ obj: m, life: 2.5, age: 0, vel: v, debris: true, spin: new THREE.Vector3().randomDirection().multiplyScalar(12) });
+      const chunk = takeMesh(this._debrisPool);
+      chunk.life = 2.5;
+      chunk.mesh.position.copy(point).addScaledVector(normal, 0.2);
+      chunk.mesh.rotation.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
+      chunk.vel.copy(normal).multiplyScalar(5 + Math.random() * 8)
+        .add(this._shellStep.set(Math.random() - 0.5, Math.random() * 0.5, Math.random() - 0.5).multiplyScalar(9));
+      chunk.spin.randomDirection().multiplyScalar(12);
     }
 
     const body = collider?.parent();
@@ -1557,24 +1594,32 @@ export class Effects {
   }
 
   update(dt, heightAt) {
-    const R = this.RAPIER;
     this._tickDamageFire(dt);
-    if (this.camera) this.camera.getWorldQuaternion(this._camQInv).invert();
+    if (this.camera) {
+      this.camera.getWorldQuaternion(this._camQ);
+      this._camQInv.copy(this._camQ).invert();
+    }
     for (let i = this.shells.length - 1; i >= 0; i--) {
       const s = this.shells[i];
       s.age += dt;
-      const step = s.vel.clone().multiplyScalar(dt);
+      const step = this._shellStep.copy(s.vel).multiplyScalar(dt);
       const len = step.length();
-      const dir = step.clone().divideScalar(len);
-      const ray = new R.Ray(s.pos, dir);
-      const hit = this.world.castRayAndGetNormal(ray, len, true, undefined, undefined, undefined, s.owner);
+      const dir = this._shellDir.copy(step);
+      if (len > 1e-8) dir.divideScalar(len);
+      else dir.set(0, -1, 0);
+      const o = this._shellOrigin;
+      const d = this._shellDirN;
+      o.x = s.pos.x; o.y = s.pos.y; o.z = s.pos.z;
+      d.x = dir.x; d.y = dir.y; d.z = dir.z;
+      const hit = this.world.castRayAndGetNormal(this._shellRay, len, true, undefined, undefined, undefined, s.owner);
       if (hit || s.age > 6) {
         if (hit) {
-          const p = s.pos.clone().addScaledVector(dir, hit.timeOfImpact);
-          this.onShellHit({ point: p, collider: hit.collider, owner: s.owner, dir });
-          this._explode(p, new THREE.Vector3(hit.normal.x, hit.normal.y, hit.normal.z), dir, hit.collider, { muzzle: true });
+          this._shellHit.copy(s.pos).addScaledVector(dir, hit.timeOfImpact);
+          this._boomN.set(hit.normal.x, hit.normal.y, hit.normal.z);
+          this.onShellHit({ point: this._shellHit, collider: hit.collider, owner: s.owner, dir });
+          this._explode(this._shellHit, this._boomN, dir, hit.collider, { muzzle: true });
         }
-        this.scene.remove(s.mesh);
+        releaseSlot(this._shellPool, s);
         this.shells.splice(i, 1);
         continue;
       }
@@ -1615,7 +1660,7 @@ export class Effects {
       t.traveled += step;
       t.pos.addScaledVector(t.dir, step);
       if (done) {
-        this.scene.remove(t.mesh);
+        releaseSlot(this._tracerPool, t);
         this.mgTracers.splice(i, 1);
         continue;
       }
@@ -1629,94 +1674,26 @@ export class Effects {
       p.age += dt;
       const k = p.age / p.life;
       if (k >= 1) {
-        this.scene.remove(p.obj);
-        if (
-          p.obj.material !== this.debrisMat
-          && p.obj.material !== this.brassMat
-          && p.obj.material !== this.grassBitMat
-          && p.obj.material !== this.grassBitMatB
-          && p.obj.material !== this.grassBitMatC
-        ) {
-          // Flipbook uses a per-burst CanvasTexture — dispose it. Shared atlas stays alive.
-          if (p.flipbook) p.flipbook.map.dispose();
-          p.obj.material.dispose();
-        }
+        p.obj.visible = false;
+        p.pool?.free.push(p);
         this.particles.splice(i, 1);
         continue;
       }
-      if (p.debris || p.brass) {
-        p.vel.y -= GRAVITY * dt;
-        p.obj.position.addScaledVector(p.vel, dt);
-        const groundPad = p.brass ? 0.05 : 0.07;
-        const g = heightAt(p.obj.position.x, p.obj.position.z) + groundPad;
-        if (p.obj.position.y < g) {
-          p.obj.position.y = g;
-          p.vel.multiplyScalar(p.brass ? 0.35 : 0.4);
-          p.vel.y = Math.abs(p.vel.y) * (p.brass ? 0.25 : 0.3);
-          if (p.brass) p.spin.multiplyScalar(0.55);
-        }
-        p.obj.rotation.x += p.spin.x * dt;
-        p.obj.rotation.y += p.spin.y * dt;
-        if (p.brass) p.obj.rotation.z += p.spin.z * dt;
-        continue;
-      }
-      if (p.spark) {
-        p.vel.y -= GRAVITY * dt;
-        p.obj.position.addScaledVector(p.vel, dt);
-        const g = heightAt(p.obj.position.x, p.obj.position.z) + 0.04;
-        if (p.obj.position.y < g) {
-          p.obj.position.y = g;
-          p.vel.x *= 0.55;
-          p.vel.z *= 0.55;
-          p.vel.y = Math.abs(p.vel.y) * 0.5;
-        }
-        // Metal: white → red. Dirt: brown → dark earth. Stay emissive either way.
-        const from = p.sparkFrom ?? [SPRITE_EMISSIVE, SPRITE_EMISSIVE, SPRITE_EMISSIVE];
-        const to = p.sparkTo ?? [8, 0.55, 0.06].map((v) => v * (SPRITE_EMISSIVE / 10));
-        const r = THREE.MathUtils.lerp(from[0], to[0], k);
-        const gC = THREE.MathUtils.lerp(from[1], to[1], k);
-        const b = THREE.MathUtils.lerp(from[2], to[2], k);
-        const em = p.obj.material.userData.emissiveUniform;
-        if (em) em.value.setRGB(r, gC, b);
-        else p.obj.material.color.setRGB(r, gC, b);
-        p.obj.material.opacity = (1 - k) * (1 - k);
-        const w = p.size * (1 - k * 0.65);
-        if (p.streak && this.camera) {
-          // Velocity in camera space: x/y give the on-screen direction and the speed across the view.
-          const v = this._streakV.copy(p.vel).applyQuaternion(this._camQInv);
-          const across = Math.hypot(v.x, v.y);
-          p.obj.material.rotation = Math.atan2(v.y, v.x) - Math.PI / 2;
-          p.obj.scale.set(w, w * 2.5 + across * 0.044, 1);
-        } else {
-          p.obj.scale.setScalar(w);
-        }
-        continue;
-      }
-      if (p.burst) {
-        const s = p.size * (1 + 0.6 * Math.sqrt(k));
-        p.obj.scale.set(s, s * 0.5, 1);
-        p.obj.material.opacity = 1 - k * k;
-        continue;
-      }
-      if (p.flipbook) {
-        const fb = p.flipbook;
-        const frame = Math.min(fb.frames - 1, Math.floor(p.age * fb.fps));
-        blitFlipbookFrame(fb, frame);
-        if (p.muzzleDir) this._aimMuzzleSide(p.obj, p.muzzleDir);
-        // Soft fade on the last ~15% so the last sparse frames don't hard-cut.
-        p.obj.material.opacity = k > 0.85 ? (1 - (k - 0.85) / 0.15) : 1;
-        continue;
-      }
-      p.vel.multiplyScalar(Math.exp(-p.drag * dt));
-      p.vel.y += p.rise * dt;
-      p.obj.position.addScaledVector(p.vel, dt);
-      const scale = p.scaleToZero
-        ? p.size * (1 - k)
-        : p.size * (1 + (p.grow - 1) * Math.sqrt(k));
-      p.obj.scale.setScalar(scale);
-      const fade = p.fadeLinear ? (1 - k) : (1 - k) * (1 - k);
-      p.obj.material.opacity = p.opacity * fade;
+      const fb = p.flipbook;
+      const frame = Math.min(fb.frames - 1, Math.floor(p.age * fb.fps));
+      blitFlipbookFrame(fb, frame);
+      if (p.muzzleDir) this._aimMuzzleSide(p.obj, p.muzzleDir);
+      // Soft fade on the last ~15% so the last sparse frames don't hard-cut.
+      p.obj.material.opacity = k > 0.85 ? (1 - (k - 0.85) / 0.15) : 1;
     }
+
+    stepMeshPool(this._debrisPool, dt, heightAt);
+    stepMeshPool(this._brassPool, dt, heightAt);
+    stepMeshPool(this._grassPool, dt, heightAt);
+    stepBillboards(
+      [this._smokeBoard, this._flashBoard, this._streakBoard, this._glowBoard, ...this._burstBoards],
+      dt, heightAt, this._camQ, this._camQInv,
+    );
 
     for (const L of this.lights) {
       L.t += dt;

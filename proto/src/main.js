@@ -2,6 +2,7 @@ import * as THREE from 'three/webgpu';
 import { WebGPURenderer } from 'three/webgpu';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader.js';
 import { LightProbeGenerator } from 'three/examples/jsm/lights/LightProbeGenerator.js';
 import { SkyMesh } from 'three/examples/jsm/objects/SkyMesh.js';
@@ -17,6 +18,7 @@ import { shadowTint, patchShadowTint } from './shadowTint.js';
 import { createCloudShadows } from './cloudShadows.js';
 import { Input } from './input.js';
 import { Tank, RELOAD, REPAIR_TIME, MG_HEAT_TIME } from './tank.js';
+import { tankPose, boatPose } from './combatPose.js';
 import { installTankLods, updateTankLod } from './tankLod.js';
 import { Effects, wreckFireFade } from './fx.js';
 import { TankCamera } from './TankCamera.js';
@@ -179,16 +181,36 @@ async function main() {
   freezeStatic(bridge.root);
   await buildPebbles(scene, vegetation.pebbleAnchors, terrain.groundSets, terrain.palette.concrete);
 
+  // Player keeps the parsed scene. Each enemy gets a skinned clone and its own
+  // materials, taken before the player installs the repair glow on the original.
+  function cloneSherman(src) {
+    const scene = cloneSkinned(src.scene);
+    const mats = new Map();
+    const cloneMat = (m) => {
+      if (!m) return m;
+      let c = mats.get(m.uuid);
+      if (!c) {
+        c = m.clone();
+        mats.set(m.uuid, c);
+      }
+      return c;
+    };
+    scene.traverse((o) => {
+      if (!o.isMesh || !o.material) return;
+      o.material = Array.isArray(o.material) ? o.material.map(cloneMat) : cloneMat(o.material);
+    });
+    return { scene };
+  }
+
   const loader = new GLTFLoader();
-  const [gltf, enemyGltf, enemyGltfB, wreckGltf] = await Promise.all([
-    loader.loadAsync('./models/sherman.glb'),
-    loader.loadAsync('./models/sherman.glb'),
+  const [gltf, wreckGltf] = await Promise.all([
     loader.loadAsync('./models/sherman.glb'),
     loader.loadAsync('./models/sherman_destroyed.glb'),
   ]);
   const { x: sx, z: sz } = PLAYER_SPAWN;
   const spawn = { x: sx, y: heightAt(sx, sz) + 0.6, z: sz, yaw: Math.atan2(-(BRIDGE.z - sz), BRIDGE.x - sx) };
   const wreckSrc = wreckGltf.scene;
+  const enemyScenes = [cloneSherman(gltf), cloneSherman(gltf)];
   const tank = new Tank(gltf, RAPIER, world, spawn, { wreck: wreckSrc, repairGlow: true });
   scene.add(tank.model);
   const heatHaze = createEngineHeatHaze();
@@ -206,8 +228,8 @@ async function main() {
     ...trucks.navObstacles(),
   ]);
   const foeSpecs = [
-    { src: enemyGltf, anchor: ENEMY_SPAWN, fireSlot: 1, mgId: 'enemy' },
-    { src: enemyGltfB, anchor: ENEMY_SPAWN_BASE, spawnR: 10, patrolR: [8, 16], fireSlot: 6, mgId: 'enemy2' },
+    { src: enemyScenes[0], anchor: ENEMY_SPAWN, fireSlot: 1, mgId: 'enemy' },
+    { src: enemyScenes[1], anchor: ENEMY_SPAWN_BASE, spawnR: 10, patrolR: [8, 16], fireSlot: 6, mgId: 'enemy2' },
   ];
   const foes = foeSpecs.map(({ src, anchor, fireSlot, mgId, patrolR, spawnR }) => {
     const foe = new Tank(src, RAPIER, world, pickSpawn(nav, spawn, anchor, spawnR), { tint: ENEMY_TINT, wreck: wreckSrc });
@@ -789,24 +811,12 @@ async function main() {
     }
   }
 
-  function frame(now) {
-    const dt = Math.min(0.1, (now - last) / 1000);
-    last = now;
-    input.setEnabled(!visuals.open && !menuPaused);
-    const inp = input.read(dt);
-    // Gamepad: any button leaves the pause menu (no pointer lock needed)
-    if (menuPaused) {
-      if (inp.padPressed.length) setMenuPaused(false);
-    } else if (inp.padPressed.includes(9) && !fly.enabled) {
-      tank.reset(heightAt); snapCam();
-    }
+  const playerPose = tankPose(tank);
+  const foeGunners = foes.map((f) => ({ foe: f, pose: tankPose(f.tank) }));
+  const boatPoses = patrolBoat.boats.map((b) => boatPose(b));
+  const ramBodies = [];
 
-    const versus = !game.solo;
-    const flying = fly.enabled;
-    // Menu = hard freeze. Freefly = soft freeze (screenshots) without the overlay.
-    const paused = flying || menuPaused;
-    if (!paused) elapsed += dt;
-
+  function simTick(dt, inp, paused, versus, flying) {
     if (versus && !paused) {
       for (const f of foes) f.ai.update(dt, { halt: game.overT > 0 });
     }
@@ -818,7 +828,6 @@ async function main() {
         sfx.nitro();
         tankCam.nitroFov();
         input.rumble(0.35, 0.55, 180);
-        // Initial diesel cough from the exhaust stack
         tank.model.updateMatrixWorld(true);
         const mw = tank.model.matrixWorld;
         exhaustPoint.copy(EXHAUST_LOCAL).applyMatrix4(mw);
@@ -854,12 +863,13 @@ async function main() {
           for (const f of foes) f.ai.alert(pos.x, pos.z);
         } : null,
       });
-      // Drop the backlog instead of spiralling: a slow frame shouldn't make the next one slower.
       if (steps === MAX_SUBSTEPS) acc = Math.min(acc, FIXED_DT);
-      vegetation?.checkRams?.([
-        tank.body,
-        ...(versus ? foes.filter((f) => f.tank.alive).map((f) => f.tank.body) : []),
-      ]);
+      ramBodies.length = 0;
+      ramBodies.push(tank.body);
+      if (versus) {
+        for (const f of foes) if (f.tank.alive) ramBodies.push(f.tank.body);
+      }
+      vegetation?.checkRams?.(ramBodies);
     }
     barrels.sync();
     vegetation?.sync?.();
@@ -867,11 +877,12 @@ async function main() {
       clouds.update(dt);
       planes.update(dt);
     }
+  }
 
+  function combatTick(dt, inp, paused, versus, flying) {
     if (!menuPaused) updateCamera(dt, inp);
     else camera.getWorldDirection(viewDir);
     castFrom(camera.position, viewDir, 1200, aimPoint);
-    // Freefly owns the look — leave the turret alone so the hull doesn't track the ghost cam
     if (!paused) tank.update(dt, tank.alive ? aimPoint : null);
     if (tank.repairCancelled) sfx.repairStop();
     if (tank.repairDone) {
@@ -901,25 +912,25 @@ async function main() {
     }
 
     if (versus && !paused) {
-      for (const f of foes) {
-        const e = f.tank;
-        e.update(dt, e.alive ? f.ai.aimPoint : null);
-        if (f.ai.wantsSmoke) {
-          const pose = e.trySmoke();
-          if (pose) {
-            smoke.deploy(pose);
-            sfx.smokeBomb(0.85 * distGain(e.model.position.distanceTo(tank.model.position), 120));
+      for (const { foe, pose } of foeGunners) {
+        const e = foe.tank;
+        e.update(dt, e.alive ? foe.ai.aimPoint : null);
+        if (foe.ai.wantsSmoke) {
+          const poseSmoke = e.trySmoke();
+          if (poseSmoke) {
+            smoke.deploy(poseSmoke);
+            sfx.smokeBomb(0.85 * distGain(pose.position.distanceTo(playerPose.position), 120));
           }
         }
-        if (f.ai.wantsFire) {
-          const ep = e.position;
-          const pp = tank.position;
+        if (foe.ai.wantsFire) {
+          const ep = pose.position;
+          const pp = playerPose.position;
           const shot = e.tryFire(smoke.missBonus(ep.x, ep.z, pp.x, pp.z));
           if (shot) {
-            fx.fire({ ...shot, owner: e.body });
+            fx.fire({ ...shot, owner: pose.body });
             fx.muzzleFlash(shot.pos, shot.dir);
-            f.ai.onFired();
-            const hearD = shot.pos.distanceTo(tank.model.position);
+            foe.ai.onFired();
+            const hearD = shot.pos.distanceTo(playerPose.position);
             sfx.fire(0.9 * distGain(hearD, 160), hearD);
           }
         }
@@ -929,37 +940,35 @@ async function main() {
       for (const f of foes) fx.setDamageFire(null, 0, f.fireSlot);
     }
 
-    // Roof .50 cal — player RMB/R1; enemy sprays while its main gun reloads.
-    // Heat cooks the barrel; a full cook locks the gun. Hostile loops dull with distance.
     let hostileMgDist = null;
     const hearFrom = (p) => {
-      const d = p.distanceTo(tank.model.position);
+      const d = p.distanceTo(playerPose.position);
       if (hostileMgDist == null || d < hostileMgDist) hostileMgDist = d;
     };
     const mgDt = paused ? 0 : dt;
-    const mgFire = tank.tickMg(mgDt, !paused && inp.mgFire && tank.alive && !flying);
-    for (const f of foes) {
-      const want = versus && !paused && f.tank.alive && f.ai.wantsMg;
-      const on = f.tank.tickMg(versus ? mgDt : 0, want);
+    const mgFire = tank.tickMg(mgDt, !paused && inp.mgFire && playerPose.alive && !flying);
+    for (const { foe, pose } of foeGunners) {
+      const want = versus && !paused && pose.alive && foe.ai.wantsMg;
+      const on = foe.tank.tickMg(versus ? mgDt : 0, want);
       if (on) {
-        hearFrom(f.tank.model.position);
-        fx.setMgFlash(f.tank.mgMuzzle(), f.tank.body, f.mgId);
+        hearFrom(pose.position);
+        fx.setMgFlash(pose.mgMuzzle(), pose.body, foe.mgId);
       } else {
-        fx.setMgFlash(null, null, f.mgId);
+        fx.setMgFlash(null, null, foe.mgId);
       }
     }
     let boatMg = false;
     if (!paused) {
-      for (const b of patrolBoat.boats) {
-        if (!b.firing) continue;
+      for (const pose of boatPoses) {
+        if (!pose.mgMuzzle()) continue;
         boatMg = true;
-        hearFrom(b.root.position);
+        hearFrom(pose.position);
       }
     }
     sfx.setMgFire(mgFire);
     sfx.setHostileMg(hostileMgDist);
     if (mgFire) {
-      fx.setMgFlash(tank.mgMuzzle(), tank.body, 'player');
+      fx.setMgFlash(playerPose.mgMuzzle(), playerPose.body, 'player');
       input.rumble(0.12, 0.35, 50);
     } else {
       fx.setMgFlash(null, null, 'player');
@@ -969,6 +978,9 @@ async function main() {
     if (!paused) tankFx(tank, dt);
 
     if (!paused) match.tick(dt);
+  }
+
+  function ambientTick(dt, paused) {
     updatePathLine();
     debug.update();
     grass.updateLod(camera.position);
@@ -980,7 +992,7 @@ async function main() {
     if (!paused) {
       smoke.update(dt);
       airSupport.update(dt);
-      fx.update(dt, heightAt);
+      fx.update(dt, (x, z) => nav.sampleHeight(x, z));
       barrels.update(dt, fx);
       crates.update(dt);
       waterTower.update(dt, fx);
@@ -989,15 +1001,14 @@ async function main() {
       grass.update(elapsed);
       vegetation?.update?.(elapsed);
       flag.update(elapsed, vegetation?.getWind?.());
-      // Backdrop P-51 runup — audible across more of the scout orbit (~200 m).
       {
         const sp = planes.scoutPos?.();
         const orbit = sp
-          ? distGain(sp.distanceTo(tank.model.position), 200)
+          ? distGain(sp.distanceTo(playerPose.position), 200)
           : 0;
         sfx.setP51Orbit(orbit);
       }
-      sfx.setFire(distGain(fx.nearestDamageFireDist(tank.model.position), FIRE_HEAR));
+      sfx.setFire(distGain(fx.nearestDamageFireDist(playerPose.position), FIRE_HEAR));
       sfx.update(dt, {
         speed: tank.forwardSpeed(),
         throttle: tank.cmd.throttle,
@@ -1005,16 +1016,40 @@ async function main() {
         turretSlew: tank.turretSlew,
       });
     } else if (!menuPaused) {
-      // Freefly soft-pause: keep loops quiet but audio context running
       sfx.setP51Orbit(0);
-      sfx.setFire(distGain(fx.nearestDamageFireDist(tank.model.position), FIRE_HEAR));
+      sfx.setFire(distGain(fx.nearestDamageFireDist(playerPose.position), FIRE_HEAR));
       sfx.update(dt, { speed: 0, throttle: 0, maxSpeed: 12.5, turretSlew: 0 });
     }
+  }
+
+  function presentTick(dt, inp) {
     updateSun();
     updateHud(inp);
     const freezeDt = menuPaused ? 0 : dt;
     hud.update(freezeDt, camera);
     post.render(freezeDt);
+  }
+
+  function frame(now) {
+    const dt = Math.min(0.1, (now - last) / 1000);
+    last = now;
+    input.setEnabled(!visuals.open && !menuPaused);
+    const inp = input.read(dt);
+    if (menuPaused) {
+      if (inp.padPressed.length) setMenuPaused(false);
+    } else if (inp.padPressed.includes(9) && !fly.enabled) {
+      tank.reset(heightAt); snapCam();
+    }
+
+    const versus = !game.solo;
+    const flying = fly.enabled;
+    const paused = flying || menuPaused;
+    if (!paused) elapsed += dt;
+
+    simTick(dt, inp, paused, versus, flying);
+    combatTick(dt, inp, paused, versus, flying);
+    ambientTick(dt, paused);
+    presentTick(dt, inp);
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);

@@ -4,7 +4,24 @@ import * as THREE from 'three';
 import { float, materialEmissive, mix, positionWorld, smoothstep, uniform, vec3 } from 'three/tsl';
 import { applyBurntMetal } from './burntMetal.js';
 import { createEngineHeatHaze } from './heatHaze.js';
-import { SMOKE_COOLDOWN } from './smoke.js';
+import {
+  REPAIR_CHARGES,
+  tryNitro as startNitro, updateNitro as stepNitro,
+  stressMissChance as stressMiss, missChance as combinedMiss, addStress as gainStress, decayStress,
+  trySmoke as launchSmoke, smokeCdFraction as smokeFraction, tryRepair as beginRepair,
+  tickRepair, updateRepairSweep,
+} from './tankGadgets.js';
+import {
+  RELOAD,
+  tickMg as stepMg, syncMgHeatVisual, muzzleOf, mgMuzzleOf, tryFire as launchShell,
+} from './tankWeapons.js';
+import {
+  obliterateTank, restoreTankWreck, spawnWreckTurret, syncWreckTurret, clearWreckTurret,
+} from './tankWreck.js';
+
+export { RELOAD, MG_HEAT_TIME, MG_COOLDOWN, SHELL_SPEED } from './tankWeapons.js';
+export { stepMgHeat } from './tankWeapons.js';
+export { REPAIR_CHARGES, REPAIR_TIME, REPAIR_HEAL, STRESS_MAX } from './tankGadgets.js';
 
 const MASS = 25500;          // a bit lighter → more playful pitch under throttle
 const LINK_T = 0.07;
@@ -18,14 +35,6 @@ const GRIP_FLAT = 0.88;
 const GRIP_STEEP = 0.55;
 const GRIP_FLOOR = 0.15;
 const SPEED = { cruise: 9.5, boost: 15.4, reverse: 4.5, pivot: 4.6875, turn: 3.90625 };   // m/s
-// Nitro: 2 charges, then must fully refill. Envelope matches nitro_rev.wav (~2.31s, peak ~1s).
-const NITRO = {
-  duration: 2.313,
-  cost: 0.5,
-  rechargePerSec: 1 / 6.5,
-  peakAt: 1.0,
-  holdEnd: 1.45,
-};
 const DAMP_RATIO = 0.28;     // fraction of critical; lower = bouncier rebound
 const BRAKE_DIVE = 0.75;     // keep this fraction of nose-dive pitch under hard braking
 // Side bumps spin the long axis easily. Stiffen roll inertia, and past a small lean
@@ -46,23 +55,8 @@ const MG_TRAVERSE = THREE.MathUtils.degToRad(90);
 const MG_ELEVATE = THREE.MathUtils.degToRad(60);
 const MG_ELEV_MIN = THREE.MathUtils.degToRad(-20);
 const MG_ELEV_MAX = THREE.MathUtils.degToRad(70);
-export const RELOAD = 4.0;
-// Roof .50. Continuous fire fills the bar in MG_HEAT_TIME. Barrel glow starts at 50% and ramps to cook-off.
-// A full bar locks the gun for MG_COOLDOWN (twice a main-gun reload). Letting go early bleeds.
-export const MG_HEAT_TIME = 6;
-export const MG_COOLDOWN = RELOAD * 2;
-const MG_HEAT_BLEED = 4.5;
-export const STRESS_MAX = 100;
-const STRESS_DECAY = 10;      // units/s back toward 0 after a hit
-const STRESS_MISS_MAX = 0.5;  // miss chance at full stress
-export const SHELL_SPEED = 260 * 0.8;
 export const MAX_HP = 4;     // main-gun hits to destroy
 export const MG_DAMAGE = 0.01; // .50 cal chip damage (−80%; ~100 rounds / full bar)
-export const REPAIR_CHARGES = 2;
-export const REPAIR_TIME = 5;   // s channel
-export const REPAIR_HEAL = 0.5; // fraction of max HP per charge
-const REPAIR_SWEEP = 1.15;      // s, green band travels the hull after a repair lands
-const RECOIL_IMPULSE = 4500;  // N*s on the hull
 // MG50 mesh tip (Blender build: brake cyl at x=1.24, len 0.08 → tip ~1.28; z=0.43)
 const MG_MUZZLE_LOCAL = new THREE.Vector3(1.28, 0.43, 0);
 // GLB material index 4 / Blender slot 4 on Hull_Details — red brake/tail lenses
@@ -86,15 +80,21 @@ const ANT_BASE = { hz: 1.4, zeta: 0.12 };
 const ANT_TIP = { hz: 3.2, zeta: 0.18 };
 const ANT_SHARE = [0.12, 0.2, 0.3, 0.38];   // fraction of the lean per joint, base → tip
 const ANT_ACCEL_SMOOTH = 25; // 1/s, low-pass on the measured acceleration
-// Destroyed turret: spawn at ring COM (hull local), pop up with a little tumble.
-const WRECK_TURRET_LOCAL = new THREE.Vector3(-0.16, 2.35, 0);
-const WRECK_TURRET_HALF = { x: 0.9, y: 0.42, z: 0.72 }; // cuboid half-extents (m)
-const WRECK_TURRET_MASS = 2200;
-const WRECK_TURRET_UP = 9.5;   // m/s vertical pop
-const WRECK_TURRET_SIDE = 2.8; // m/s random horizontal
 
 const _v = new THREE.Vector3();
 const _q = new THREE.Quaternion();
+const _susUp = new THREE.Vector3();
+const _susFwd = new THREE.Vector3();
+const _susDown = new THREE.Vector3();
+const _susOrigin = new THREE.Vector3();
+const _susN = new THREE.Vector3();
+const _susTf = new THREE.Vector3();
+const _susTs = new THREE.Vector3();
+const _susImp = new THREE.Vector3();
+const _susHit = new THREE.Vector3();
+const _susSide = new THREE.Vector3();
+const _susTarget = { L: 0, R: 0 };
+const _susLong = { L: [0, 0], R: [0, 0] };
 const _up = new THREE.Vector3(0, 1, 0);
 const _side = new THREE.Vector3();
 
@@ -122,26 +122,6 @@ function pointOnLoop({ segs, L }, d, outP) {
   const s = segs[lo];
   outP.copy(s.a).addScaledVector(s.t, d - s.s0);
   return s.t;
-}
-
-/** One step of roof-gun heat. `firing` is true for the step that cooks the barrel. */
-export function stepMgHeat(heat, lock, dt, trigger, alive) {
-  if (lock > 0) {
-    lock = Math.max(0, lock - dt);
-    if (lock > 0) return { heat: lock / MG_COOLDOWN, lock, firing: false };
-    heat = 0;
-  }
-  const firing = !!trigger && !!alive;
-  if (firing) {
-    heat = Math.min(1, heat + dt / MG_HEAT_TIME);
-    if (heat >= 0.999) {
-      heat = 1;
-      lock = MG_COOLDOWN;
-    }
-  } else if (heat > 0) {
-    heat = Math.max(0, heat - dt / MG_HEAT_BLEED);
-  }
-  return { heat, lock, firing };
 }
 
 // Jacket + tube + muzzle brake sit forward of the receiver, on the bore (local +X).
@@ -235,29 +215,6 @@ function uprightAssist(up, fwd, side, angvel, grounded) {
     y: fwd.y * rollT + side.y * pitchT,
     z: fwd.z * rollT + side.z * pitchT,
   };
-}
-
-/** Speed blend 0..1 over a nitro burst — soft wind-up into the rev peak, then decay. */
-function nitroEnvelope(age) {
-  if (age <= 0 || age >= NITRO.duration) return 0;
-  if (age < NITRO.peakAt) {
-    const u = age / NITRO.peakAt;
-    return u * u; // slow start → full thrust ~1s with the audio peak
-  }
-  if (age < NITRO.holdEnd) return 1;
-  const u = (age - NITRO.holdEnd) / (NITRO.duration - NITRO.holdEnd);
-  return Math.max(0, 1 - u * u);
-}
-
-/** Panic throw: yaw hard enough to miss a hull at duel range. Mutates `dir`. */
-function deflectShell(dir) {
-  const yaw = (Math.random() < 0.5 ? -1 : 1) * (0.26 + Math.random() * 0.12);
-  dir.applyAxisAngle(_up, yaw);
-  _side.crossVectors(_up, dir);
-  if (_side.lengthSq() > 1e-8) {
-    dir.applyAxisAngle(_side.normalize(), (Math.random() - 0.4) * 0.08);
-  }
-  return dir.normalize();
 }
 
 /** Damped spring on a 2D value (pos, vel: Vector2) towards target, semi-implicit Euler. */
@@ -376,6 +333,7 @@ export class Tank {
     // antenna: x = lean towards turret +X (forward), y = towards turret +Z
     this.antennaBones = ANT_SHARE.map((_, i) => node(`Antenna_${i}`));
     this.accelLocal = new THREE.Vector3();   // hull-frame acceleration, smoothed
+    this._prevVel = { x: 0, y: 0, z: 0 };
     this.prevVel = null;
     this.antBase = new THREE.Vector2();
     this.antBaseVel = new THREE.Vector2();
@@ -473,76 +431,36 @@ export class Tank {
   get nitroActive() { return this.nitro.t > 0; }
 
   /** Rising-edge Shift/L1: spend half a bar if available. Returns true when a burst starts. */
-  tryNitro() {
-    const n = this.nitro;
-    if (n.t > 0) return false;
-    if (n.needFull && n.charge < 1 - 1e-4) return false;
-    if (n.charge < NITRO.cost - 1e-4) return false;
-    n.charge = Math.max(0, n.charge - NITRO.cost);
-    if (n.charge < 0.02) n.needFull = true;
-    n.t = NITRO.duration;
-    n.power = 0;
-    return true;
-  }
+  tryNitro() { return startNitro(this); }
 
   /**
    * Edge-trigger nitro from held boost, advance envelope / recharge.
    * Call once per frame (variable dt) before physics steps.
    */
-  updateNitro(dt, wantBoost) {
-    const n = this.nitro;
-    const pressed = !!wantBoost;
-    n.justStarted = false;
-    if (pressed && !n.held) n.justStarted = this.tryNitro();
-    n.held = pressed;
-
-    if (n.t > 0) {
-      n.t = Math.max(0, n.t - dt);
-      n.power = nitroEnvelope(NITRO.duration - n.t);
-    } else {
-      n.power = 0;
-      if (n.charge < 1) {
-        n.charge = Math.min(1, n.charge + NITRO.rechargePerSec * dt);
-        if (n.charge >= 1 - 1e-4) {
-          n.charge = 1;
-          n.needFull = false;
-        }
-      }
-    }
-  }
+  updateNitro(dt, wantBoost) { stepNitro(this, dt, wantBoost); }
 
   get position() { return this.body.translation(); }
   get alive() { return this.hp > 0; }
   /** Chance a well-aimed main-gun shell still misses, from Stress (0..1). */
-  get stressMissChance() { return (this.stress / STRESS_MAX) * STRESS_MISS_MAX; }
+  get stressMissChance() { return stressMiss(this); }
 
   /**
    * Combined miss chance: stress jitter + optional smoke penalty (0..1).
    * Hit rate = 1 − this.
    */
-  missChance(smokeMiss = 0) {
-    return Math.min(0.95, this.stressMissChance + Math.max(0, smokeMiss));
-  }
+  missChance(smokeMiss = 0) { return combinedMiss(this, smokeMiss); }
 
   /** Effective direct-hit rate for HUD (0..1). */
   hitRate(smokeMiss = 0) { return 1 - this.missChance(smokeMiss); }
 
   /** Spike stress from a hard hit (main gun). Clamped to 0..100. */
-  addStress(amount) {
-    if (amount <= 0 || !this.alive) return;
-    this.stress = Math.min(STRESS_MAX, this.stress + amount);
-  }
+  addStress(amount) { gainStress(this, amount); }
 
   /** BF3/4 smoke launchers. Returns deploy pose or null if on cooldown / dead. */
-  trySmoke() {
-    if (!this.alive || this.smokeCd > 0) return null;
-    this.smokeCd = SMOKE_COOLDOWN;
-    const p = this.body.translation();
-    return { x: p.x, y: p.y, z: p.z };
-  }
+  trySmoke() { return launchSmoke(this); }
 
   get smokeReady() { return this.alive && this.smokeCd <= 0; }
-  get smokeCdFraction() { return this.smokeCd <= 0 ? 1 : 1 - this.smokeCd / SMOKE_COOLDOWN; }
+  get smokeCdFraction() { return smokeFraction(this); }
 
   get repairing() { return this.repairT > 0; }
 
@@ -550,13 +468,7 @@ export class Tank {
    * Start a repair channel. Spends one charge up front.
    * No-op at full HP, while already repairing, or with no charges left.
    */
-  tryRepair() {
-    if (!this.alive || this.wrecked || this.repairT > 0 || this.repairs <= 0) return false;
-    if (this.hp >= this.maxHp - 1e-3) return false;
-    this.repairs -= 1;
-    this.repairT = REPAIR_TIME;
-    return true;
-  }
+  tryRepair() { return beginRepair(this); }
 
   /** Remove from (or return to) the world without destroying it — used by solo mode. */
   setActive(on) {
@@ -566,93 +478,14 @@ export class Tank {
   }
 
   /** Kill-shot: freeze pose, hide the intact rig, show the destroyed hull + flying turret. */
-  obliterate() {
-    if (this.wrecked) return;
-    this.model.position.copy(this.body.translation());
-    this.model.quaternion.copy(this.body.rotation());
-    this.model.updateMatrixWorld(true);
-    for (const c of this.intactRoots) c.visible = false;
-    if (this.wreck) this.wreck.visible = true;
-    // Freeze the hull as a fixed wreck so the flying turret can land on it.
-    this.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
-    this.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
-    this.body.setBodyType(this.RAPIER.RigidBodyType.Fixed, true);
-    this.turretCollider?.setEnabled(false);
-    this.wrecked = true;
-    this._spawnWreckTurret();
-  }
+  obliterate() { obliterateTank(this); }
 
   /** Swap the intact rig back in (round restart). */
-  restoreWreck() {
-    if (!this.wrecked) return;
-    this._clearWreckTurret();
-    for (const c of this.intactRoots) c.visible = true;
-    if (this.wreck) this.wreck.visible = false;
-    this.turretCollider?.setEnabled(true);
-    this.body.setBodyType(this.RAPIER.RigidBodyType.Dynamic, true);
-    this.wrecked = false;
-  }
+  restoreWreck() { restoreTankWreck(this); }
 
-  /** Blow the turret off the ring — only physics-driven wreck piece. */
-  _spawnWreckTurret() {
-    if (!this.wreckTurretSrc || this.wreckTurret) return;
-    const R = this.RAPIER;
-    const mesh = this.wreckTurretSrc.clone(true);
-    mesh.visible = true;
-    const hullQ = _q.copy(this.model.quaternion);
-    const pos = WRECK_TURRET_LOCAL.clone().applyQuaternion(hullQ).add(this.model.position);
-    // Keep hull yaw so the barrel still points roughly forward as it leaves.
-    mesh.position.copy(pos);
-    mesh.quaternion.copy(hullQ);
-    (this.model.parent || this.model).add(mesh);
-
-    const rb = this.world.createRigidBody(R.RigidBodyDesc.dynamic()
-      .setTranslation(pos.x, pos.y, pos.z)
-      .setRotation(hullQ)
-      .setLinearDamping(0.12)
-      .setAngularDamping(0.18)
-      .setCcdEnabled(true)
-      .setUserData({ mat: 'metal' }));
-    const { x: hx, y: hy, z: hz } = WRECK_TURRET_HALF;
-    this.world.createCollider(
-      R.ColliderDesc.cuboid(hx, hy, hz)
-        .setMass(WRECK_TURRET_MASS)
-        .setFriction(0.6)
-        .setRestitution(0.15),
-      rb,
-    );
-    const side = WRECK_TURRET_SIDE;
-    rb.setLinvel({
-      x: (Math.random() - 0.5) * 2 * side,
-      y: WRECK_TURRET_UP + Math.random() * 2.5,
-      z: (Math.random() - 0.5) * 2 * side,
-    }, true);
-    rb.setAngvel({
-      x: (Math.random() - 0.5) * 8,
-      y: (Math.random() - 0.5) * 6,
-      z: (Math.random() - 0.5) * 8,
-    }, true);
-    this.wreckTurret = mesh;
-    this.wreckTurretBody = rb;
-  }
-
-  _syncWreckTurret() {
-    if (!this.wreckTurret || !this.wreckTurretBody) return;
-    const t = this.wreckTurretBody.translation();
-    this.wreckTurret.position.set(t.x, t.y, t.z);
-    this.wreckTurret.quaternion.copy(this.wreckTurretBody.rotation());
-  }
-
-  _clearWreckTurret() {
-    if (this.wreckTurretBody) {
-      this.world.removeRigidBody(this.wreckTurretBody);
-      this.wreckTurretBody = null;
-    }
-    if (this.wreckTurret) {
-      this.wreckTurret.parent?.remove(this.wreckTurret);
-      this.wreckTurret = null;
-    }
-  }
+  _spawnWreckTurret() { spawnWreckTurret(this); }
+  _syncWreckTurret() { syncWreckTurret(this); }
+  _clearWreckTurret() { clearWreckTurret(this); }
 
   forwardSpeed() {
     const v = this.body.linvel();
@@ -678,22 +511,26 @@ export class Tank {
       : SPEED.reverse;
     const v = this.cmd.throttle * top;
     const steer = this.cmd.turn * THREE.MathUtils.lerp(SPEED.pivot, SPEED.turn, Math.min(1, Math.abs(v) / 4));
-    const target = { L: v + steer, R: v - steer };   // D (turn > 0) = right: left track runs faster
+    const target = _susTarget;   // D (turn > 0) = right: left track runs faster
+    target.L = v + steer;
+    target.R = v - steer;
 
     const t = this.body.translation();
     const q = _q.copy(this.body.rotation());
-    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
-    const fwd = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
-    const down = up.clone().negate();
-    const origin = new THREE.Vector3();
-    const n = new THREE.Vector3();
-    const tf = new THREE.Vector3();
-    const ts = new THREE.Vector3();
-    const imp = new THREE.Vector3();
-    const ray = new R.Ray(origin, down);
+    const up = _susUp.set(0, 1, 0).applyQuaternion(q);
+    const fwd = _susFwd.set(1, 0, 0).applyQuaternion(q);
+    const down = _susDown.copy(up).negate();
+    const origin = _susOrigin;
+    const n = _susN;
+    const tf = _susTf;
+    const ts = _susTs;
+    const imp = _susImp;
+    if (!this._susRay) this._susRay = new R.Ray(origin, down);
+    const ray = this._susRay;
     const maxDist = RAY_UP + SAG;
     let grounded = 0;
-    const sideLong = { L: [0, 0], R: [0, 0] };
+    const sideLong = _susLong;
+    sideLong.L[0] = sideLong.L[1] = sideLong.R[0] = sideLong.R[1] = 0;
     const fwdSpeed = this.forwardSpeed();
     const com = this.body.worldCom();
     const diveCancel = 1 - BRAKE_DIVE;
@@ -708,7 +545,7 @@ export class Tank {
       if (!hit) continue;
       const dist = hit.timeOfImpact;
       const comp = maxDist - dist;
-      const p = origin.clone().addScaledVector(down, dist);
+      const p = _susHit.copy(origin).addScaledVector(down, dist);
       const vel = this.body.velocityAtPoint(p);
       n.set(hit.normal.x, hit.normal.y, hit.normal.z);
       const vAlong = vel.x * up.x + vel.y * up.y + vel.z * up.z;
@@ -749,7 +586,7 @@ export class Tank {
 
     // Keep small leans. Bleed off roll speed, and shove back once a tip is actually underway.
     {
-      const side = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
+      const side = _susSide.set(0, 0, 1).applyQuaternion(q);
       const av = this.body.angvel();
       const torque = uprightAssist(up, fwd, side, av, grounded > 0);
       this.body.applyTorqueImpulse({ x: torque.x * dt, y: torque.y * dt, z: torque.z * dt }, true);
@@ -771,7 +608,11 @@ export class Tank {
         .applyQuaternion(_q.copy(this.body.rotation()).invert());
       this.accelLocal.lerp(_v, 1 - Math.exp(-ANT_ACCEL_SMOOTH * dt));
     }
-    this.prevVel = { x: lv.x, y: lv.y, z: lv.z };
+    const prev = this._prevVel;
+    prev.x = lv.x;
+    prev.y = lv.y;
+    prev.z = lv.z;
+    this.prevVel = prev;
   }
 
   /** Swing the whip antenna from the hull's acceleration, expressed in the turret's frame. */
@@ -844,7 +685,7 @@ export class Tank {
       this.turretSlew = 0;
     }
 
-    if (this.stress > 0) this.stress = Math.max(0, this.stress - STRESS_DECAY * dt);
+    decayStress(this, dt);
     if (this.smokeCd > 0) this.smokeCd = Math.max(0, this.smokeCd - dt);
 
     const wasReloading = this.reload > 0;
@@ -911,41 +752,8 @@ export class Tank {
     });
   }
 
-  _tickRepair(dt) {
-    this.repairDone = false;
-    this.repairCancelled = false;
-    if (this.repairT <= 0) return;
-    if (!this.alive) {
-      this.repairT = 0;
-      this.repairCancelled = true;
-      return;
-    }
-    this.repairT = Math.max(0, this.repairT - dt);
-    if (this.repairT > 0) return;
-    this.hp = Math.min(this.maxHp, this.hp + this.maxHp * REPAIR_HEAL);
-    this.repairDone = true;
-    this._sweep = 0;
-  }
-
-  _updateRepairSweep(dt) {
-    const u = this._repairU;
-    if (!u || this._sweep < 0) return;
-    if (!this.alive) {
-      this._sweep = -1;
-      u.amp.value = 0;
-      return;
-    }
-    this._sweep += dt;
-    const k = Math.min(1, this._sweep / REPAIR_SWEEP);
-    u.t.value = k;
-    u.amp.value = k > 0.84 ? Math.max(0, (1 - k) / 0.16) : 1;
-    u.origin.value.copy(this.model.position);
-    u.forward.value.set(1, 0, 0).transformDirection(this.model.matrixWorld);
-    if (k >= 1) {
-      this._sweep = -1;
-      u.amp.value = 0;
-    }
-  }
+  _tickRepair(dt) { tickRepair(this, dt); }
+  _updateRepairSweep(dt) { updateRepairSweep(this, dt); }
 
   /** Green hull band, same sweep as a finished repair. */
   showHeal() {
@@ -1024,72 +832,20 @@ export class Tank {
    * Advance roof-gun heat. `trigger` is the held fire button (already gated on pause / death).
    * Returns whether a round should actually leave the barrel this frame.
    */
-  tickMg(dt, trigger) {
-    const s = stepMgHeat(this.mgHeat, this.mgLock, dt, trigger, this.alive);
-    this.mgHeat = s.heat;
-    this.mgLock = s.lock;
-    this.mgFiring = s.firing;
-    this._syncMgHeatVisual(s.firing);
-    return s.firing;
-  }
+  tickMg(dt, trigger) { return stepMg(this, dt, trigger); }
 
-  _syncMgHeatVisual(firing) {
-    const h = this.mgHeat;
-    // Cold until halfway, then a straight ramp to full orange at cook-off.
-    const glow = h <= 0.5 ? 0 : (h - 0.5) / 0.5;
-    const hot = glow > 0.02;
-    for (const m of this._mgHeatMats) {
-      if (this.hitFlashFrames > 0) break;
-      if (hot) {
-        m.emissive.setRGB(1, 0.28, 0.02);
-        m.emissiveIntensity = glow * 36;
-      } else {
-        m.emissive.setRGB(0, 0, 0);
-        m.emissiveIntensity = 1;
-      }
-    }
-    const haze = this.mgHaze;
-    if (!haze) return;
-    const k = firing ? Math.max(h, 0.45) : (h > 0.05 ? h : 0);
-    const show = this.alive && k > 0.03;
-    haze.visible = show;
-    if (!show) return;
-    haze.userData.heatStrength.value = 0.02 * k;
-    haze.scale.setScalar(0.75 + 0.45 * h);
-  }
+  _syncMgHeatVisual(firing) { syncMgHeatVisual(this, firing); }
 
-  muzzle() {
-    const pos = this.barrel.localToWorld(this.muzzleLocal.clone().setX(this.muzzleLocal.x));
-    const dir = new THREE.Vector3(1, 0, 0).transformDirection(this.barrel.matrixWorld);
-    return { pos, dir };
-  }
+  muzzle() { return muzzleOf(this); }
 
   /** World pose of the roof .50 cal muzzle. */
-  mgMuzzle() {
-    const pos = this.mg.localToWorld(this.mgMuzzleLocal.clone());
-    const dir = new THREE.Vector3(1, 0, 0).transformDirection(this.mg.matrixWorld);
-    return { pos, dir };
-  }
+  mgMuzzle() { return mgMuzzleOf(this); }
 
   /**
    * Returns shell launch data if the gun fired this frame.
    * @param {number} [smokeMiss=0] extra miss from smoke (see smoke.js)
    */
-  tryFire(smokeMiss = 0) {
-    if (this.reload > 0) return null;
-    this.reload = RELOAD;
-    this.recoilT = 0;
-    const { pos, dir } = this.muzzle();
-    const miss = this.missChance(smokeMiss);
-    const shotDir = (miss > 0 && Math.random() < miss)
-      ? deflectShell(dir.clone())
-      : dir;
-    const lv = this.body.linvel();
-    const vel = shotDir.clone().multiplyScalar(SHELL_SPEED).add(new THREE.Vector3(lv.x, lv.y, lv.z));
-    const at = this.turret.getWorldPosition(new THREE.Vector3());
-    this.body.applyImpulseAtPoint(dir.clone().multiplyScalar(-RECOIL_IMPULSE), at, true);
-    return { pos, dir: shotDir, vel };
-  }
+  tryFire(smokeMiss = 0) { return launchShell(this, smokeMiss); }
 
   /** True when the hull is on its side / roof (tracks no longer under it). */
   isFlipped() {
