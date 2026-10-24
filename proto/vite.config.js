@@ -7,6 +7,8 @@ const threeWebgpu = path.resolve(root, 'node_modules/three/build/three.webgpu.js
 
 // Remap bare `three` (used by examples/jsm) to the WebGPU build so one module graph.
 export default defineConfig({
+  // Project Pages URL is https://stellanjoh2.github.io/TankU/
+  base: '/TankU/',
   resolve: {
     alias: [
       { find: /^three$/, replacement: threeWebgpu },
