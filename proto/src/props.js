@@ -21,6 +21,8 @@ export function buildProps(RAPIER, world, scene) {
     const y = heightAt(x, z) + lift;
     mesh.position.set(x, y, z);
     mesh.quaternion.copy(q);
+    mesh.updateMatrix();
+    mesh.matrixAutoUpdate = false;
     const body = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(x, y, z).setRotation(q));
     world.createCollider(RAPIER.ColliderDesc.cuboid(size[0] / 2, size[1] / 2, size[2] / 2).setFriction(0.9), body);
   }

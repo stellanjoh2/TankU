@@ -47,17 +47,22 @@ canvas { display: block; }
 #hud .hp,
 #hud .nitro,
 #hud .reload,
+#hud .overheat,
 #hud .repair,
 #hud .hit,
-#hud .gadget { display: grid; grid-template-columns: 56px 160px 44px; align-items: center; gap: 8px; }
+#hud .gadget,
+#hud .pickup { display: grid; grid-template-columns: 56px 160px 44px; align-items: center; gap: 8px; }
 #hud .repair { grid-template-columns: 120px 120px 48px; }
 #hud .gadget { grid-template-columns: 56px 1fr; }
+#hud .pickup { grid-template-columns: 96px 1fr; }
 #hud .hp span,
 #hud .nitro span,
 #hud .reload span,
+#hud .overheat span,
 #hud .repair span,
 #hud .hit span,
-#hud .gadget span {
+#hud .gadget span,
+#hud .pickup span {
   font-family: "Bebas Neue", sans-serif; font-size: 16px; font-weight: 400;
   line-height: 1; letter-spacing: 0.06em; opacity: 0.85; text-shadow: 0 1px 3px #000;
 }
@@ -65,11 +70,15 @@ canvas { display: block; }
 #hud .hp b,
 #hud .nitro b,
 #hud .reload b,
+#hud .overheat b,
 #hud .repair b,
 #hud .hit b,
-#hud .gadget b { font-weight: 600; font-size: 12px; text-align: right; text-shadow: 0 1px 3px #000; }
-#hud .gadget span { color: #d8c898; opacity: 1; }
-#hud .gadget b { text-align: left; color: #ffd278; letter-spacing: 0.04em; }
+#hud .gadget b,
+#hud .pickup b { font-weight: 600; font-size: 12px; text-align: right; text-shadow: 0 1px 3px #000; }
+#hud .gadget span,
+#hud .pickup span { color: #d8c898; opacity: 1; }
+#hud .gadget b,
+#hud .pickup b { text-align: left; color: #ffd278; letter-spacing: 0.04em; }
 #hud .gadget.cooling b { color: #a09880; }
 #hud .gadget.repairing b {
   color: #c8ff7a; font-size: 14px; letter-spacing: 0.14em;
@@ -90,6 +99,7 @@ canvas { display: block; }
 #hud .hp-bar,
 #hud .nitro-bar,
 #hud .reload-bar,
+#hud .overheat-bar,
 #hud .repair-bar,
 #hud .hit-bar {
   height: 10px; background: rgba(0, 0, 0, 0.5); border: 1px solid rgba(232, 228, 216, 0.35);
@@ -126,6 +136,18 @@ canvas { display: block; }
 #hud .reload-bar i {
   display: block; height: 100%; width: 0%;
   background: #e0a030; transition: width 0.08s linear;
+}
+#hud .overheat span { color: #ff9a3a; opacity: 1; }
+#hud .overheat-bar { border-color: rgba(255, 140, 40, 0.55); }
+#hud .overheat-bar i {
+  display: block; height: 100%; width: 0%;
+  background: linear-gradient(90deg, #c45a12, #ffb020);
+  box-shadow: 0 0 8px rgba(255, 140, 40, 0.35);
+  transition: width 0.08s linear;
+}
+#hud .overheat.locked span { color: #ff5a2a; }
+#hud .overheat.locked .overheat-bar i {
+  background: linear-gradient(90deg, #ff4a1a, #ffb020);
 }
 #hud .repair-bar { height: 10px; border-color: rgba(160, 255, 110, 0.65); }
 #hud .repair-bar i {
@@ -169,6 +191,7 @@ canvas { display: block; }
 #banner.in .banner-inner { animation: banner-in 0.62s cubic-bezier(0.16, 1, 0.3, 1) both; }
 #banner.in strong { animation: banner-title 0.7s cubic-bezier(0.12, 1.15, 0.28, 1) both; }
 #banner.in span { animation: banner-sub 0.5s ease-out 0.16s both; }
+#banner.out .banner-inner { animation: banner-out 0.4s ease-in both; }
 
 @keyframes banner-in {
   0% { opacity: 0; transform: translateY(-22px); }
@@ -182,6 +205,10 @@ canvas { display: block; }
 @keyframes banner-sub {
   0% { opacity: 0; transform: translateY(10px); letter-spacing: 0.38em; }
   100% { opacity: 0.72; transform: translateY(0); letter-spacing: 0.22em; }
+}
+@keyframes banner-out {
+  0% { opacity: 1; transform: translateY(0); }
+  100% { opacity: 0; transform: translateY(-16px); }
 }
 
 #hit-flash {

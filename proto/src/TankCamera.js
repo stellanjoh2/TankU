@@ -237,7 +237,7 @@ export class TankCamera {
     this.nitroFovAmt = 0;
   }
 
-  /** Restore cfg (incl. wheel-zoom distances) and runtime camera state to defaults. */
+  /** Restore cfg and runtime camera state to defaults. */
   resetDefaults() {
     Object.assign(this.cfg, CAMERA_CONFIG);
     this.distance = this.cfg.distanceMin;
@@ -327,10 +327,9 @@ export class TankCamera {
       ? c.fovBase - c.fovDelta * brakeT
       : c.fovBase + c.fovDelta * speedT;
     this.fov = damp(this.fov, targetFov, c.fovLambda, dt);
-    // Boom stays at distanceMin. Lerping out to a longer distance at speed is
-    // what reels the camera off the hull after you've been driving.
-    const targetDist = c.distanceMin;
-    this.distance = damp(this.distance, targetDist, c.fovLambda, dt);
+    // Authored boom length, every frame. A smoothed or cfg distance parks at a
+    // new length (scroll used to rewrite distanceMin) and the tank shrinks.
+    this.distance = CAMERA_CONFIG.distanceMin;
     const height = lerp(c.heightMin, c.heightMax, speedT);
 
     // ----- kick: ease-out shove to peak, then ease-out return synced to reload -----

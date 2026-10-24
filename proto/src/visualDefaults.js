@@ -61,7 +61,7 @@ export const VISUAL_DEFAULTS = {
   vignette: 1,
   fisheye: 0.05,
   grain: 0.04,
-  aberration: 0.0015,
+  aberration: 0,
   shadowIntensity: 0.94,
   shadowColor: '#417676',
 };

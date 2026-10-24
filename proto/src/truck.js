@@ -6,6 +6,7 @@ import { AIRFIELD_Y, heightAt } from './terrain.js';
 import { pickLod } from './lod.js';
 import { createEngineHeatHaze } from './heatHaze.js';
 import { applyBurntMetal } from './burntMetal.js';
+import { wreckFireFade } from './fx.js';
 
 const SLAB_T = 0.06;
 const NODE = 'ArmyTruck';
@@ -228,6 +229,8 @@ export async function buildTrucks(scene, { RAPIER, world }) {
     const t = {
       obj, lods, ruin, haze, lod: -2, body, collider, spot, dead: false,
       fireSlot: FIRE_SLOT0 + i,
+      burnT: 0,
+      hazeBase: haze.userData.heatStrength.value,
     };
     live.push(t);
     setLod(t, 0);
@@ -251,7 +254,7 @@ export async function buildTrucks(scene, { RAPIER, world }) {
           const cull = CULL_DIST * lodScale + (t.ruin.visible ? cullPad : -cullPad);
           const show = d <= cull;
           t.ruin.visible = show;
-          t.haze.visible = show;
+          t.haze.visible = show && wreckFireFade(t.burnT) > 0;
           continue;
         }
         const d = t.obj.position.distanceTo(camPos);
@@ -269,6 +272,7 @@ export async function buildTrucks(scene, { RAPIER, world }) {
       if (!t) return false;
       if (t.dead) return true;
       t.dead = true;
+      t.burnT = 0;
       for (const m of t.lods) m.visible = false;
       t.ruin.visible = true;
       t.haze.visible = true;
@@ -279,11 +283,24 @@ export async function buildTrucks(scene, { RAPIER, world }) {
     update(dt, fx) {
       for (const t of live) {
         if (!t.dead || !fx) continue;
+        t.burnT += dt;
+        const k = wreckFireFade(t.burnT);
+        const hazeU = t.haze.userData.heatStrength;
+        if (k <= 0) {
+          t.haze.visible = false;
+          if (hazeU) hazeU.value = 0;
+          fx.setDamageFire(null, 0, t.fireSlot);
+          continue;
+        }
+        if (hazeU) hazeU.value = t.hazeBase * k;
         // Fire gif is bottom-anchored — sit on terrain so flames don't float over the wreck.
         smokeAt.set(t.spot.x, heightAt(t.spot.x, t.spot.z), t.spot.z);
-        fx.plume(smokeAt, dt * 0.85);
-        if (t.haze.visible) fx.setDamageFire(smokeAt, FIRE_STAGE, t.fireSlot);
-        else fx.setDamageFire(null, 0, t.fireSlot);
+        if (t.haze.visible) {
+          fx.plume(smokeAt, dt * 0.85 * k);
+          fx.setDamageFire(smokeAt, FIRE_STAGE, t.fireSlot, k);
+        } else {
+          fx.setDamageFire(null, 0, t.fireSlot);
+        }
       }
       for (let i = sheets.length - 1; i >= 0; i--) {
         const s = sheets[i];
@@ -307,8 +324,10 @@ export async function buildTrucks(scene, { RAPIER, world }) {
       sheets.length = 0;
       for (const t of live) {
         t.dead = false;
+        t.burnT = 0;
         t.ruin.visible = false;
         t.haze.visible = false;
+        t.haze.userData.heatStrength.value = t.hazeBase;
         t.lod = -2;
         fx?.setDamageFire(null, 0, t.fireSlot);
         setLod(t, 0);

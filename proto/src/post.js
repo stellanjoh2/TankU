@@ -39,7 +39,7 @@ export function createPost(renderer, scene, camera) {
   // 0 = rectilinear. Higher bulges the center. Corner scale keeps samples in-frame.
   const uFisheye = uniform(0.5);
   // Finish uniforms. Same .value objects the Visuals sliders write.
-  const uAberration = uniform(0.0012);
+  const uAberration = uniform(0);
   const uTime = uniform(0);
   const uGrain = uniform(0.035);
   const uGrainScale = uniform(1);

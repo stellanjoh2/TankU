@@ -11,14 +11,15 @@ const LOD_EDGES = [45, 100];
 const LOD_LEVELS = LOD_EDGES.length + 1;
 const CULL_DIST = 240;
 
+const SCALE = 1.1;            // model is the 10.5 m hull; this is the in-world size
 const SHORE_MIN = 5;          // no hull point closer than this (m)
 const OFFSHORE_MAX = 42;      // stay a coastal scout, not a blue-water wanderer
 const BRIDGE_PAD = 6;
-const HX = 5.25;              // half-length
-const HZ = 1.48;              // half-beam
-const HY = 1.55;              // collider half-height about the waterline (covers cabin / MG)
-const BOW = 5.2;
-const STERN = 5.4;
+const HX = 5.25 * SCALE;      // half-length
+const HZ = 1.48 * SCALE;      // half-beam
+const HY = 1.55 * SCALE;      // collider half-height about the waterline (covers cabin / MG)
+const BOW = 5.2 * SCALE;
+const STERN = 5.4 * SCALE;
 
 const CRUISE = 6.4;           // m/s
 const TURN = 1.05;            // hull rad/s — always smoothed, never snapped
@@ -27,13 +28,17 @@ const TURRET_PITCH = THREE.MathUtils.degToRad(25);
 const PITCH_MIN = THREE.MathUtils.degToRad(-8);
 const PITCH_MAX = THREE.MathUtils.degToRad(18);
 const SIGHT = 115;
-const EYE_H = 2.16;           // turret roof
+const EYE_H = 2.16 * SCALE;   // turret roof
 const TANK_HULL_H = 1.3;
 const TANK_EYE_H = 2.3;
 const LOSE_T = 2.4;
 const FIRE_SLOT0 = 4;
 const SINK_T = 7.5;
-const SINK_DEPTH = 4.4;
+const SINK_DEPTH = 4.4 * SCALE;
+const SINK_GONE = 60;         // a minute after the kill the wreck is gone
+const SINK_SLIDE = 8;         // final drop through the sea floor
+// Terrain sea floor sits 5.5 m under the waterline. Bury the cabin with it.
+const SINK_FLOOR = 5.5 + 3.4;
 // Same brake-light red as Tank.flashHit.
 const HIT_RGB = [1.0, 0.04, 0.02];
 const HIT_GLOW = 18;
@@ -237,6 +242,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
 
   const root = new THREE.Group();
   root.name = name;
+  root.scale.setScalar(SCALE);
 
   const hullPivot = new THREE.Group();
   hullPivot.name = 'Hull';
@@ -274,7 +280,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
   );
   world.createCollider(
     RAPIER.ColliderDesc.cuboid(HX, HY, HZ)
-      .setTranslation(0, 0.85, 0)
+      .setTranslation(0, 0.85 * SCALE, 0)
       .setFriction(0.4),
     body,
   );
@@ -305,6 +311,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     coolT: rnd(0.6, 1.4),
     sinkT: 0,
     sinkSign: 1,
+    gone: false,
     burned: false,
     hitFlashFrames: 0,
     thinkT: 0,
@@ -338,13 +345,13 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
 
   function blocked(x, z, yaw, dist) {
     const fx = fwdX(yaw), fz = fwdZ(yaw);
-    const ox = x + fx * (BOW - 0.4);
-    const oz = z + fz * (BOW - 0.4);
+    const ox = x + fx * (BOW - 0.4 * SCALE);
+    const oz = z + fz * (BOW - 0.4 * SCALE);
     ray.dir.x = fx;
     ray.dir.y = 0;
     ray.dir.z = fz;
     const reach = dist + 1.6;
-    for (const hy of [0.85, 2.05]) {
+    for (const hy of [0.85 * SCALE, 2.05 * SCALE]) {
       ray.origin.x = ox;
       ray.origin.y = WATER_Y + hy;
       ray.origin.z = oz;
@@ -360,7 +367,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     if (!poseOk(nx, nz, yaw)) return null;
     if (blocked(x, z, yaw, dist)) return null;
     for (const o of fleet) {
-      if (o !== boat && hullsOverlap(nx, nz, yaw, o, PASS_PAD)) return null;
+      if (o !== boat && !o.gone && hullsOverlap(nx, nz, yaw, o, PASS_PAD)) return null;
     }
     return { x: nx, z: nz };
   }
@@ -372,7 +379,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     let nearest = Infinity;
     const c = Math.cos(boat.yaw), s = Math.sin(boat.yaw);
     for (const o of fleet) {
-      if (o === boat) continue;
+      if (o === boat || o.gone) continue;
       const dx = o.x - boat.x, dz = o.z - boat.z;
       const dist = Math.hypot(dx, dz);
       if (dist > PASS_RANGE || dist < 1e-3) continue;
@@ -518,11 +525,11 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     const nextYaw = approachAngle(boat.yaw, target, TURN * dt);
     let yawClear = true;
     for (const o of fleet) {
-      if (o !== boat && hullsOverlap(boat.x, boat.z, nextYaw, o, PASS_PAD)) yawClear = false;
+      if (o !== boat && !o.gone && hullsOverlap(boat.x, boat.z, nextYaw, o, PASS_PAD)) yawClear = false;
     }
     if (yawClear) boat.yaw = nextYaw;
     const fitted = fitPose(boat.x, boat.z, boat.yaw);
-    if (fitted && !fleet.some((o) => o !== boat && hullsOverlap(fitted.x, fitted.z, boat.yaw, o, PASS_PAD))) {
+    if (fitted && !fleet.some((o) => o !== boat && !o.gone && hullsOverlap(fitted.x, fitted.z, boat.yaw, o, PASS_PAD))) {
       boat.x = fitted.x;
       boat.z = fitted.z;
     }
@@ -617,11 +624,31 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     setLod(0);
   }
 
+  function finishSink(fx) {
+    if (boat.gone) return;
+    boat.gone = true;
+    setLod(-1);
+    root.visible = false;
+    wake.group.visible = false;
+    fx?.setDamageFire(null, 0, fireSlot);
+    body.setEnabled(false);
+  }
+
   function updateSink(dt, fx) {
+    if (boat.gone) return;
     boat.sinkT += dt;
+    if (boat.sinkT >= SINK_GONE) {
+      finishSink(fx);
+      return;
+    }
     const k = THREE.MathUtils.clamp(boat.sinkT / SINK_T, 0, 1);
     const ease = k * k * (3 - 2 * k);
-    const y = WATER_Y - ease * SINK_DEPTH;
+    let drop = ease * SINK_DEPTH;
+    if (boat.sinkT > SINK_GONE - SINK_SLIDE) {
+      const u = (boat.sinkT - (SINK_GONE - SINK_SLIDE)) / SINK_SLIDE;
+      drop = SINK_DEPTH + (SINK_FLOOR - SINK_DEPTH) * u * u;
+    }
+    const y = WATER_Y - drop;
     _e.set(ease * 0.18, boat.yaw, boat.sinkSign * ease * 0.85, 'YXZ');
     _q.setFromEuler(_e);
     body.setNextKinematicTranslation({ x: boat.x, y, z: boat.z });
@@ -666,6 +693,9 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     boat.burstT = 0;
     boat.coolT = rnd(0.6, 1.4);
     boat.sinkT = 0;
+    boat.gone = false;
+    root.visible = true;
+    if (!body.isEnabled()) body.setEnabled(true);
     boat.thinkT = 0;
     boat.stuckT = 0;
     boat.broadside = 0;
@@ -762,6 +792,11 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
       return ping ?? null;
     },
     updateLod(camPos) {
+      if (boat.gone) {
+        setLod(-1);
+        wake.group.visible = false;
+        return;
+      }
       const d = root.position.distanceTo(camPos);
       const pad = CULL_DIST * lodScale * 0.05;
       const cull = CULL_DIST * lodScale + (lod === -1 ? -pad : pad);

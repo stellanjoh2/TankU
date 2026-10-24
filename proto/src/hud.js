@@ -14,7 +14,9 @@ export function createHud() {
     <div class="hit hidden" data-who="player-hit"><span>HIT</span><div class="hit-bar"><i></i></div><b>100%</b></div>
     <div class="nitro" data-who="nitro"><span>NITRO</span><div class="nitro-bar"><i></i></div><b>100%</b></div>
     <div class="reload hidden" data-who="reload"><span>RELOAD</span><div class="reload-bar"><i></i></div><b>0.0s</b></div>
+    <div class="overheat hidden" data-who="overheat"><span>HEAT</span><div class="overheat-bar"><i></i></div><b>0.0s</b></div>
     <div class="gadget" data-who="gadget"><span>GADGET</span><b>1 SMOKE</b></div>
+    <div class="pickup" data-who="pickup"><span>PICKUP IN</span><b>2:00</b></div>
     <div class="hp enemy" data-who="enemy"><span>ENEMY</span><div class="hp-bar"><i></i></div><b>100%</b></div>
     <div class="hp enemy" data-who="enemy2"><span>ENEMY 2</span><div class="hp-bar"><i></i></div><b>100%</b></div>
     <div class="hit hidden" data-who="enemy-hit"><span>HIT</span><div class="hit-bar"><i></i></div><b>100%</b></div>
@@ -22,6 +24,8 @@ export function createHud() {
   const banner = document.createElement('div');
   banner.id = 'banner';
   banner.className = 'hidden';
+  const BANNER_FADE = 0.4;
+  let bannerTimer = null; // { t, fading } while a callout should dismiss itself
   const flash = document.createElement('div');
   flash.id = 'hit-flash';
   const dirRoot = document.createElement('div');
@@ -44,7 +48,9 @@ export function createHud() {
     enemies: [...root.querySelectorAll('.hp.enemy')],
     nitro: root.querySelector('[data-who="nitro"]'),
     reload: root.querySelector('[data-who="reload"]'),
+    overheat: root.querySelector('[data-who="overheat"]'),
     gadget: root.querySelector('[data-who="gadget"]'),
+    pickup: root.querySelector('[data-who="pickup"]'),
     repair: root.querySelector('[data-who="repair"]'),
     playerHit: root.querySelector('[data-who="player-hit"]'),
     enemyHit: root.querySelector('[data-who="enemy-hit"]'),
@@ -87,6 +93,28 @@ export function createHud() {
       setHitRow(rows.playerHit, player, playerSmoke);
       setHitRow(rows.enemyHit, enemy ?? 1, enemySmoke);
     },
+    /**
+     * Roof-gun heat 0..1. Hidden when cold.
+     * While firing, the number is seconds until cook-off. While locked, seconds of cooldown left.
+     */
+    setOverheat(heat, lock, heatTime, firing = false) {
+      const row = rows.overheat;
+      const on = heat > 0.03 || lock > 0.05;
+      row.classList.toggle('hidden', !on);
+      row.classList.toggle('locked', lock > 0.05);
+      if (!on) return;
+      row.querySelector('i').style.width = `${Math.round(Math.max(0, Math.min(1, heat)) * 100)}%`;
+      if (lock > 0.05) {
+        row.querySelector('span').textContent = 'COOL';
+        row.querySelector('b').textContent = `${lock.toFixed(1)}s`;
+      } else if (firing) {
+        row.querySelector('span').textContent = 'HEAT';
+        row.querySelector('b').textContent = `${Math.max(0, (1 - heat) * heatTime).toFixed(1)}s`;
+      } else {
+        row.querySelector('span').textContent = 'HEAT';
+        row.querySelector('b').textContent = `${Math.round(heat * 100)}%`;
+      }
+    },
     /** Seconds left on the main gun. Hidden when the gun is ready. */
     setReload(remaining, total) {
       const on = remaining > 0.05 && total > 0;
@@ -102,6 +130,13 @@ export function createHud() {
       rows.nitro.querySelector('b').textContent = `${pct}%`;
       rows.nitro.classList.toggle('empty', pct <= 0);
       rows.nitro.classList.toggle('active', !!active);
+    },
+    /** Seconds until the next supply drop. Shown as m:ss. */
+    setPickup(seconds) {
+      const s = Math.max(0, Math.ceil(seconds));
+      const m = Math.floor(s / 60);
+      const r = s % 60;
+      rows.pickup.querySelector('b').textContent = `${m}:${String(r).padStart(2, '0')}`;
     },
     /**
      * Active gadget slot (1 smoke / 2 air / 3 repair).
@@ -136,8 +171,13 @@ export function createHud() {
       for (const row of rows.enemies) row.classList.toggle('hidden', !on);
       if (!on) rows.enemyHit.classList.add('hidden');
     },
-    banner(title, sub = '', tone = 'win') {
-      banner.classList.remove('in', 'win', 'lose');
+    /**
+     * Round callout. `hold` > 0 dismisses itself (remaining-enemy notices);
+     * 0 stays up until the next banner() (win / lose).
+     */
+    banner(title, sub = '', tone = 'win', hold = 0) {
+      banner.classList.remove('in', 'out', 'win', 'lose');
+      bannerTimer = null;
       if (!title) {
         banner.classList.add('hidden');
         banner.innerHTML = '';
@@ -148,6 +188,7 @@ export function createHud() {
       banner.innerHTML = `<div class="banner-inner"><strong>${title}</strong>${sub ? `<span>${sub}</span>` : ''}</div>`;
       void banner.offsetWidth;
       banner.classList.add('in');
+      if (hold > 0) bannerTimer = { t: hold, fading: false };
     },
     flash() {
       flash.classList.remove('on');
@@ -170,6 +211,21 @@ export function createHud() {
     },
     /** Per frame: re-aim the markers relative to the camera's heading and fade them out. */
     update(dt, camera) {
+      if (bannerTimer) {
+        bannerTimer.t -= dt;
+        if (!bannerTimer.fading && bannerTimer.t <= 0) {
+          banner.classList.remove('in');
+          banner.classList.add('out');
+          bannerTimer.fading = true;
+          bannerTimer.t = BANNER_FADE + bannerTimer.t;
+        }
+        if (bannerTimer?.fading && bannerTimer.t <= 0) {
+          bannerTimer = null;
+          banner.classList.add('hidden');
+          banner.classList.remove('out', 'win', 'lose');
+          banner.innerHTML = '';
+        }
+      }
       if (!hitDirs.length) return;
       const e = camera.matrixWorld.elements;
       const fx = -e[8], fz = -e[10], fl = Math.hypot(fx, fz) || 1;

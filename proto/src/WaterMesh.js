@@ -70,12 +70,16 @@ class WaterMesh extends Mesh {
 
 		const reflection = normalize( reflect( this.sunDirection.negate(), surfaceNormal ) );
 		const direction = max( 0.0, dot( eyeDirection, reflection ) );
-		const specularLight = pow( direction, 100 ).mul( this.sunColor ).mul( 2.0 );
+		// Wider than the stock pow(100) glint so the highlight shimmers instead of popping pixels.
+		const specularLight = pow( direction, 48 ).mul( this.sunColor ).mul( 2.0 );
 		const diffuseLight = max( dot( this.sunDirection, surfaceNormal ), 0.0 ).mul( this.sunColor ).mul( 0.5 );
 
 		const distance = length( worldToEye );
 
-		const distortion = surfaceNormal.xz.mul( float( 0.001 ).add( float( 1.0 ).div( distance ) ) ).mul( this.distortionScale );
+		// The 1/distance term is a screen-space UV kick. Uncapped it is huge on
+		// nearby water and changes every frame while driving, which swims the mirror.
+		const distortionDistance = max( distance, float( 40.0 ) );
+		const distortion = surfaceNormal.xz.mul( float( 0.001 ).add( float( 1.0 ).div( distortionDistance ) ) ).mul( this.distortionScale );
 
 		// Opaque scene depth vs water surface → contact / shallow masks.
 		const sceneViewZ = perspectiveDepthToViewZ( viewportDepthTexture(), cameraNear, cameraFar );
@@ -95,9 +99,11 @@ class WaterMesh extends Mesh {
 
 		material.colorNode = Fn( () => {
 
-			const mirrorSampler = reflector();
+			const mirrorSampler = reflector( { generateMipmaps: true } );
 			mirrorSampler.uvNode = mirrorSampler.uvNode.add( distortion );
 			mirrorSampler.reflector.resolutionScale = this.resolutionScale;
+			// Sample one mip soft so horizon and prop edges don't crawl while the camera moves.
+			const mirror = mirrorSampler.bias( float( 1.0 ) );
 
 			this.add( mirrorSampler.target );
 
@@ -108,7 +114,7 @@ class WaterMesh extends Mesh {
 			// Turquoise absorption near contact; keep reflections in deep water.
 			const tint = mix( this.waterColor, this.shallowColor, shallow.mul( shallow ) );
 			const scatter = max( 0.0, dot( surfaceNormal, eyeDirection ) ).mul( tint );
-			const deepAlbedo = mix( this.sunColor.mul( diffuseLight ).mul( 0.3 ).add( scatter ), mirrorSampler.rgb.add( specularLight ), reflectance );
+			const deepAlbedo = mix( this.sunColor.mul( diffuseLight ).mul( 0.3 ).add( scatter ), mirror.rgb.add( specularLight ), reflectance );
 			const shoreAlbedo = mix( deepAlbedo, tint, shallow.mul( 0.65 ) );
 			const foamColor = vec3( 0.92, 0.96, 0.98 );
 

@@ -162,6 +162,17 @@ const DAMAGE_FIRE_URL = './textures/vfx/fire.gif';
 // Steps: 25% / 50% / 75% damage, then the wreck.
 const DAMAGE_FIRE_SCALE = [0, 2.1, 3.6, 5.3, 7.6];
 const DAMAGE_FIRE_SPEED = 2.25;
+/** Destroyed tank / truck: full burn, then a short fade, then the wreck is cold. */
+export const WRECK_FIRE_LIFE = 60;
+const WRECK_FIRE_FADE = 8;
+
+/** 1 while the wreck is fully alight, 0 once the fire is out (~1 min). */
+export function wreckFireFade(age) {
+  if (age >= WRECK_FIRE_LIFE) return 0;
+  const hold = WRECK_FIRE_LIFE - WRECK_FIRE_FADE;
+  if (age <= hold) return 1;
+  return (WRECK_FIRE_LIFE - age) / WRECK_FIRE_FADE;
+}
 
 /** Right-hand side of a barrel dir (world +Y up). */
 function gunRight(dir, out) {
@@ -482,25 +493,30 @@ export class Effects {
       frame: -1,
       acc: 0,
     };
-    const mat = emissiveSpriteMat(map, new THREE.Color(1.15, 1.15, 1.15), {});
-    // Additive: dark smoke adds nothing, so it doesn't sit on the scene as a black blob.
-    // SrcAlpha keeps the gif's mask. Leave the frame's alpha alone so the card doesn't stamp a square.
-    mat.blending = THREE.CustomBlending;
-    mat.blendEquation = THREE.AddEquation;
-    mat.blendSrc = THREE.SrcAlphaFactor;
-    mat.blendDst = THREE.OneFactor;
-    mat.blendEquationAlpha = THREE.AddEquation;
-    mat.blendSrcAlpha = THREE.ZeroFactor;
-    mat.blendDstAlpha = THREE.OneFactor;
-    mat.opacityNode = texture(map).a;
     // Shared gif clip. 0 player, 1 + 6 enemy tanks, 2–3 trucks, 4–5 boats.
+    // Own material per slot so a dying wreck can fade without dimming the others.
     const FIRE_SLOTS = 7;
     fire.sprites = Array.from({ length: FIRE_SLOTS }, () => {
+      const fadeU = uniform(1);
+      const mat = emissiveSpriteMat(map, new THREE.Color(1.15, 1.15, 1.15), {});
+      // Additive: dark smoke adds nothing, so it doesn't sit on the scene as a black blob.
+      // SrcAlpha keeps the gif's mask. Leave the frame's alpha alone so the card doesn't stamp a square.
+      mat.blending = THREE.CustomBlending;
+      mat.blendEquation = THREE.AddEquation;
+      mat.blendSrc = THREE.SrcAlphaFactor;
+      mat.blendDst = THREE.OneFactor;
+      mat.blendEquationAlpha = THREE.AddEquation;
+      mat.blendSrcAlpha = THREE.ZeroFactor;
+      mat.blendDstAlpha = THREE.OneFactor;
+      const sample = texture(map);
+      mat.emissiveNode = sample.rgb.mul(mat.userData.emissiveUniform).mul(fadeU);
+      mat.opacityNode = sample.a.mul(fadeU);
       const sprite = new THREE.Sprite(mat);
       sprite.center.set(0.5, 0.02);
       sprite.visible = false;
       sprite.frustumCulled = false;
       sprite.renderOrder = 2;
+      sprite.userData.fireFade = fadeU;
       this.scene.add(sprite);
       return sprite;
     });
@@ -1335,23 +1351,35 @@ export class Effects {
     }
   }
 
-  /** Fire gif. slot 0 = player, 1 = enemy, 2+ = props. stage 0 hides; 1–4 grow with damage. */
-  setDamageFire(pos, stage, slot = 0) {
+  /** Fire gif. slot 0 = player, 1 = enemy, 2+ = props. stage 0 hides; 1–4 grow with damage. `fade` is 0..1. */
+  setDamageFire(pos, stage, slot = 0, fade = 1) {
     const sprite = this.damageFire?.sprites[slot];
     if (!sprite) return;
+    const k = fade > 0 ? fade : 0;
     const scale = DAMAGE_FIRE_SCALE[stage] ?? 0;
-    if (scale <= 0 || !pos) {
+    const u = sprite.userData.fireFade;
+    if (scale <= 0 || !pos || k <= 0.02) {
       sprite.visible = false;
+      if (u) u.value = 1;
       return;
     }
     sprite.visible = true;
     sprite.position.copy(pos);
+    if (u) u.value = k;
     sprite.scale.set(scale, scale, 1);
   }
 
-  /** True while any default fire-gif slot is showing (tanks, trucks, …). */
-  anyDamageFire() {
-    return !!this.damageFire?.sprites.some((s) => s.visible);
+  /** Metres to the nearest visible fire-gif, or Infinity when nothing is burning. */
+  nearestDamageFireDist(from) {
+    const sprites = this.damageFire?.sprites;
+    if (!sprites || !from) return Infinity;
+    let best = Infinity;
+    for (const s of sprites) {
+      if (!s.visible) continue;
+      const d = from.distanceTo(s.position);
+      if (d < best) best = d;
+    }
+    return best;
   }
 
   _blitDamageFire(frame) {

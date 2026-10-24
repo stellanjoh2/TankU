@@ -3,6 +3,7 @@
 import * as THREE from 'three';
 import { float, materialEmissive, mix, positionWorld, smoothstep, uniform, vec3 } from 'three/tsl';
 import { applyBurntMetal } from './burntMetal.js';
+import { createEngineHeatHaze } from './heatHaze.js';
 import { SMOKE_COOLDOWN } from './smoke.js';
 
 const MASS = 25500;          // a bit lighter → more playful pitch under throttle
@@ -11,6 +12,11 @@ const RAY_UP = 0.4;          // ray starts this far above each contact's resting
 const SAG = 0.10;            // static spring compression (softer = more bounce)
 const MU_LONG = 1.14;        // longitudinal grip; higher = harder launch
 const MU_SIDE = 0.64125;    // lateral grip; lower = more drift in a turn
+// Grip stays full on driveable ground, then fades so a rock shoulder sheds the hull
+// instead of the tracks parking on it. n·up: 0.88 ≈ 28°, 0.55 ≈ 57°.
+const GRIP_FLAT = 0.88;
+const GRIP_STEEP = 0.55;
+const GRIP_FLOOR = 0.15;
 const SPEED = { cruise: 9.5, boost: 15.4, reverse: 4.5, pivot: 4.6875, turn: 3.90625 };   // m/s
 // Nitro: 2 charges, then must fully refill. Envelope matches nitro_rev.wav (~2.31s, peak ~1s).
 const NITRO = {
@@ -35,12 +41,17 @@ const TRAVERSE_CATCHUP = 0.85;                      // extra × at large aim err
 const TRAVERSE_CATCHUP_AT = THREE.MathUtils.degToRad(40);
 const ELEVATE = THREE.MathUtils.degToRad(50);
 const ELEV_MIN = THREE.MathUtils.degToRad(-10);
-const ELEV_MAX = THREE.MathUtils.degToRad(25);
+const ELEV_MAX = THREE.MathUtils.degToRad(45);
 const MG_TRAVERSE = THREE.MathUtils.degToRad(90);
 const MG_ELEVATE = THREE.MathUtils.degToRad(60);
 const MG_ELEV_MIN = THREE.MathUtils.degToRad(-20);
 const MG_ELEV_MAX = THREE.MathUtils.degToRad(70);
 export const RELOAD = 4.0;
+// Roof .50. Continuous fire fills the bar in MG_HEAT_TIME. Barrel glow starts at 50% and ramps to cook-off.
+// A full bar locks the gun for MG_COOLDOWN (twice a main-gun reload). Letting go early bleeds.
+export const MG_HEAT_TIME = 6;
+export const MG_COOLDOWN = RELOAD * 2;
+const MG_HEAT_BLEED = 4.5;
 export const STRESS_MAX = 100;
 const STRESS_DECAY = 10;      // units/s back toward 0 after a hit
 const STRESS_MISS_MAX = 0.5;  // miss chance at full stress
@@ -111,6 +122,75 @@ function pointOnLoop({ segs, L }, d, outP) {
   const s = segs[lo];
   outP.copy(s.a).addScaledVector(s.t, d - s.s0);
   return s.t;
+}
+
+/** One step of roof-gun heat. `firing` is true for the step that cooks the barrel. */
+export function stepMgHeat(heat, lock, dt, trigger, alive) {
+  if (lock > 0) {
+    lock = Math.max(0, lock - dt);
+    if (lock > 0) return { heat: lock / MG_COOLDOWN, lock, firing: false };
+    heat = 0;
+  }
+  const firing = !!trigger && !!alive;
+  if (firing) {
+    heat = Math.min(1, heat + dt / MG_HEAT_TIME);
+    if (heat >= 0.999) {
+      heat = 1;
+      lock = MG_COOLDOWN;
+    }
+  } else if (heat > 0) {
+    heat = Math.max(0, heat - dt / MG_HEAT_BLEED);
+  }
+  return { heat, lock, firing };
+}
+
+// Jacket + tube + muzzle brake sit forward of the receiver, on the bore (local +X).
+function isMgBarrelCentroid(x, y, z) {
+  return x >= 0.18 && y > 0.3 && y < 0.6 && Math.abs(z) < 0.1;
+}
+
+/** Triangles whose centroid passes `keep`, attributes copied so normals stay smooth. */
+function takeTriangles(geo, keep) {
+  const index = geo.getIndex();
+  const pos = geo.getAttribute('position');
+  if (!pos) return null;
+  const triCount = (index ? index.count : pos.count) / 3;
+  const kept = [];
+  for (let t = 0; t < triCount; t++) {
+    const i0 = index ? index.getX(t * 3) : t * 3;
+    const i1 = index ? index.getX(t * 3 + 1) : t * 3 + 1;
+    const i2 = index ? index.getX(t * 3 + 2) : t * 3 + 2;
+    const x = (pos.getX(i0) + pos.getX(i1) + pos.getX(i2)) / 3;
+    const y = (pos.getY(i0) + pos.getY(i1) + pos.getY(i2)) / 3;
+    const z = (pos.getZ(i0) + pos.getZ(i1) + pos.getZ(i2)) / 3;
+    if (keep(x, y, z)) kept.push(i0, i1, i2);
+  }
+  if (!kept.length) return null;
+  const map = new Map();
+  const seq = [];
+  const newIndex = new Uint32Array(kept.length);
+  for (let i = 0; i < kept.length; i++) {
+    const vi = kept[i];
+    let n = map.get(vi);
+    if (n === undefined) {
+      n = seq.length;
+      map.set(vi, n);
+      seq.push(vi);
+    }
+    newIndex[i] = n;
+  }
+  const out = new THREE.BufferGeometry();
+  for (const name of Object.keys(geo.attributes)) {
+    const attr = geo.getAttribute(name);
+    const item = attr.itemSize;
+    const arr = new attr.array.constructor(seq.length * item);
+    for (let i = 0; i < seq.length; i++) {
+      for (let k = 0; k < item; k++) arr[i * item + k] = attr.getComponent(seq[i], k);
+    }
+    out.setAttribute(name, new THREE.BufferAttribute(arr, item, attr.normalized));
+  }
+  out.setIndex(new THREE.BufferAttribute(newIndex, 1));
+  return out;
 }
 
 function approachAngle(cur, target, maxStep) {
@@ -288,6 +368,10 @@ export class Tank {
     this.recoilDistance = 0.2;
     this.muzzleLocal = new THREE.Vector3(...(this.barrel.userData.muzzle_local ?? [2.44, 0, 0]));
     this.mgMuzzleLocal = MG_MUZZLE_LOCAL.clone();
+    this.mgHeat = 0;       // 0..1, barrel glow and heat shimmer
+    this.mgLock = 0;       // s left on a cook-off; gun won't fire
+    this.mgFiring = false;
+    this._installMgHeat();
 
     // antenna: x = lean towards turret +X (forward), y = towards turret +Z
     this.antennaBones = ANT_SHARE.map((_, i) => node(`Antenna_${i}`));
@@ -314,12 +398,19 @@ export class Tank {
       .setLinearDamping(0.04).setAngularDamping(0.48).setCanSleep(false);
     this.body = world.createRigidBody(rb);
     const hx = 2.9, hy = 0.7, hz = 1.62;
+    const hullRound = 0.22; // eased corners; outer size stays hx/hy/hz
     const I = (a, b) => (MASS / 12) * (a * a + b * b);
-    // COM raised + slightly aft so forward drive lifts the nose a little (arcade weight transfer)
-    world.createCollider(RAPIER.ColliderDesc.cuboid(hx, hy, hz).setTranslation(0, 1.25, 0)
-      .setFriction(0.5)
-      .setMassProperties(MASS, { x: -0.28, y: 0.45, z: 0 },
-        { x: I(2 * hy, 2 * hz) * ROLL_I_SCALE, y: I(2 * hx, 2 * hz), z: I(2 * hx, 2 * hy) * 0.88 }, { x: 0, y: 0, z: 0, w: 1 }), this.body);
+    // COM raised + slightly aft so forward drive lifts the nose a little (arcade weight transfer).
+    // Low friction (Min vs the other shape) so the belly slides off a rock instead of hanging on it.
+    world.createCollider(
+      RAPIER.ColliderDesc.roundCuboid(hx - hullRound, hy - hullRound, hz - hullRound, hullRound)
+        .setTranslation(0, 1.25, 0)
+        .setFriction(0.12)
+        .setFrictionCombineRule(RAPIER.CoefficientCombineRule.Min)
+        .setMassProperties(MASS, { x: -0.28, y: 0.45, z: 0 },
+          { x: I(2 * hy, 2 * hz) * ROLL_I_SCALE, y: I(2 * hx, 2 * hz), z: I(2 * hx, 2 * hy) * 0.88 }, { x: 0, y: 0, z: 0, w: 1 }),
+      this.body,
+    );
     // Intact turret volume — disabled while the wreck turret flies so they don't explode apart.
     this.turretCollider = world.createCollider(
       RAPIER.ColliderDesc.cylinder(0.45, 1.05).setTranslation(-0.16, 2.4, 0)
@@ -625,13 +716,18 @@ export class Tank {
       c.load = Fs;
       grounded++;
 
+      const face = n.x * up.x + n.y * up.y + n.z * up.z;
+      const steep = smooth01((GRIP_FLAT - face) / (GRIP_FLAT - GRIP_STEEP));
+      const grip = 1 - steep * (1 - GRIP_FLOOR);
       tf.copy(fwd).addScaledVector(n, -fwd.dot(n)).normalize();
       ts.crossVectors(n, tf).normalize();
       const vLong = vel.x * tf.x + vel.y * tf.y + vel.z * tf.z;
       const vSide = vel.x * ts.x + vel.y * ts.y + vel.z * ts.z;
       const tgt = target[c.side.side];
-      const Fl = THREE.MathUtils.clamp(this.KD * (tgt - vLong), -MU_LONG * Fs, MU_LONG * Fs);
-      const Fsd = THREE.MathUtils.clamp(-this.KS * vSide, -MU_SIDE * Fs, MU_SIDE * Fs);
+      const muL = MU_LONG * grip * Fs;
+      const muS = MU_SIDE * grip * Fs;
+      const Fl = THREE.MathUtils.clamp(this.KD * (tgt - vLong), -muL, muL);
+      const Fsd = THREE.MathUtils.clamp(-this.KS * vSide, -muS, muS);
       sideLong[c.side.side][0] += vLong;
       sideLong[c.side.side][1]++;
 
@@ -851,6 +947,11 @@ export class Tank {
     }
   }
 
+  /** Green hull band, same sweep as a finished repair. */
+  showHeal() {
+    if (this._repairU) this._sweep = 0;
+  }
+
   /** Two-frame red emissive flash (same red as taillights / bloom). */
   flashHit() {
     this.hitFlashFrames = 2;
@@ -870,6 +971,91 @@ export class Tank {
         m.emissiveIntensity = 1;
       }
     }
+  }
+
+  /**
+   * Orange emissive on the barrel tube only. Receiver and ammo can keep the shared metal.
+   * The .50 is one mesh, so the jacket / tube / muzzle triangles are split onto their own material.
+   */
+  _installMgHeat() {
+    this._mgHeatMats = [];
+    const targets = [];
+    this.mg.traverse((o) => {
+      if (!o.isMesh || Array.isArray(o.material)) return;
+      if (o.material?.name === 'M_Metal_Dark') targets.push(o);
+    });
+    for (const o of targets) {
+      const barrelGeo = takeTriangles(o.geometry, isMgBarrelCentroid);
+      const bodyGeo = takeTriangles(o.geometry, (x, y, z) => !isMgBarrelCentroid(x, y, z));
+      if (!barrelGeo || !bodyGeo) {
+        barrelGeo?.dispose();
+        bodyGeo?.dispose();
+        continue;
+      }
+      const heatMat = o.material.clone();
+      heatMat.emissive = new THREE.Color(0, 0, 0);
+      heatMat.emissiveIntensity = 1;
+      heatMat.emissiveNode = null;
+      this._mgHeatMats.push(heatMat);
+      this.flashMats.push(heatMat);
+      const barrel = new THREE.Mesh(barrelGeo, heatMat);
+      barrel.name = 'MG50_Barrel';
+      barrel.castShadow = o.castShadow;
+      barrel.receiveShadow = o.receiveShadow;
+      o.add(barrel);
+      const old = o.geometry;
+      o.geometry = bodyGeo;
+      old.dispose();
+    }
+
+    this.mgHaze = createEngineHeatHaze({
+      local: new THREE.Vector3(1.08, 0.92, 0),
+      width: 0.95,
+      height: 1.35,
+      strength: 0,
+    });
+    this.mgHaze.name = 'MGHeatHaze';
+    this.mgHaze.userData.skipLod = true;
+    this.mgHaze.visible = false;
+    this.mg.add(this.mgHaze);
+  }
+
+  /**
+   * Advance roof-gun heat. `trigger` is the held fire button (already gated on pause / death).
+   * Returns whether a round should actually leave the barrel this frame.
+   */
+  tickMg(dt, trigger) {
+    const s = stepMgHeat(this.mgHeat, this.mgLock, dt, trigger, this.alive);
+    this.mgHeat = s.heat;
+    this.mgLock = s.lock;
+    this.mgFiring = s.firing;
+    this._syncMgHeatVisual(s.firing);
+    return s.firing;
+  }
+
+  _syncMgHeatVisual(firing) {
+    const h = this.mgHeat;
+    // Cold until halfway, then a straight ramp to full orange at cook-off.
+    const glow = h <= 0.5 ? 0 : (h - 0.5) / 0.5;
+    const hot = glow > 0.02;
+    for (const m of this._mgHeatMats) {
+      if (this.hitFlashFrames > 0) break;
+      if (hot) {
+        m.emissive.setRGB(1, 0.28, 0.02);
+        m.emissiveIntensity = glow * 36;
+      } else {
+        m.emissive.setRGB(0, 0, 0);
+        m.emissiveIntensity = 1;
+      }
+    }
+    const haze = this.mgHaze;
+    if (!haze) return;
+    const k = firing ? Math.max(h, 0.45) : (h > 0.05 ? h : 0);
+    const show = this.alive && k > 0.03;
+    haze.visible = show;
+    if (!show) return;
+    haze.userData.heatStrength.value = 0.02 * k;
+    haze.scale.setScalar(0.75 + 0.45 * h);
   }
 
   muzzle() {
@@ -952,6 +1138,10 @@ export class Tank {
     this.reload = 0;
     this.reloadDone = false;
     this.recoilT = 1;
+    this.mgHeat = 0;
+    this.mgLock = 0;
+    this.mgFiring = false;
+    this._syncMgHeatVisual(false);
     this.prevVel = null;
     this.hp = this.maxHp;
     this.stress = 0;

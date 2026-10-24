@@ -17,6 +17,7 @@
 // + repair wrench (Sounds/591528__rudmer_rotteveel__ratchet-wrench-slow-multiple.wav).
 // + repair complete (Sounds/242501__gabrielaraujo__powerupsuccess.wav).
 // + victory fanfare (Sounds/161984__robinhood76__03599-majestic-foreboding-fanfare.wav).
+// + C-47 supply pass (Sounds/515293__breviceps__propeller-plane.wav, +5 dB).
 const SHOT_URLS = [
   './sounds/tank_shot_1.wav',
   './sounds/tank_shot_2.wav',
@@ -30,6 +31,8 @@ const MG_CLANK_URL = './sounds/mg_metal_clank.wav';
 const P51_PASS_URL = './sounds/p51_pass.wav';
 const P51_MG_URL = './sounds/p51_mg.wav';
 const P51_ORBIT_URL = './sounds/p51_orbit.wav';
+const C47_URL = './sounds/515293__breviceps__propeller-plane.wav';
+const C47_DB = Math.pow(10, 5 / 20); // +5 dB
 const P51_ORBIT_VOL = 0.55 * Math.pow(10, 10 / 20); // +10 dB; peak when overhead / very close
 const DIRT_THUMP_URL = './sounds/dirt_thump.wav';
 const MG_BASS_URL = './sounds/mg_bass_thump.wav';
@@ -61,6 +64,8 @@ const RELOAD_URL = './sounds/418882__kierankeegan__tank-reload.wav';
 const RELOAD_DB = Math.pow(10, 5 / 20); // +5 dB
 const FIRE_URL = './sounds/fire_loop.wav';
 const FIRE_VOL = 0.62; // sample already +2 dB vs source
+/** Burn loop is silent past this. Squared falloff, same as other world sounds. */
+export const FIRE_HEAR = 70;
 const MUSIC_VOL_DEFAULT = 0.35; // ~25% above prior 0.28
 // Base rate (+20% vs sample); L/R offset ~1.5 semitones each way
 const TURRET_BASE = 1.2;
@@ -114,6 +119,7 @@ export class Sfx {
     this.p51PassBuf = null;
     this.p51MgBuf = null;
     this.p51OrbitBuf = null;
+    this.c47Buf = null;
     this.dirtThumpBuf = null;
     this.mgBassBuf = null;
     this.smokeBombBuf = null;
@@ -167,6 +173,7 @@ export class Sfx {
     this._musicDuckTarget = 1;
     this._fanfare = null;
     this._repair = null;
+    this._c47 = null;
   }
 
   async load() {
@@ -176,7 +183,7 @@ export class Sfx {
       const res = await fetch(url);
       return this.ctx.decodeAudioData(await res.arrayBuffer());
     };
-    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, p51Pass, p51Mg, p51Orbit, dirtThump, mgBass, smokeBomb, flyby, repair, repairDone, fanfare] = await Promise.all([
+    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, p51Pass, p51Mg, p51Orbit, c47, dirtThump, mgBass, smokeBomb, flyby, repair, repairDone, fanfare] = await Promise.all([
       Promise.all(SHOT_URLS.map(decode)),
       decode(ENGINE_URL),
       decode(MG50_URL),
@@ -190,6 +197,7 @@ export class Sfx {
       decode(P51_PASS_URL),
       decode(P51_MG_URL),
       decode(P51_ORBIT_URL),
+      decode(C47_URL),
       decode(DIRT_THUMP_URL),
       decode(MG_BASS_URL),
       decode(SMOKE_BOMB_URL),
@@ -211,6 +219,7 @@ export class Sfx {
     this.p51PassBuf = p51Pass;
     this.p51MgBuf = p51Mg;
     this.p51OrbitBuf = p51Orbit;
+    this.c47Buf = c47;
     this.dirtThumpBuf = dirtThump;
     this.mgBassBuf = mgBass;
     this.smokeBombBuf = smokeBomb;
@@ -487,13 +496,45 @@ export class Sfx {
     this._p51OrbitGain = g;
   }
 
-  /** Default fire-gif burn loop (tanks, trucks, …). Call each frame while any slot is lit. */
-  setFire(on) {
-    this._fireWant = !!on;
-    if (on) {
+  /**
+   * Fire-gif burn loop (tanks, trucks, …). `gain` is 0..1 loudness at the listener
+   * (already distance-scaled). Call each frame.
+   */
+  setFire(gain = 0) {
+    const t = Math.max(0, Math.min(1, Number(gain) || 0));
+    this._fireWant = t;
+    if (t > 0.02) {
       this.unlock();
       this._ensureFire();
     }
+  }
+
+  /** Supply C-47 flyby. The clip is the whole pass; the crate drops at 15s. */
+  c47Pass() {
+    this.c47Stop();
+    if (!this.ready || !this.c47Buf) return;
+    this.unlock();
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.c47Buf;
+    const g = this.ctx.createGain();
+    g.gain.value = C47_DB;
+    src.connect(g).connect(this.ctx.destination);
+    this._active.add(src);
+    src.onended = () => {
+      this._active.delete(src);
+      if (this._c47 === src) this._c47 = null;
+    };
+    src.start();
+    this._c47 = src;
+  }
+
+  /** Cut the flyby when the round resets before the crate is gone. */
+  c47Stop() {
+    const src = this._c47;
+    if (!src) return;
+    this._c47 = null;
+    try { src.stop(); } catch (_) { /* already ended */ }
+    this._active.delete(src);
   }
 
   /** One-shot P-51 overhead pass — length drives the air-raid timeline. */
@@ -783,8 +824,9 @@ export class Sfx {
 
     this._ensureFire();
     if (this._fire && this._fireGain) {
-      const target = this._fireWant ? FIRE_VOL : 0;
-      this._fireVol = damp(this._fireVol, target, this._fireWant ? 6 : 4, dt);
+      const want = this._fireWant || 0;
+      const target = want * FIRE_VOL;
+      this._fireVol = damp(this._fireVol, target, want > 0.02 ? 6 : 4, dt);
       this._fireGain.gain.value = this._fireVol;
     }
 

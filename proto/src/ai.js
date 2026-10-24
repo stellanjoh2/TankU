@@ -860,11 +860,15 @@ export class TankAI {
   }
 
   /**
-   * Occasional .50 bursts while the main gun reloads — not every reload, short sprays
-   * when the roof gun is roughly on the player.
+   * .50 bursts while the main gun reloads — most windows are skipped.
+   * A committed spray holds until the barrel cooks or the main gun is loaded again.
    */
   _triggerMg(dt) {
     this.mgCool -= dt;
+    if (this.tank.mgLock > 0) {
+      this.mgBurstT = 0;
+      return;
+    }
     if (this.mgBurstT > 0) {
       this.mgBurstT -= dt;
       if (this.visible && this.enemy.alive && this.tank.reload > 0.15) this.wantsMg = true;
@@ -883,7 +887,7 @@ export class TankAI {
       this.mgCool = rnd(0.25, 0.6);
       return;
     }
-    this.mgBurstT = rnd(0.35, 0.85);
+    this.mgBurstT = Math.max(0.45, this.tank.reload);
     this.mgCool = rnd(1.4, 2.8);
     this.wantsMg = true;
   }

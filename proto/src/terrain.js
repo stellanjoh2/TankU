@@ -614,6 +614,7 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   // WebGPU ocean (three.js WaterMesh). Shore shelf stays on the terrain mesh; the floor is separate.
   const waterNormals = await loader.loadAsync('./textures/waternormals.jpg');
   waterNormals.wrapS = waterNormals.wrapT = THREE.RepeatWrapping;
+  waterNormals.anisotropy = 8;
   const water = new WaterMesh(
     new THREE.PlaneGeometry(SIZE * 6, SIZE * 6),
     {

@@ -16,11 +16,11 @@ import { createVisualsEditor } from './visuals.js';
 import { shadowTint, patchShadowTint } from './shadowTint.js';
 import { createCloudShadows } from './cloudShadows.js';
 import { Input } from './input.js';
-import { Tank, RELOAD, REPAIR_TIME } from './tank.js';
+import { Tank, RELOAD, REPAIR_TIME, MG_HEAT_TIME } from './tank.js';
 import { installTankLods, updateTankLod } from './tankLod.js';
-import { Effects } from './fx.js';
+import { Effects, wreckFireFade } from './fx.js';
 import { TankCamera } from './TankCamera.js';
-import { Sfx, distGain } from './sfx.js';
+import { Sfx, distGain, FIRE_HEAR } from './sfx.js';
 import { NavGrid } from './navgrid.js';
 import { TankAI, pickSpawn } from './ai.js';
 import { createMatch } from './match.js';
@@ -30,22 +30,33 @@ import { createAirSupport } from './airSupport.js';
 import { createDebug } from './debug.js';
 import { FreeFlight } from './freeflight.js';
 import { buildPlanes } from './planes.js';
+import { buildTransport } from './c47.js';
 import { buildShip } from './ship.js';
 import { buildBgIsland } from './bgIsland.js';
 import { buildWaterTower } from './watertower.js';
 import { buildBridge } from './bridge.js';
 import { buildFlag } from './flag.js';
 import { buildBarrels } from './barrels.js';
+import { createCrates } from './crates.js';
 import { buildTrucks } from './truck.js';
 import { buildPatrolBoat } from './patrolBoat.js';
 import { buildPebbles } from './pebbles.js';
 import { createEngineHeatHaze } from './heatHaze.js';
 import './style.css';
 
-const FIXED_DT = 1 / 120;
-const MAX_SUBSTEPS = 4;
+const FIXED_DT = 1 / 60;
+const MAX_SUBSTEPS = 2;
 const MAX_RENDER_W = 960;
 const MAX_RENDER_H = 540;
+
+/** Bake local matrices and stop recomputing them. Safe for scenery that never moves. */
+function freezeStatic(root) {
+  root.traverse((obj) => {
+    obj.updateMatrix();
+    obj.matrixAutoUpdate = false;
+  });
+  root.updateMatrixWorld(true);
+}
 
 /** 540p drawing buffer (960×540). The canvas stretches it to the window with bilinear filtering. */
 function renderPixelRatio() {
@@ -125,12 +136,12 @@ async function main() {
 
   const sun = new THREE.DirectionalLight(new THREE.Color(1.0, 0.93, 0.82), 3.2);
   sun.castShadow = true;
-  sun.shadow.mapSize.set(1024, 1024);
+  sun.shadow.mapSize.set(512, 512);
   Object.assign(sun.shadow.camera, { left: -SHADOW_EXTENT, right: SHADOW_EXTENT, top: SHADOW_EXTENT,
                                      bottom: -SHADOW_EXTENT, near: 1, far: 260 });
   sun.shadow.bias = -0.0004;
   sun.shadow.normalBias = 0.035;
-  sun.shadow.radius = 2.5;
+  sun.shadow.radius = 1;
   sun.shadow.intensity = 1;
   scene.add(sun, sun.target);
   const hemi = new THREE.HemisphereLight(new THREE.Color(0.55, 0.65, 0.85), new THREE.Color(0.32, 0.27, 0.18), 0.85);
@@ -148,11 +159,14 @@ async function main() {
   buildBgIsland(scene, terrain);
   buildProps(RAPIER, world, scene);
   const airfield = buildAirfield(RAPIER, world, scene);
+  freezeStatic(airfield.root);
   const port = buildPort(RAPIER, world, scene);
-  const [grass, vegetation, planes, , waterTower, flag, barrels, trucks, bridge, patrolBoat] = await Promise.all([
+  freezeStatic(port.root);
+  const [grass, vegetation, planes, transport, ship, waterTower, flag, barrels, trucks, bridge, patrolBoat] = await Promise.all([
     buildGrass(scene),
     buildVegetation(scene, { RAPIER, world }),
     buildPlanes(scene),
+    buildTransport(scene),
     buildShip(scene),
     buildWaterTower(scene, { RAPIER, world }),
     buildFlag(scene, { RAPIER, world }),
@@ -161,6 +175,8 @@ async function main() {
     buildBridge(scene, { RAPIER, world }),
     buildPatrolBoat(scene, { RAPIER, world }),
   ]);
+  freezeStatic(ship.root);
+  freezeStatic(bridge.root);
   await buildPebbles(scene, vegetation.pebbleAnchors, terrain.groundSets, terrain.palette.concrete);
 
   const loader = new GLTFLoader();
@@ -176,6 +192,7 @@ async function main() {
   const tank = new Tank(gltf, RAPIER, world, spawn, { wreck: wreckSrc, repairGlow: true });
   scene.add(tank.model);
   const heatHaze = createEngineHeatHaze();
+  const HEAT_HAZE = heatHaze.userData.heatStrength.value;
   heatHaze.visible = false;
   tank.model.add(heatHaze);
   const fx = new Effects(scene, RAPIER, world, tank.body, barrels.dynamic);
@@ -232,6 +249,18 @@ async function main() {
   });
   match.wireFx();
   const { game } = match;
+  const crates = createCrates({
+    scene, RAPIER, world, fx,
+    getPlayer: () => tank,
+    getTanks: () => [tank, ...foes.map((f) => f.tank)],
+    tryPickup: (kind) => kind === 'health' && match.healFull(tank),
+    transport,
+    onIncoming: () => {
+      sfx.c47Pass();
+      if (game.overT > 0) return;
+      hud.banner('Pickup Incoming', '', 'win', 3);
+    },
+  });
 
   function nearestLivingFoe() {
     let best = null;
@@ -399,6 +428,8 @@ async function main() {
   }
 
   onMatchRestart = ({ resetCam = true } = {}) => {
+    crates.reset();
+    sfx.c47Stop();
     sfx.repairStop();
     lookYaw = spawn.yaw;
     lookPitch = -0.08;
@@ -555,17 +586,10 @@ async function main() {
     // Soft lead: free within ±LEAD of the barrel; held turn slides the window
     // at traverse speed as the gun chases the reticle.
     lookYaw = wrapYaw(lookYaw - THREE.MathUtils.clamp(inp.aimX, -Math.PI, Math.PI));
-    lookPitch = THREE.MathUtils.clamp(lookPitch - inp.aimY, -0.75, 0.45);
+    lookPitch = THREE.MathUtils.clamp(lookPitch - inp.aimY, -0.75, THREE.MathUtils.degToRad(45));
     const gunYaw = turretAimYaw();
     if (gunYaw != null) {
       lookYaw = gunYaw + THREE.MathUtils.clamp(wrapYaw(lookYaw - gunYaw), -TURRET_CAM_LEAD, TURRET_CAM_LEAD);
-    }
-
-    if (inp.zoom) {
-      const k = 1 + inp.zoom * 0.08;
-      const d = THREE.MathUtils.clamp(tankCam.cfg.distanceMin * k, 4, 16);
-      tankCam.cfg.distanceMin = d;
-      tankCam.cfg.distanceMax = d;
     }
 
     // Camera lean from real turret motion (prev frame), not raw mouse delta.
@@ -615,6 +639,7 @@ async function main() {
     }
     hud.setNitro(tank.nitroCharge, tank.nitroActive);
     hud.setReload(tank.alive ? tank.reload : 0, RELOAD);
+    hud.setOverheat(tank.mgHeat, tank.mgLock, MG_HEAT_TIME, tank.mgFiring);
     const gadgetCd = activeGadget === 'smoke' ? tank.smokeCd : activeGadget === 'air' ? airSupport.cd : 0;
     hud.setGadget(activeGadget, gadgetCd, activeGadget === 'repair' ? {
       repairing: tank.repairing,
@@ -622,6 +647,7 @@ async function main() {
       charges: tank.repairs,
     } : null);
     hud.setRepair(tank.repairT, REPAIR_TIME);
+    hud.setPickup(crates.timeToDrop());
     // HIT% = stress jitter + smoke (−10% when either tank is in a cloud)
     const pPos = tank.position;
     const near = game.solo ? null : nearestLivingFoe();
@@ -666,34 +692,45 @@ async function main() {
     return 3;
   }
 
-  function setTankFire(t, stage) {
+  function setTankFire(t, stage, fade = 1) {
     const slot = t === tank ? 0 : (foes.find((f) => f.tank === t)?.fireSlot ?? 1);
-    if (t === tank) heatHaze.visible = stage > 0;
-    if (stage <= 0) {
+    const k = stage > 0 ? fade : 0;
+    if (t === tank) {
+      heatHaze.visible = k > 0.02;
+      heatHaze.userData.heatStrength.value = HEAT_HAZE * k;
+    }
+    if (k <= 0.02) {
       fx.setDamageFire(null, 0, slot);
       return;
     }
     t.model.updateMatrixWorld();
     firePoint.copy(FIRE_LOCAL).applyMatrix4(t.model.matrixWorld);
-    fx.setDamageFire(firePoint, stage, slot);
+    fx.setDamageFire(firePoint, stage, slot, k);
   }
 
   /** Track dust, diesel exhaust and track kick for one tank; damaged tanks burn, wrecks smoke. */
   function tankFx(t, dt) {
     const mw = t.model.matrixWorld;
     if (!t.alive) {
-      // Wreck mesh sits at the kill pose — plume from the disabled body.
+      // Wreck burns about a minute, fades, then only the destroyed mesh is left.
+      t.wreckBurn = (t.wreckBurn || 0) + dt;
+      const k = wreckFireFade(t.wreckBurn);
+      if (k <= 0) {
+        setTankFire(t, 0);
+        return;
+      }
       const p = t.body.translation();
       burnPoint.set(p.x - 0.4, p.y + 1.8, p.z);
-      fx.burn(burnPoint, dt, 1.6, true);
+      fx.burn(burnPoint, dt, 1.6 * k, true);
       exhaustPoint.set(p.x, p.y + 2.4, p.z);
       exhaustUp.set(0, 1, 0);
       exhaustBack.set(-1, 0, 0).transformDirection(mw);
       if (exhaustBack.lengthSq() < 1e-6) exhaustBack.set(0, 0, 1);
-      fx.engineSmoke(exhaustPoint, 1, exhaustBack, exhaustUp);
-      setTankFire(t, 4);
+      fx.engineSmoke(exhaustPoint, k, exhaustBack, exhaustUp);
+      setTankFire(t, 4, k);
       return;
     }
+    t.wreckBurn = 0;
     if (t.hp < t.maxHp) fx.burn(burnPoint.copy(BURN_LOCAL).applyMatrix4(mw), dt, 1, true);
     setTankFire(t, damageStage(t));
     for (const s of t.sides) {
@@ -892,16 +929,19 @@ async function main() {
       for (const f of foes) fx.setDamageFire(null, 0, f.fireSlot);
     }
 
-    // Roof .50 cal — player RMB/R1; enemy AI sprays sometimes while its main gun reloads.
-    // Hostile loops are a second voice: quieter and duller the farther the shooter is.
-    const mgFire = inp.mgFire && tank.alive && !flying;
+    // Roof .50 cal — player RMB/R1; enemy sprays while its main gun reloads.
+    // Heat cooks the barrel; a full cook locks the gun. Hostile loops dull with distance.
     let hostileMgDist = null;
     const hearFrom = (p) => {
       const d = p.distanceTo(tank.model.position);
       if (hostileMgDist == null || d < hostileMgDist) hostileMgDist = d;
     };
+    const mgDt = paused ? 0 : dt;
+    const mgFire = tank.tickMg(mgDt, !paused && inp.mgFire && tank.alive && !flying);
     for (const f of foes) {
-      if (versus && !paused && f.tank.alive && f.ai.wantsMg) {
+      const want = versus && !paused && f.tank.alive && f.ai.wantsMg;
+      const on = f.tank.tickMg(versus ? mgDt : 0, want);
+      if (on) {
         hearFrom(f.tank.model.position);
         fx.setMgFlash(f.tank.mgMuzzle(), f.tank.body, f.mgId);
       } else {
@@ -942,6 +982,7 @@ async function main() {
       airSupport.update(dt);
       fx.update(dt, heightAt);
       barrels.update(dt, fx);
+      crates.update(dt);
       waterTower.update(dt, fx);
       trucks.update(dt, fx);
       airfield.update?.(dt);
@@ -956,7 +997,7 @@ async function main() {
           : 0;
         sfx.setP51Orbit(orbit);
       }
-      sfx.setFire(fx.anyDamageFire());
+      sfx.setFire(distGain(fx.nearestDamageFireDist(tank.model.position), FIRE_HEAR));
       sfx.update(dt, {
         speed: tank.forwardSpeed(),
         throttle: tank.cmd.throttle,
@@ -966,7 +1007,7 @@ async function main() {
     } else if (!menuPaused) {
       // Freefly soft-pause: keep loops quiet but audio context running
       sfx.setP51Orbit(0);
-      sfx.setFire(fx.anyDamageFire());
+      sfx.setFire(distGain(fx.nearestDamageFireDist(tank.model.position), FIRE_HEAR));
       sfx.update(dt, { speed: 0, throttle: 0, maxSpeed: 12.5, turretSlew: 0 });
     }
     updateSun();
@@ -978,7 +1019,7 @@ async function main() {
   }
   requestAnimationFrame(frame);
   $('loading').remove();
-  window.__sherman = { renderer, tank, enemy, foes, ai, nav, game, match, input, fx, smoke, airSupport, tankCam, sfx, world, grass, vegetation, terrain, visuals, debug, fly, lightProbe, sky, planes, flag, barrels, clouds, patrolBoat };
+  window.__sherman = { renderer, tank, enemy, foes, ai, nav, game, match, input, fx, smoke, airSupport, tankCam, sfx, world, grass, vegetation, terrain, visuals, debug, fly, lightProbe, sky, planes, flag, barrels, crates, clouds, patrolBoat };
 }
 
 main().catch((e) => {

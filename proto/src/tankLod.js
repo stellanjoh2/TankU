@@ -339,7 +339,7 @@ export async function installTankLods(tank) {
 
   const base = [];
   model.traverse((o) => {
-    if (!o.isMesh || isWreck(o)) return;
+    if (!o.isMesh || isWreck(o) || o.userData.skipLod) return;
     base.push({ mesh: o, kind: kindOf(o), part: partOf(o) });
   });
 

@@ -5,6 +5,7 @@ import { pickSpawn } from './ai.js';
 import { distGain } from './sfx.js';
 
 const ROUND_RESTART_DELAY = 4;          // seconds the wreck burns before the next round
+const REMAIN_HOLD = 2.6;                // seconds "N ENEMIES REMAINING" stays up
 const BARREL_BLAST_FULL = 3;            // m from a fuel drum blast: 1 HP (same as a shell hit)
 const BARREL_BLAST_EDGE = 5.5;          // m: chip damage out to here
 const SOLO_KEY = 'sherman.solo';
@@ -59,9 +60,24 @@ export function createMatch({
   }
 
   /** Living enemy tanks (skipped in solo) plus patrol boats still afloat. */
+  function hostileCount() {
+    let n = 0;
+    if (!game.solo) {
+      for (const f of foes) if (f.tank.alive) n++;
+    }
+    const boats = patrolBoat?.boats;
+    if (boats) for (const b of boats) if (b.alive) n++;
+    return n;
+  }
+
   function hostilesRemain() {
-    if (!game.solo && foes.some((f) => f.tank.alive)) return true;
-    return patrolBoat?.boats?.some((b) => b.alive) ?? false;
+    return hostileCount() > 0;
+  }
+
+  function announceRemaining() {
+    const n = hostileCount();
+    if (n <= 0 || !tank.alive) return;
+    hud.banner(n === 1 ? '1 ENEMY REMAINING' : `${n} ENEMIES REMAINING`, '', 'win', REMAIN_HOLD);
   }
 
   function pushHealth() {
@@ -125,6 +141,7 @@ export function createMatch({
     tankCam.addShake(victim === tank ? 1 : 0.4);
     if (victim === tank) endRound(true, victim);
     else if (!hostilesRemain()) endRound(false, victim);
+    else announceRemaining();
   }
 
   /** Fuel-drum blast: full shell hit point-blank, a graze further out. */
@@ -196,7 +213,10 @@ export function createMatch({
       const boat = patrolBoat?.boats?.find((b) => b.body.handle === body.handle);
       const boatWasAlive = !!boat?.alive;
       if (patrolBoat?.shellHit(body, dir)) {
-        if (boatWasAlive && tank.alive && !hostilesRemain()) endRound(false);
+        if (boatWasAlive && !boat.alive && tank.alive && game.overT <= 0) {
+          if (!hostilesRemain()) endRound(false);
+          else announceRemaining();
+        }
         return;
       }
       if (vegetation.shellHit?.(body, dir, point)) return;
@@ -282,5 +302,20 @@ export function createMatch({
     if (game.overT <= 0) restart({ resetCam: false });
   }
 
-  return { game, restart, tick, setSolo, wireFx };
+  /** Pickup heal: fill to max. No-op if dead, the round is over, or HP is already full. */
+  function healFull(victim) {
+    if (!victim?.alive || game.overT > 0) return false;
+    if (victim.hp >= victim.maxHp - 1e-3) return false;
+    victim.hp = victim.maxHp;
+    if (victim === tank && victim.repairT > 0) {
+      victim.repairT = 0;
+      sfx.repairStop();
+    }
+    victim.showHeal();
+    pushHealth();
+    if (victim === tank) sfx.repairComplete();
+    return true;
+  }
+
+  return { game, restart, tick, setSolo, wireFx, healFull };
 }
