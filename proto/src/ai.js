@@ -7,7 +7,7 @@
 //  * Driving: threat-aware A* from NavGrid (exposed cells cost more), pure-pursuit steering,
 //    unstick + unflip recovery. Aim leads the target with deliberately imperfect, settling error.
 import * as THREE from 'three';
-import { heightAt } from './terrain.js';
+import { heightAt, ENEMY_SPAWN } from './terrain.js';
 import { SHELL_SPEED } from './tank.js';
 
 const SIGHT_RANGE = 170;
@@ -53,26 +53,32 @@ function terrainLos(ax, az, bx, bz, h = EYE_H) {
   return true;
 }
 
-/** Random drivable spawn between minGap and maxGap from `from`, preferably out of its sight. */
-export function pickSpawn(nav, from, minGap, maxGap = minGap + 55) {
-  const home = nav.regionAt(from.x, from.z);
+/**
+ * Random drivable spawn near `near` (default ENEMY_SPAWN on the far side of the island).
+ * Faces `face` when given (usually the player), preferring a spot out of its sight.
+ * Small radius keeps each round feeling familiar but not identical.
+ */
+export function pickSpawn(nav, face = null, near = ENEMY_SPAWN, radius = 18) {
+  const faceX = face?.x ?? near.x, faceZ = face?.z ?? near.z;
+  const home = nav.regionAt(near.x, near.z);
   let fallback = null;
   for (let i = 0; i < 600; i++) {
-    const a = Math.random() * Math.PI * 2, d = rnd(minGap, maxGap);
-    const x = from.x + Math.cos(a) * d, z = from.z + Math.sin(a) * d;
+    const a = Math.random() * Math.PI * 2, d = rnd(4, radius);
+    const x = near.x + Math.cos(a) * d, z = near.z + Math.sin(a) * d;
     if (!nav.passable(x, z) || nav.clearanceAt(x, z) < 6 || nav.gradeAt(x, z) > 0.2) continue;
-    if (nav.regionAt(x, z) !== home) continue;
-    const spawn = { x, y: heightAt(x, z) + 0.6, z, yaw: yawOf(from.x - x, from.z - z) };
-    if (!terrainLos(from.x, from.z, x, z)) return spawn;
+    if (home && nav.regionAt(x, z) !== home) continue;
+    const spawn = { x, y: heightAt(x, z) + 0.6, z, yaw: yawOf(faceX - x, faceZ - z) };
+    if (face && !terrainLos(faceX, faceZ, x, z)) return spawn;
     fallback ??= spawn;
   }
   if (fallback) return fallback;
-  // Last resort: farthest passable cell on the grid.
-  let best = null, bestD = 0;
+  // Last resort: nearest passable cell to the base anchor.
+  let best = null, bestD = Infinity;
   for (let k = 0; k < nav.n * nav.n; k++) {
-    if (!Number.isFinite(nav.cost[k]) || nav.region[k] !== home) continue;
-    const x = nav.xOf(k), z = nav.zOf(k), d = Math.hypot(x - from.x, z - from.z);
-    if (d > bestD) { bestD = d; best = { x, y: heightAt(x, z) + 0.6, z, yaw: yawOf(from.x - x, from.z - z) }; }
+    if (!Number.isFinite(nav.cost[k])) continue;
+    if (home && nav.region[k] !== home) continue;
+    const x = nav.xOf(k), z = nav.zOf(k), d = Math.hypot(x - near.x, z - near.z);
+    if (d < bestD) { bestD = d; best = { x, y: heightAt(x, z) + 0.6, z, yaw: yawOf(faceX - x, faceZ - z) }; }
   }
   return best;
 }

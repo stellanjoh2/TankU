@@ -477,8 +477,9 @@ export class Effects {
     mat.blendSrcAlpha = THREE.ZeroFactor;
     mat.blendDstAlpha = THREE.OneFactor;
     mat.opacityNode = texture(map).a;
-    // One shared clip, two sprites — player and enemy can burn at once.
-    fire.sprites = [0, 1].map(() => {
+    // Shared gif clip. Slots 0–1 = tanks; 2+ = wrecked props (trucks, …).
+    const FIRE_SLOTS = 6;
+    fire.sprites = Array.from({ length: FIRE_SLOTS }, () => {
       const sprite = new THREE.Sprite(mat);
       sprite.center.set(0.5, 0.02);
       sprite.visible = false;
@@ -1102,7 +1103,7 @@ export class Effects {
     }
   }
 
-  /** Engine fire for one tank. slot 0 = player, 1 = enemy. stage 0 hides; 1–4 grow with damage. */
+  /** Fire gif. slot 0 = player, 1 = enemy, 2+ = props. stage 0 hides; 1–4 grow with damage. */
   setDamageFire(pos, stage, slot = 0) {
     const sprite = this.damageFire?.sprites[slot];
     if (!sprite) return;

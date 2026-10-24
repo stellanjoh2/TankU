@@ -36,7 +36,9 @@ const MG_ELEVATE = THREE.MathUtils.degToRad(60);
 const MG_ELEV_MIN = THREE.MathUtils.degToRad(-20);
 const MG_ELEV_MAX = THREE.MathUtils.degToRad(70);
 export const RELOAD = 4.0;
-const STRESS_MISS = 0.15;   // per main-gun hit taken: chance the next shell throws wide of a good aim
+const STRESS_MAX = 100;
+const STRESS_DECAY = 10;      // units/s back toward 0 after a hit
+const STRESS_MISS_MAX = 0.5;  // miss chance at full stress
 export const SHELL_SPEED = 260 * 0.8;
 export const MAX_HP = 4;     // main-gun hits to destroy
 export const MG_DAMAGE = 0.01; // .50 cal chip damage (−80%; ~100 rounds / full bar)
@@ -53,7 +55,7 @@ const TAIL_LIGHT_LOCALS = [
   new THREE.Vector3(-2.72, 1.92, 1.50),
   new THREE.Vector3(-2.72, 1.92, -1.50),
 ];
-const TAIL_LIGHT_DIST = 0.5;
+const TAIL_LIGHT_DIST = 1.0;
 const TAIL_LIGHT_IDLE = 0;
 const TAIL_LIGHT_BRAKE = 5;
 // Whip antenna (bones Antenna_0..3, rest pose straight up local +Y): lean = -GAIN * hull accel,
@@ -69,49 +71,20 @@ const _v = new THREE.Vector3();
 const _q = new THREE.Quaternion();
 const _up = new THREE.Vector3(0, 1, 0);
 const _side = new THREE.Vector3();
-const _box = new THREE.Box3();
-const _size = new THREE.Vector3();
-const _center = new THREE.Vector3();
-const _inv = new THREE.Matrix4();
-const _m = new THREE.Matrix4();
 
-/**
- * Kill-shot breakup: each `root` becomes one Rapier body. `attach` nodes are
- * reparented onto it (world transform kept) so they fly with the chunk.
- * `shapes` are the sub-nodes whose bounds become that body's box colliders.
- */
-const DEBRIS_CHUNKS = [
-  { root: 'Hull', attach: ['RunningGear_L', 'RunningGear_R'], shapes: ['Hull_Body'] },
-  { root: 'Turret', shapes: ['Turret_Body'] },
-];
+// Placeholder burnt metal: ground rock albedo, darkened 85% (keep 15%).
+const BURNT_MAP_URL = './textures/ground/rock_color.jpg';
+const BURNT_DARKEN = 0.15;
+let _burntMap = null;
 
-/** High-poly extras hidden on the wreck (tracks, fittings, MG, antenna). */
-function isWreckDetail(name) {
-  return name === 'Hull_Details' || name === 'Turret_Details'
-    || name === 'Antenna_Rig' || name === 'MG50_Mount'
-    || name === 'Track_L' || name === 'Track_R'
-    || name.startsWith('ReturnRoller_');
-}
-
-// Rapier groups = (membership << 16) | filter: debris is in group 2 and ignores group 2.
-const DEBRIS_GROUPS = (0x0002 << 16) | 0xfffd;
-
-/** Axis-aligned bounds of `root` and its mesh descendants, in `frame` local space. */
-function localAabb(root, frame = root) {
-  _box.makeEmpty();
-  frame.updateWorldMatrix(true, true);
-  root.updateWorldMatrix(true, true);
-  _inv.copy(frame.matrixWorld).invert();
-  root.traverse((c) => {
-    if (!c.isMesh || !c.geometry?.attributes?.position) return;
-    const pos = c.geometry.attributes.position;
-    _m.multiplyMatrices(_inv, c.matrixWorld);
-    for (let i = 0; i < pos.count; i++) {
-      _v.fromBufferAttribute(pos, i).applyMatrix4(_m);
-      _box.expandByPoint(_v);
-    }
-  });
-  return _box;
+function burntMetalMap() {
+  if (_burntMap) return _burntMap;
+  _burntMap = new THREE.TextureLoader().load(BURNT_MAP_URL);
+  _burntMap.colorSpace = THREE.SRGBColorSpace;
+  _burntMap.wrapS = _burntMap.wrapT = THREE.RepeatWrapping;
+  _burntMap.repeat.set(2.5, 2.5);
+  _burntMap.anisotropy = 8;
+  return _burntMap;
 }
 
 function loopSegments(flat) {
@@ -216,7 +189,11 @@ function springStep(pos, vel, target, { hz, zeta }, dt) {
 }
 
 export class Tank {
-  /** `opts.tint` multiplies every non-lamp material colour (tells the enemy apart). */
+  /**
+   * @param {object} [opts]
+   * @param {THREE.Color} [opts.tint] multiplies every non-lamp material colour (enemy)
+   * @param {THREE.Object3D} [opts.wreck] destroyed-tank mesh to clone and swap in on death
+   */
   constructor(gltf, RAPIER, world, spawn, opts = {}) {
     this.RAPIER = RAPIER;
     this.world = world;
@@ -227,7 +204,8 @@ export class Tank {
     this.hitFlashFrames = 0;
     this.hp = MAX_HP;
     this.maxHp = MAX_HP;
-    this.stress = 0;          // main-gun hits taken this round; each one is −15% direct-hit chance
+    this.stress = 0;          // 0..100 temporary aim jitter; decays after main-gun hits
+    this.wrecked = false;
     this.model.traverse((o) => {
       if (!o.isMesh) return;
       o.castShadow = o.receiveShadow = true;
@@ -250,9 +228,38 @@ export class Tank {
         }
       }
     });
+    // Static destroyed mesh (truck / water-tower style). Hidden until obliterate().
+    this.intactRoots = [...this.model.children];
+    this.wreck = null;
+    if (opts.wreck) {
+      const src = opts.wreck.getObjectByName('Sherman_Destroyed') || opts.wreck;
+      this.wreck = src.clone(true);
+      this.wreck.name = 'Sherman_Destroyed';
+      this.wreck.visible = false;
+      this.wreck.position.set(0, 0, 0);
+      this.wreck.rotation.set(0, 0, 0);
+      this.wreck.scale.set(1, 1, 1);
+      const burnt = burntMetalMap();
+      this.wreck.traverse((o) => {
+        if (!o.isMesh) return;
+        o.castShadow = o.receiveShadow = true;
+        const mats = [].concat(o.material).filter(Boolean).map((m) => m.clone());
+        o.material = Array.isArray(o.material) ? mats : mats[0];
+        for (const m of mats) {
+          m.map = burnt;
+          m.color.setScalar(BURNT_DARKEN);
+          m.metalness = 0.4;
+          m.roughness = 0.92;
+          m.envMapIntensity = 0.35;
+          m.needsUpdate = true;
+          if (opts.tint) m.color.multiply(opts.tint);
+        }
+      });
+      this.model.add(this.wreck);
+    }
     // Red point lights at the two rear brake lenses — spill onto hull/grass when braking.
     this.tailLights = TAIL_LIGHT_LOCALS.map((local) => {
-      const l = new THREE.PointLight(new THREE.Color(...TAIL_RGB), TAIL_LIGHT_IDLE, TAIL_LIGHT_DIST, 2);
+      const l = new THREE.PointLight(new THREE.Color(...TAIL_RGB), TAIL_LIGHT_IDLE, TAIL_LIGHT_DIST, 1);
       l.position.copy(local);
       this.model.add(l);
       return l;
@@ -343,22 +350,6 @@ export class Tank {
     this.yawAim = 0;
     this.elevAim = 0;
     this.turretSlew = 0;     // rad/s, + = left (CCW from above)
-    this.debris = [];         // { obj, body, parent, localPos, localQuat, localScale }
-    // Part-local bounds measured once here, so the kill frame doesn't walk every vertex.
-    this.debrisChunks = [];
-    this.debrisHidden = [];
-    for (const { root, attach = [], shapes } of DEBRIS_CHUNKS) {
-      const obj = this.model.getObjectByName(root);
-      if (!obj) continue;
-      const extras = attach.map((n) => this.model.getObjectByName(n)).filter(Boolean);
-      const boxes = [];
-      for (const name of shapes) {
-        const sub = obj.getObjectByName(name);
-        const box = sub && localAabb(sub, obj);
-        if (box && !box.isEmpty()) boxes.push(box.clone());
-      }
-      if (boxes.length) this.debrisChunks.push({ obj, extras, boxes });
-    }
     // charge 0..1 (two 0.5 hits); needFull = spent both, wait for 100% before next use
     this.nitro = { charge: 1, t: 0, power: 0, held: false, needFull: false, justStarted: false };
   }
@@ -422,148 +413,41 @@ export class Tank {
 
   get position() { return this.body.translation(); }
   get alive() { return this.hp > 0; }
-  /** Chance a well-aimed main-gun shell still misses, from Stress. */
-  get stressMissChance() { return this.stress * STRESS_MISS; }
+  /** Chance a well-aimed main-gun shell still misses, from Stress (0..1). */
+  get stressMissChance() { return (this.stress / STRESS_MAX) * STRESS_MISS_MAX; }
+
+  /** Spike stress from a hard hit (main gun). Clamped to 0..100. */
+  addStress(amount) {
+    if (amount <= 0 || !this.alive) return;
+    this.stress = Math.min(STRESS_MAX, this.stress + amount);
+  }
 
   /** Remove from (or return to) the world without destroying it — used by solo mode. */
   setActive(on) {
-    if (!on) this.restoreDebris();
+    if (!on) this.restoreWreck();
     this.body.setEnabled(on);
     this.model.visible = on;
   }
 
-  /**
-   * Kill-shot breakup: detach major meshes into Rapier dynamics and blast them apart.
-   * @param {{ point?: THREE.Vector3, dir?: THREE.Vector3 }} hit  shell impact (world)
-   */
-  obliterate({ point, dir } = {}) {
-    if (this.debris.length) return;
-    const R = this.RAPIER;
-    const scene = this.model.parent;
-    if (!scene) return;
-
+  /** Kill-shot: freeze pose, hide the intact rig, show the destroyed mesh. */
+  obliterate() {
+    if (this.wrecked) return;
+    this.model.position.copy(this.body.translation());
+    this.model.quaternion.copy(this.body.rotation());
     this.model.updateMatrixWorld(true);
-    const hullT = this.body.translation();
-    const hullV = this.body.linvel();
-    const blast = point
-      ? point.clone()
-      : new THREE.Vector3(hullT.x, hullT.y + 1.2, hullT.z);
-    const shove = dir ? dir.clone().normalize() : new THREE.Vector3(0, 1, 0);
-
-    for (const { obj, extras, boxes } of this.debrisChunks) {
-      if (obj.parent == null) continue;
-      const parent = obj.parent;
-      const localPos = obj.position.clone();
-      const localQuat = obj.quaternion.clone();
-      const localScale = obj.scale.clone();
-
-      const attached = [];
-      for (const extra of extras) {
-        if (!extra.parent || extra === obj) continue;
-        attached.push({
-          obj: extra,
-          parent: extra.parent,
-          localPos: extra.position.clone(),
-          localQuat: extra.quaternion.clone(),
-          localScale: extra.scale.clone(),
-        });
-        obj.attach(extra);
-      }
-
-      obj.traverse((c) => {
-        if (c.isMesh) c.castShadow = false;
-        if (c.visible && isWreckDetail(c.name)) {
-          this.debrisHidden.push(c);
-          c.visible = false;
-        }
-      });
-
-      const pos = new THREE.Vector3();
-      const quat = new THREE.Quaternion();
-      const scl = new THREE.Vector3();
-      obj.matrixWorld.decompose(pos, quat, scl);
-
-      parent.remove(obj);
-      scene.add(obj);
-      obj.position.copy(pos);
-      obj.quaternion.copy(quat);
-      obj.scale.copy(scl);
-
-      boxes[0].getSize(_size);
-      boxes[0].getCenter(_center);
-      const hx = Math.max(0.08, _size.x * 0.5);
-      const hy = Math.max(0.08, _size.y * 0.5);
-      const hz = Math.max(0.08, _size.z * 0.5);
-      const mass = THREE.MathUtils.clamp(8 * hx * hy * hz * 280, 40, 6000);
-
-      const body = this.world.createRigidBody(
-        R.RigidBodyDesc.dynamic()
-          .setTranslation(pos.x, pos.y, pos.z)
-          .setRotation(quat)
-          .setLinvel(hullV.x, hullV.y, hullV.z)
-          .setLinearDamping(0.15)
-          .setAngularDamping(0.4)
-          .setUserData({ mat: 'metal' }),
-      );
-      this.world.createCollider(
-        R.ColliderDesc.cuboid(hx, hy, hz)
-          .setTranslation(_center.x, _center.y, _center.z)
-          .setMass(mass)
-          .setFriction(0.75)
-          .setRestitution(0.15)
-          .setCollisionGroups(DEBRIS_GROUPS),
-        body,
-      );
-
-      // Outward blast from the chunk's box centre, plus a lift so chunks clear the hull.
-      _center.applyMatrix4(obj.matrixWorld);
-      const away = _center.clone().sub(blast);
-      if (away.lengthSq() < 1e-4) away.set(Math.random() - 0.5, 1, Math.random() - 0.5);
-      away.normalize();
-      const kick = 6 + Math.random() * 10;
-      const lift = 5 + Math.random() * 9;
-      body.applyImpulse({
-        x: (away.x * kick + shove.x * 4) * mass,
-        y: (away.y * kick * 0.35 + lift + shove.y * 2) * mass,
-        z: (away.z * kick + shove.z * 4) * mass,
-      }, true);
-      body.applyTorqueImpulse({
-        x: (Math.random() - 0.5) * mass * 3.5,
-        y: (Math.random() - 0.5) * mass * 3.5,
-        z: (Math.random() - 0.5) * mass * 3.5,
-      }, true);
-
-      this.debris.push({ obj, body, parent, localPos, localQuat, localScale, attached });
-    }
-
+    for (const c of this.intactRoots) c.visible = false;
+    if (this.wreck) this.wreck.visible = true;
     this.body.setEnabled(false);
-    this.model.visible = false;
+    this.wrecked = true;
   }
 
-  /** Reassemble the tank hierarchy and drop debris bodies (round restart). */
-  restoreDebris() {
-    if (!this.debris.length) return;
-    for (const d of this.debris) {
-      this.world.removeRigidBody(d.body);
-      d.obj.removeFromParent();
-      d.parent.add(d.obj);
-      d.obj.position.copy(d.localPos);
-      d.obj.quaternion.copy(d.localQuat);
-      d.obj.scale.copy(d.localScale);
-      d.obj.traverse((c) => { if (c.isMesh) c.castShadow = true; });
-      for (const a of d.attached) {
-        a.obj.removeFromParent();
-        a.parent.add(a.obj);
-        a.obj.position.copy(a.localPos);
-        a.obj.quaternion.copy(a.localQuat);
-        a.obj.scale.copy(a.localScale);
-      }
-    }
-    for (const o of this.debrisHidden) o.visible = true;
-    this.debrisHidden.length = 0;
-    this.debris.length = 0;
+  /** Swap the intact rig back in (round restart). */
+  restoreWreck() {
+    if (!this.wrecked) return;
+    for (const c of this.intactRoots) c.visible = true;
+    if (this.wreck) this.wreck.visible = false;
     this.body.setEnabled(true);
-    this.model.visible = true;
+    this.wrecked = false;
   }
 
   forwardSpeed() {
@@ -574,7 +458,7 @@ export class Tank {
 
   /** One fixed physics step: suspension, traction, drive. */
   physicsStep(dt, input) {
-    if (!this.body.isEnabled() || this.debris.length) return;
+    if (!this.body.isEnabled() || this.wrecked) return;
     const R = this.RAPIER;
     const ramp = (cur, tgt, rate) => cur + THREE.MathUtils.clamp(tgt - cur, -rate * dt, rate * dt);
     let throttleTgt = input.throttle;
@@ -703,13 +587,7 @@ export class Tank {
 
   /** Sync the model to the body, animate the running gear, aim, recoil. */
   update(dt, aimPoint) {
-    if (this.debris.length) {
-      for (const d of this.debris) {
-        d.obj.position.copy(d.body.translation());
-        d.obj.quaternion.copy(d.body.rotation());
-      }
-      return;
-    }
+    if (this.wrecked) return;
     this.model.position.copy(this.body.translation());
     this.model.quaternion.copy(this.body.rotation());
     this.model.updateMatrixWorld();
@@ -749,6 +627,8 @@ export class Tank {
     } else {
       this.turretSlew = 0;
     }
+
+    if (this.stress > 0) this.stress = Math.max(0, this.stress - STRESS_DECAY * dt);
 
     const wasReloading = this.reload > 0;
     this.reload = Math.max(0, this.reload - dt);
@@ -873,7 +753,7 @@ export class Tank {
 
   /** Full restart at the original spawn pose. */
   respawn(spawn) {
-    this.restoreDebris();
+    this.restoreWreck();
     this.body.setTranslation({ x: spawn.x, y: spawn.y, z: spawn.z }, true);
     this.body.setRotation(
       new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), spawn.yaw ?? 0),

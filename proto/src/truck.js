@@ -4,6 +4,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { AIRFIELD_Y, heightAt } from './terrain.js';
 import { pickLod } from './lod.js';
+import { createEngineHeatHaze } from './heatHaze.js';
 
 const SLAB_T = 0.06;
 const NODE = 'ArmyTruck';
@@ -12,6 +13,9 @@ const LOD_EDGES = [28, 65];
 const LOD_LEVELS = LOD_EDGES.length + 1;
 const CULL_DIST = 180;
 const SHEET_LINGER = 1.2;
+// Damage-fire gif slots 0–1 are tanks; trucks start at 2.
+const FIRE_SLOT0 = 2;
+const FIRE_STAGE = 4; // wreck-sized flame
 
 // Half-extents matching the intact GLB (metres, local +X forward, origin at ground centre).
 const HX = 3.38;
@@ -52,7 +56,7 @@ function patchIntactMat(mat) {
  *   setLodScale: (v: number) => void,
  *   shellHit: (body: object, dir?: THREE.Vector3) => boolean,
  *   update: (dt: number, fx: object) => void,
- *   reset: () => void,
+ *   reset: (fx?: object) => void,
  * }>}
  */
 export async function buildTrucks(scene, { RAPIER, world }) {
@@ -204,6 +208,15 @@ export async function buildTrucks(scene, { RAPIER, world }) {
       }
     });
     obj.add(ruin);
+
+    const haze = createEngineHeatHaze({
+      local: new THREE.Vector3(0.2, 1.55, 0),
+      width: 1.7,
+      height: 2.1,
+    });
+    haze.visible = false;
+    haze.name = `${obj.name}_HeatHaze`;
+    obj.add(haze);
     root.add(obj);
 
     const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), spot.yaw);
@@ -221,8 +234,9 @@ export async function buildTrucks(scene, { RAPIER, world }) {
     );
 
     const t = {
-      obj, lods, ruin, lod: -2, body, collider, spot, dead: false,
+      obj, lods, ruin, haze, lod: -2, body, collider, spot, dead: false,
       smokeY: y0 + 1.1,
+      fireSlot: FIRE_SLOT0 + i,
     };
     live.push(t);
     setLod(t, 0);
@@ -241,10 +255,12 @@ export async function buildTrucks(scene, { RAPIER, world }) {
       const cullPad = CULL_DIST * lodScale * 0.05;
       for (const t of live) {
         if (t.dead) {
-          // Keep ruin visible until culled far away.
+          // Keep ruin + fire FX visible until culled far away.
           const d = t.obj.position.distanceTo(camPos);
           const cull = CULL_DIST * lodScale + (t.ruin.visible ? cullPad : -cullPad);
-          t.ruin.visible = d <= cull;
+          const show = d <= cull;
+          t.ruin.visible = show;
+          t.haze.visible = show;
           continue;
         }
         const d = t.obj.position.distanceTo(camPos);
@@ -264,6 +280,7 @@ export async function buildTrucks(scene, { RAPIER, world }) {
       t.dead = true;
       for (const m of t.lods) m.visible = false;
       t.ruin.visible = true;
+      t.haze.visible = true;
       t.lod = -3;
       spawnScrap(t, dir);
       return true;
@@ -273,6 +290,8 @@ export async function buildTrucks(scene, { RAPIER, world }) {
         if (!t.dead || !fx) continue;
         smokeAt.set(t.spot.x, t.smokeY, t.spot.z);
         fx.plume(smokeAt, dt * 0.85);
+        if (t.haze.visible) fx.setDamageFire(smokeAt, FIRE_STAGE, t.fireSlot);
+        else fx.setDamageFire(null, 0, t.fireSlot);
       }
       for (let i = sheets.length - 1; i >= 0; i--) {
         const s = sheets[i];
@@ -291,13 +310,15 @@ export async function buildTrucks(scene, { RAPIER, world }) {
         }
       }
     },
-    reset() {
+    reset(fx) {
       for (const s of sheets) removeSheet(s);
       sheets.length = 0;
       for (const t of live) {
         t.dead = false;
         t.ruin.visible = false;
+        t.haze.visible = false;
         t.lod = -2;
+        fx?.setDamageFire(null, 0, t.fireSlot);
         setLod(t, 0);
       }
     },

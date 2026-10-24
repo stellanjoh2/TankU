@@ -4,7 +4,6 @@ import { MG_DAMAGE } from './tank.js';
 import { pickSpawn } from './ai.js';
 import { distGain } from './sfx.js';
 
-export const MIN_SPAWN_GAP = 75;        // metres between the two tanks at round start
 const ROUND_RESTART_DELAY = 4;          // seconds the wreck burns before the next round
 const BARREL_BLAST_FULL = 3;            // m from a fuel drum blast: 1 HP (same as a shell hit)
 const BARREL_BLAST_EDGE = 5.5;          // m: chip damage out to here
@@ -13,6 +12,7 @@ const HULL_FRONT_X = 1.4;               // local +X is forward; past this is the
 const HULL_REAR_X = -1.5;               // engine bay
 const FRONT_DMG = 0.75;
 const REAR_DMG = 1.25;
+const STRESS_PER_SHELL = 55;           // side hit; scaled by shellDamage (rear hits harder)
 const HIT_KICK_RETURN = 2;             // s, camera shove when a shell hits you
 
 const _hitP = new THREE.Vector3();
@@ -51,7 +51,7 @@ export function createMatch({
     fx.clearShells();
     barrels.reset();
     waterTower.reset();
-    trucks.reset();
+    trucks.reset(fx);
     nav.setObstacles([   // palm slider may have changed
       ...vegetation.navObstacles(), ...airfield.navObstacles(),
       ...port.navObstacles(), ...waterTower.navObstacles(),
@@ -59,7 +59,7 @@ export function createMatch({
     ]);
     enemy.setActive(!game.solo);
     if (!game.solo) {
-      enemy.respawn(pickSpawn(nav, spawn, MIN_SPAWN_GAP));
+      enemy.respawn(pickSpawn(nav, spawn));
       ai.reset();
     }
     game.overT = 0;
@@ -78,13 +78,10 @@ export function createMatch({
     restart({ resetCam: false });
   }
 
-  function onTankDestroyed(victim, hit = {}) {
+  function onTankDestroyed(victim) {
     const origin = new THREE.Vector3().copy(victim.body.translation()).add(new THREE.Vector3(0, 1.2, 0));
     fx.wreck(origin);
-    victim.obliterate({
-      point: hit.point ? new THREE.Vector3().copy(hit.point) : origin,
-      dir: hit.dir ? new THREE.Vector3().copy(hit.dir) : undefined,
-    });
+    victim.obliterate();
     tankCam.addShake(victim === tank ? 1 : 0.4);
     game.overT = ROUND_RESTART_DELAY;
     game.wreck = victim;
@@ -112,7 +109,7 @@ export function createMatch({
         victim.flashHit();
       }
       hud.setHealth(tank.hp / tank.maxHp, enemy.hp / enemy.maxHp);
-      if (!victim.alive) onTankDestroyed(victim, { point });
+      if (!victim.alive) onTankDestroyed(victim);
     }
   }
 
@@ -137,8 +134,10 @@ export function createMatch({
       if (trucks.shellHit(body, dir)) return;
       const victim = [tank, enemy].find((t) => t.body.handle === body.handle);
       if (!victim || victim.body === owner || !victim.alive) return;
-      victim.hp = Math.max(0, victim.hp - shellDamage(victim, point));
-      if (victim.alive) victim.stress += 1;
+      const dmg = shellDamage(victim, point);
+      victim.hp = Math.max(0, victim.hp - dmg);
+      // Main-gun only — MG path never calls addStress. Rear hits spike harder.
+      if (victim.alive) victim.addStress(STRESS_PER_SHELL * dmg);
       // Clank at the impact — audible ~140 m, squared falloff (no distant floor)
       {
         const d = (point ?? victim.model.position).distanceTo(tank.model.position);
@@ -156,7 +155,7 @@ export function createMatch({
         ai.onHit();
       }
       hud.setHealth(tank.hp / tank.maxHp, enemy.hp / enemy.maxHp);
-      if (!victim.alive) onTankDestroyed(victim, { point, dir });
+      if (!victim.alive) onTankDestroyed(victim);
     };
 
     // Traced .50 hits: metal ricochet SFX (body.userData.mat === 'metal') + chip damage on tanks.
@@ -185,7 +184,7 @@ export function createMatch({
       if (wasAlive && !victim.alive) {
         if (victim === tank && owner === enemy.body) ai.onScored();
         if (victim === enemy) ai.onHit();
-        onTankDestroyed(victim, { point, dir });
+        onTankDestroyed(victim);
       }
     };
   }

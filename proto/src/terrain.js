@@ -90,6 +90,9 @@ export const PORT_YARD = {
   z1: PORT.z0,
 };
 
+/** Enemy spawn focus: far north of the main island — opposite the satellite, so rounds start with a hunt. */
+export const ENEMY_SPAWN = { x: -10, z: 63 };
+
 const smooth = (x, a, b) => THREE.MathUtils.smoothstep(x, a, b);
 const clamp01 = (v) => Math.min(1, Math.max(0, v));
 

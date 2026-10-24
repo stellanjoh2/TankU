@@ -22,7 +22,7 @@ import { TankCamera } from './TankCamera.js';
 import { Sfx, distGain } from './sfx.js';
 import { NavGrid } from './navgrid.js';
 import { TankAI, pickSpawn } from './ai.js';
-import { createMatch, MIN_SPAWN_GAP } from './match.js';
+import { createMatch } from './match.js';
 import { createHud } from './hud.js';
 import { createDebug } from './debug.js';
 import { FreeFlight } from './freeflight.js';
@@ -35,6 +35,7 @@ import { buildFlag } from './flag.js';
 import { buildBarrels } from './barrels.js';
 import { buildTrucks } from './truck.js';
 import { buildPebbles } from './pebbles.js';
+import { createEngineHeatHaze } from './heatHaze.js';
 import './style.css';
 
 const FIXED_DT = 1 / 120;
@@ -158,14 +159,19 @@ async function main() {
   await buildPebbles(scene, vegetation.pebbleAnchors, terrain.groundSets, terrain.palette.concrete);
 
   const loader = new GLTFLoader();
-  const [gltf, enemyGltf] = await Promise.all([
+  const [gltf, enemyGltf, wreckGltf] = await Promise.all([
     loader.loadAsync('./models/sherman.glb'),
     loader.loadAsync('./models/sherman.glb'),
+    loader.loadAsync('./models/sherman_destroyed.glb'),
   ]);
   const { x: sx, z: sz } = PLAYER_SPAWN;
   const spawn = { x: sx, y: heightAt(sx, sz) + 0.6, z: sz, yaw: Math.atan2(-(BRIDGE.z - sz), BRIDGE.x - sx) };
-  const tank = new Tank(gltf, RAPIER, world, spawn);
+  const wreckSrc = wreckGltf.scene;
+  const tank = new Tank(gltf, RAPIER, world, spawn, { wreck: wreckSrc });
   scene.add(tank.model);
+  const heatHaze = createEngineHeatHaze();
+  heatHaze.visible = false;
+  tank.model.add(heatHaze);
   const fx = new Effects(scene, RAPIER, world, tank.body, barrels.dynamic);
   fx.camera = camera;
 
@@ -175,8 +181,8 @@ async function main() {
     ...port.navObstacles(), ...waterTower.navObstacles(), ...flag.navObstacles(),
     ...trucks.navObstacles(),
   ]);
-  const enemySpawn = pickSpawn(nav, spawn, MIN_SPAWN_GAP);
-  const enemy = new Tank(enemyGltf, RAPIER, world, enemySpawn, { tint: ENEMY_TINT });
+  const enemySpawn = pickSpawn(nav, spawn);
+  const enemy = new Tank(enemyGltf, RAPIER, world, enemySpawn, { tint: ENEMY_TINT, wreck: wreckSrc });
   scene.add(enemy.model);
   const ai = new TankAI({ tank: enemy, enemy: tank, nav, world, RAPIER, coverRocks: vegetation.coverRocks });
   const hud = createHud();
@@ -284,11 +290,8 @@ async function main() {
   });
 
   // ---------------------------------------------------------------- camera + aim helpers
-  // Mouse look drives TankCamera. Hull yaw is body heading (+X forward).
-  // The view may lead the barrel, but only by this much — a fast swipe cannot
-  // orbit the camera off the turret. Past the lead the view locks and the
-  // barrel catches the reticle (Battlefield turret cam).
-  const TURRET_CAM_LEAD = THREE.MathUtils.degToRad(20);
+  // Mouse look is free; the turret slews toward the reticle at traverse speed.
+  // TankCamera still stays mostly behind the hull (turretFollowWeight).
   let lookYaw = spawn.yaw;
   let lookPitch = -0.08;
   const viewDir = new THREE.Vector3();
@@ -312,9 +315,9 @@ async function main() {
 
   const wrapYaw = (a) => Math.atan2(Math.sin(a), Math.cos(a));
 
-  /** World yaw of the barrel. Null once the turret has been blown off the hull. */
+  /** World yaw of the barrel. Null once the tank is a wreck. */
   function turretAimYaw() {
-    if (tank.debris.length) return null;
+    if (tank.wrecked) return null;
     tank.model.position.copy(tank.body.translation());
     tank.model.quaternion.copy(tank.body.rotation());
     tank.turret.updateWorldMatrix(true, false);
@@ -408,17 +411,10 @@ async function main() {
       return;
     }
 
-    // One frame of mouse can be several full turns. Cap the sample first so it
-    // can't wrap onto the opposite direction, then keep the view on the barrel.
-    // Past the lead, extra mouse is dropped; the window slides with the turret
-    // so a held turn keeps going at traverse speed.
-    lookYaw -= THREE.MathUtils.clamp(inp.aimX, -TURRET_CAM_LEAD, TURRET_CAM_LEAD);
+    // Free look — no clamp to barrel yaw. Soft per-frame cap only so a huge
+    // mouse spike can't wrap past π in one sample.
+    lookYaw = wrapYaw(lookYaw - THREE.MathUtils.clamp(inp.aimX, -Math.PI, Math.PI));
     lookPitch = THREE.MathUtils.clamp(lookPitch - inp.aimY, -0.75, 0.45);
-
-    const gunYaw = turretAimYaw();
-    if (gunYaw != null) {
-      lookYaw = gunYaw + THREE.MathUtils.clamp(wrapYaw(lookYaw - gunYaw), -TURRET_CAM_LEAD, TURRET_CAM_LEAD);
-    }
 
     if (inp.zoom) {
       const k = 1 + inp.zoom * 0.08;
@@ -477,8 +473,8 @@ async function main() {
     hud.setNitro(tank.nitroCharge, tank.nitroActive);
     hud.setReload(tank.alive ? tank.reload : 0, RELOAD);
     hud.setStress(
-      tank.alive ? tank.stressMissChance : 0,
-      !game.solo && enemy.alive ? enemy.stressMissChance : 0,
+      tank.alive ? tank.stress / 100 : 0,
+      !game.solo && enemy.alive ? enemy.stress / 100 : 0,
     );
     // Hide while driving, on gamepad, or while the visuals editor has the cursor
     $('overlay').classList.toggle('hidden', input.locked || !!inp.pad || visuals.open);
@@ -515,6 +511,7 @@ async function main() {
 
   function setTankFire(t, stage) {
     const slot = t === tank ? 0 : 1;
+    if (t === tank) heatHaze.visible = stage > 0;
     if (stage <= 0) {
       fx.setDamageFire(null, 0, slot);
       return;
@@ -528,7 +525,7 @@ async function main() {
   function tankFx(t, dt) {
     const mw = t.model.matrixWorld;
     if (!t.alive) {
-      // Hull is gone after obliterate — plume from the kill pose (body stays where it died).
+      // Wreck mesh sits at the kill pose — plume from the disabled body.
       const p = t.body.translation();
       burnPoint.set(p.x - 0.4, p.y + 1.8, p.z);
       fx.burn(burnPoint, dt, 1.6, true);

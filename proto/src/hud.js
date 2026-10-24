@@ -4,11 +4,11 @@ export function createHud() {
   root.id = 'hud';
   root.innerHTML = `
     <div class="hp" data-who="player"><span>YOU</span><div class="hp-bar"><i></i></div><b>100%</b></div>
-    <div class="stress hidden" data-who="player-stress"><span>STRESS</span><b>−0%</b></div>
+    <div class="stress hidden" data-who="player-stress"><span>STRESS</span><div class="stress-bar"><i></i></div><b>0</b></div>
     <div class="nitro" data-who="nitro"><span>NITRO</span><div class="nitro-bar"><i></i></div><b>100%</b></div>
     <div class="reload hidden" data-who="reload"><span>RELOAD</span><div class="reload-bar"><i></i></div><b>0.0s</b></div>
     <div class="hp enemy" data-who="enemy"><span>ENEMY</span><div class="hp-bar"><i></i></div><b>100%</b></div>
-    <div class="stress hidden" data-who="enemy-stress"><span>STRESS</span><b>−0%</b></div>
+    <div class="stress hidden" data-who="enemy-stress"><span>STRESS</span><div class="stress-bar"><i></i></div><b>0</b></div>
     <div class="ai-debug hidden"></div>`;
   const banner = document.createElement('div');
   banner.id = 'banner';
@@ -48,10 +48,13 @@ export function createHud() {
     row.classList.toggle('dead', pct <= 0);
   }
 
-  function setStressRow(row, chance) {
-    const on = chance > 0.001;
+  function setStressRow(row, frac) {
+    const pct = Math.round(Math.max(0, Math.min(1, frac)) * 100);
+    const on = pct > 0;
     row.classList.toggle('hidden', !on);
-    if (on) row.querySelector('b').textContent = `−${Math.round(chance * 100)}%`;
+    if (!on) return;
+    row.querySelector('i').style.width = `${pct}%`;
+    row.querySelector('b').textContent = `${pct}`;
   }
 
   return {
@@ -59,7 +62,7 @@ export function createHud() {
       setBar(rows.player, player);
       if (enemy != null) setBar(rows.enemy, enemy);
     },
-    /** Miss chance from Stress, 0..1. Hidden at 0. */
+    /** Stress level 0..1 (meter shows 0..100). Hidden at 0. */
     setStress(player, enemy) {
       setStressRow(rows.playerStress, player);
       setStressRow(rows.enemyStress, enemy ?? 0);

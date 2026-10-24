@@ -38,8 +38,8 @@ canvas { display: block; }
 }
 #hud .hp,
 #hud .nitro,
-#hud .reload { display: grid; grid-template-columns: 56px 160px 44px; align-items: center; gap: 8px; }
-#hud .stress { display: grid; grid-template-columns: 56px 1fr; align-items: center; gap: 8px; margin-top: -4px; }
+#hud .reload,
+#hud .stress { display: grid; grid-template-columns: 56px 160px 44px; align-items: center; gap: 8px; }
 #hud .hp span,
 #hud .nitro span,
 #hud .reload span,
@@ -50,14 +50,14 @@ canvas { display: block; }
 #hud .hp[data-who="player"] span { color: #ffd278; opacity: 1; }
 #hud .hp b,
 #hud .nitro b,
-#hud .reload b { font-weight: 600; font-size: 12px; text-align: right; text-shadow: 0 1px 3px #000; }
-#hud .stress b {
-  font-weight: 600; font-size: 12px; text-align: left; color: #ff6a4a; text-shadow: 0 1px 3px #000;
-}
+#hud .reload b,
+#hud .stress b { font-weight: 600; font-size: 12px; text-align: right; text-shadow: 0 1px 3px #000; }
+#hud .stress b { color: #ff6a4a; }
 #hud .stress span { color: #ff6a4a; opacity: 1; }
 #hud .hp-bar,
 #hud .nitro-bar,
-#hud .reload-bar {
+#hud .reload-bar,
+#hud .stress-bar {
   height: 10px; background: rgba(0, 0, 0, 0.5); border: 1px solid rgba(232, 228, 216, 0.35);
   border-radius: 2px; overflow: hidden;
 }
@@ -75,6 +75,14 @@ canvas { display: block; }
 }
 #hud .nitro.active .nitro-bar i { background: linear-gradient(90deg, #2bc8d4, #7cf7ff); }
 #hud .nitro.empty .nitro-bar i { background: #1a4a52; box-shadow: none; }
+#hud .stress-bar {
+  height: 8px; border-color: rgba(255, 106, 74, 0.45);
+}
+#hud .stress-bar i {
+  display: block; height: 100%; width: 0%;
+  background: linear-gradient(90deg, #c9442a, #ff6a4a);
+  transition: width 0.12s linear;
+}
 #hud .reload-bar i {
   display: block; height: 100%; width: 0%;
   background: #e0a030; transition: width 0.08s linear;
