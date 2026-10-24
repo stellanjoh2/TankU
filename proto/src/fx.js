@@ -149,6 +149,8 @@ const SHELL_VIS_MAX = 3.9;
 const MG_TRACER_SPEED = 220 * 0.75;
 const MG_TRACER_GEO_LEN = 0.825 * 1.5;
 const MG_TRACER_LEN = 2.55 * 1.5;
+// Per-round cone for every MG (roof .50, boat, P-51). Was the strafe's 2.5°.
+const MG_SPREAD_DEG = 2.5 * 1.25;
 // Metres past the muzzle. The plume reaches about here; a tracer rooted on the
 // muzzle covers the star and makes the flash look broken. Clear shifts with the
 // extra length so the tail stays where it was.
@@ -284,6 +286,8 @@ export class Effects {
     this.onShellHit = () => {};
     this.onMgShot = () => {};
     this.onMgHit = () => {};
+    /** Dirt / sand MG impact (air raid + optional ground spray). */
+    this.onMgDirtHit = () => {};
     this.groundExplosionAtlas = null;
     this.impactGlowTex = null;
 
@@ -348,13 +352,17 @@ export class Effects {
     });
     this._light = 0;
 
-    this.mgFlash = null; // legacy single kit (player); enemy uses mgFlashB
+    this.mgFlash = null; // player; enemy / enemy2 / boat use the other kits
     this.mgFlashB = null;
+    this.mgFlashD = null;
     // Active .50 streams: id → { pose, owner, shotT, flashAge, flash, roll }
     this._mgStreams = new Map();
     this._mgUp = new THREE.Vector3();
     this._mgSide = new THREE.Vector3();
     this._mgSide2 = new THREE.Vector3();
+    this._mgSpreadDir = new THREE.Vector3();
+    this._mgSpreadRight = new THREE.Vector3();
+    this._mgSpreadUp = new THREE.Vector3();
     this._mgMat = new THREE.Matrix4();
     this._mgRayOrigin = { x: 0, y: 0, z: 0 };
     this._mgRayDir = { x: 1, y: 0, z: 0 };
@@ -409,7 +417,7 @@ export class Effects {
     }
 
     // Camera-facing star + two barrel-aligned plumes crossed 90° (reads from all angles).
-    // Two kits so player + enemy can spray at once.
+    // Four kits so the player, both enemy tanks, and the patrol boat can spray at once.
     // Art is RGB on black (no alpha). Same emissive peak as the other glow sprites.
     // One,One so the black texels add nothing; a short edge fade keeps the card from outlining.
     const flashCard = (map, edgeFade, sprite) => {
@@ -449,6 +457,14 @@ export class Effects {
     };
     this.mgFlash = makeKit();
     this.mgFlashB = makeKit();
+    this.mgFlashC = makeKit();
+    this.mgFlashD = makeKit();
+    this._mgKit = {
+      player: this.mgFlash,
+      enemy: this.mgFlashB,
+      boat: this.mgFlashC,
+      enemy2: this.mgFlashD,
+    };
 
     const gif = decodeGif(await (await fetch(DAMAGE_FIRE_URL)).arrayBuffer());
     const canvas = document.createElement('canvas');
@@ -477,8 +493,8 @@ export class Effects {
     mat.blendSrcAlpha = THREE.ZeroFactor;
     mat.blendDstAlpha = THREE.OneFactor;
     mat.opacityNode = texture(map).a;
-    // Shared gif clip. Slots 0–1 = tanks; 2+ = wrecked props (trucks, …).
-    const FIRE_SLOTS = 6;
+    // Shared gif clip. 0 player, 1 + 6 enemy tanks, 2–3 trucks, 4–5 boats.
+    const FIRE_SLOTS = 7;
     fire.sprites = Array.from({ length: FIRE_SLOTS }, () => {
       const sprite = new THREE.Sprite(mat);
       sprite.center.set(0.5, 0.02);
@@ -518,9 +534,9 @@ export class Effects {
   }
 
   /**
-   * Hold-to-fire .50 cal. `id` isolates player vs enemy streams.
+   * Hold-to-fire .50 cal. `id` isolates player / enemy / boat streams.
    * Pass { pos, dir } each frame while firing, or null to stop.
-   * `owner` = firing tank rigid body (excluded from the bullet ray).
+   * `owner` = firing rigid body (excluded from the bullet ray).
    */
   setMgFlash(pose, owner = null, id = 'player') {
     if (!this.mgFlash) return;
@@ -536,7 +552,7 @@ export class Effects {
     }
     let s = this._mgStreams.get(id);
     if (!s) {
-      const flash = id === 'enemy' && this.mgFlashB ? this.mgFlashB : this.mgFlash;
+      const flash = this._mgKit?.[id] || this.mgFlash;
       s = {
         pose, owner, flash,
         shotT: MG_FLASH.shotInterval, // first round fires immediately
@@ -586,8 +602,11 @@ export class Effects {
     fx.light.position.copy(pos).addScaledVector(dir, 0.3);
   }
 
-  /** Hitscan .50 round — real physics ray so ricochets / damage line up with the barrel. */
-  _traceMgBullet(pos, dir, owner) {
+  /**
+   * Hitscan .50 round — real physics ray so ricochets / damage line up with the barrel.
+   * @param {{ damage?: number, air?: boolean }} [opts]
+   */
+  _traceMgBullet(pos, dir, owner, opts = {}) {
     const R = this.RAPIER;
     const o = this._mgRayOrigin;
     const d = this._mgRayDir;
@@ -598,17 +617,131 @@ export class Effects {
     if (!hit) return null;
     const point = pos.clone().addScaledVector(dir, hit.timeOfImpact);
     const normal = new THREE.Vector3(hit.normal.x, hit.normal.y, hit.normal.z);
-    // Ground/dirt: near terrain height with an upward face (keeps tank/barrel hits as metal sparks)
+    // Ground/dirt/concrete: near terrain height with an upward face (keeps tank/barrel hits as metal sparks)
     const dirt = Math.abs(point.y - terrainHeightAt(point.x, point.z)) < 0.35 && normal.y > 0.45;
-    this._mgImpactSparks(point, normal, dir, dirt);
+    if (dirt) {
+      this.dirtPlume(point);
+      this.onMgDirtHit({ point, dir: dir.clone(), normal, air: !!opts.air });
+    } else {
+      this._mgImpactSparks(point, normal, dir, false);
+    }
     this.onMgHit({
       point,
       collider: hit.collider,
       owner,
       dir: dir.clone(),
       normal,
+      damage: opts.damage,
+      air: !!opts.air,
     });
-    return hit.timeOfImpact;
+    return { reach: hit.timeOfImpact, body: hit.collider?.parent() ?? null };
+  }
+
+  /** Square cone around `dir`. Half-angle is `MG_SPREAD_DEG`. */
+  _spreadMgDir(dir) {
+    const spread = THREE.MathUtils.degToRad(MG_SPREAD_DEG);
+    const yawJ = (Math.random() - 0.5) * 2 * spread;
+    const pitchJ = (Math.random() - 0.5) * 2 * spread;
+    const up = this._mgSpreadUp;
+    if (Math.abs(dir.y) > 0.92) up.set(1, 0, 0);
+    else up.set(0, 1, 0);
+    const right = this._mgSpreadRight.crossVectors(dir, up).normalize();
+    up.crossVectors(right, dir).normalize();
+    return this._mgSpreadDir.copy(dir)
+      .addScaledVector(right, Math.tan(yawJ))
+      .addScaledVector(up, Math.tan(pitchJ))
+      .normalize();
+  }
+
+  /**
+   * P-51 strafe round: tracer + hitscan, no brass / roof-gun flash.
+   * @param {{ pos: THREE.Vector3, dir: THREE.Vector3 }} pose
+   * @param {{ damage?: number, owner?: object }} [opts]
+   */
+  fireAirMg(pose, opts = {}) {
+    if (!pose?.pos || !pose?.dir) return;
+    const dir = this._spreadMgDir(pose.dir);
+    const hit = this._traceMgBullet(pose.pos, dir, opts.owner ?? null, {
+      damage: opts.damage,
+      air: true,
+    });
+    this._spawnMgTracer(pose.pos, dir, hit?.reach ?? null);
+  }
+
+  /**
+   * Vertical sandy dust spout for air-raid (and MG) ground strikes — tall narrow plume.
+   * @param {THREE.Vector3} point
+   */
+  dirtPlume(point) {
+    const sand = new THREE.Color(0.82, 0.72, 0.52);
+    const sandDark = new THREE.Color(0.55, 0.45, 0.30);
+    // Core column — dense, rises fast, grows into a soft cloud (+50% size).
+    const n = 5 + (Math.random() * 3) | 0;
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1 || 1);
+      const origin = point.clone().add(new THREE.Vector3(
+        (Math.random() - 0.5) * 0.27,
+        0.02 + t * 0.08,
+        (Math.random() - 0.5) * 0.27,
+      ));
+      const v = new THREE.Vector3(
+        (Math.random() - 0.5) * 1.2,
+        6.5 + Math.random() * 5.5 + t * 2.5,
+        (Math.random() - 0.5) * 1.2,
+      );
+      this._sprite(
+        this.smokeTex,
+        sand.clone().lerp(sandDark, Math.random() * 0.35),
+        origin,
+        (0.22 + Math.random() * 0.18 + t * 0.12) * 1.5,
+        0.38 + Math.random() * 0.28,
+        {
+          vel: v,
+          grow: 4.5 + Math.random() * 2.5,
+          opacity: 0.55 + Math.random() * 0.25,
+          drag: 1.6,
+          rise: 0.15,
+        },
+      );
+    }
+    // Wispy top / edge flecks
+    for (let i = 0; i < 3; i++) {
+      this._sprite(
+        this.smokeTex,
+        sand.clone().lerp(new THREE.Color(0.9, 0.85, 0.7), 0.4),
+        point.clone().add(new THREE.Vector3((Math.random() - 0.5) * 0.45, 0.05, (Math.random() - 0.5) * 0.45)),
+        (0.14 + Math.random() * 0.12) * 1.5,
+        0.45 + Math.random() * 0.25,
+        {
+          vel: new THREE.Vector3((Math.random() - 0.5) * 2.2, 8 + Math.random() * 6, (Math.random() - 0.5) * 2.2),
+          grow: 5.5,
+          opacity: 0.35,
+          drag: 1.8,
+          rise: 0.2,
+        },
+      );
+    }
+    // Tiny hot grit at the tip of the spout
+    const gritN = 2 + (Math.random() < 0.5 ? 1 : 0);
+    const ramp = emissiveRamp([2.2, 1.3, 0.45], [0.4, 0.22, 0.08]);
+    for (let i = 0; i < gritN; i++) {
+      const size = (0.08 + Math.random() * 0.1) * 1.5;
+      const mat = emissiveSpriteMat(this.flashTex, new THREE.Color(...ramp.from), { additive: true });
+      const spark = new THREE.Sprite(mat);
+      spark.scale.setScalar(size);
+      spark.position.copy(point).add(new THREE.Vector3((Math.random() - 0.5) * 0.15, 0.04, (Math.random() - 0.5) * 0.15));
+      this.scene.add(spark);
+      this.particles.push({
+        obj: spark,
+        life: 0.2 + Math.random() * 0.25,
+        age: 0,
+        vel: new THREE.Vector3((Math.random() - 0.5) * 3, 7 + Math.random() * 8, (Math.random() - 0.5) * 3),
+        size,
+        spark: true,
+        sparkFrom: ramp.from,
+        sparkTo: ramp.to,
+      });
+    }
   }
 
   /** Head of the streak sits on `pos`; the tail trails back along `dir`. */
@@ -730,9 +863,16 @@ export class Effects {
     stream.flashAge = 0;
     this._mgSmoke(pos, dir);
     this._ejectMgBrass(pos, dir);
-    const reach = this._traceMgBullet(pos, dir, stream.owner);
-    this._spawnMgTracer(pos, dir, reach);
-    this.onMgShot({ owner: stream.owner });
+    const shotDir = this._spreadMgDir(dir);
+    const hit = this._traceMgBullet(pos, shotDir, stream.owner);
+    this._spawnMgTracer(pos, shotDir, hit?.reach ?? null);
+    this.onMgShot({
+      owner: stream.owner,
+      pos,
+      dir: shotDir,
+      reach: hit?.reach ?? null,
+      hitBody: hit?.body ?? null,
+    });
   }
 
   /** One spent casing out the right side of the receiver per round. */
@@ -916,6 +1056,98 @@ export class Effects {
   blast(pos) {
     const up = new THREE.Vector3(0, 1, 0);
     this._explode(pos.clone(), up, up.clone().negate(), null);
+  }
+
+  /**
+   * Smoke-launcher pop: canisters fire out in a ring, then bloom into the screen cloud.
+   * @param {{ x: number, y: number, z: number }} pos tank origin
+   * @param {number} [radius=10.5] cloud radius (land ring scales with it)
+   */
+  smokeBurst(pos, radius = 10.5) {
+    const n = 8;
+    const y0 = pos.y + 1.5;
+    const landR0 = radius * 0.4;
+    const landR1 = radius * 0.58;
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2 + Math.random() * 0.12;
+      const cos = Math.cos(a), sin = Math.sin(a);
+      const origin = new THREE.Vector3(pos.x + cos * 1.1, y0, pos.z + sin * 1.1);
+      const out = new THREE.Vector3(cos, 0.15 + Math.random() * 0.12, sin);
+      // Fast outward puff (the “grenade”)
+      this._sprite(
+        this.smokeTex,
+        new THREE.Color(0.72, 0.7, 0.66),
+        origin,
+        0.5 + Math.random() * 0.3,
+        0.55 + Math.random() * 0.25,
+        {
+          vel: out.clone().multiplyScalar(11 + Math.random() * 5),
+          grow: 8,
+          rise: 0.2,
+          opacity: 0.68,
+          drag: 2.8,
+        },
+      );
+      // Immediate bloom at the landing ring
+      const land = new THREE.Vector3(
+        pos.x + cos * (landR0 + Math.random() * (landR1 - landR0)),
+        y0 + Math.random() * 0.4,
+        pos.z + sin * (landR0 + Math.random() * (landR1 - landR0)),
+      );
+      this._sprite(
+        this.smokeTex,
+        new THREE.Color(0.55 + Math.random() * 0.12, 0.53, 0.48),
+        land,
+        2.0 + Math.random() * 1.0,
+        2.4 + Math.random() * 1.2,
+        {
+          vel: new THREE.Vector3((Math.random() - 0.5) * 0.8, 1.2 + Math.random() * 0.8, (Math.random() - 0.5) * 0.8),
+          grow: 4.5,
+          rise: 0.9,
+          opacity: 0.68,
+          drag: 0.7,
+        },
+      );
+    }
+  }
+
+  /**
+   * Sustained screen cloud for an active smoke volume. Call every frame while alive.
+   * @param {{ x: number, y: number, z: number, r: number }} cloud
+   * @param {number} dt
+   * @param {number} amount emission strength 0..1+ (includes density multiplier)
+   */
+  smokeScreen(cloud, dt, amount = 1) {
+    const rate = 14 * amount * dt;
+    let n = Math.floor(rate);
+    if (Math.random() < rate - n) n += 1;
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const d = cloud.r * (0.25 + Math.random() * 0.75);
+      const grey = 0.48 + Math.random() * 0.18;
+      this._sprite(
+        this.smokeTex,
+        new THREE.Color(grey, grey * 0.97, grey * 0.9),
+        new THREE.Vector3(
+          cloud.x + Math.cos(a) * d,
+          cloud.y + Math.random() * 2.2,
+          cloud.z + Math.sin(a) * d,
+        ),
+        2.8 + Math.random() * 2.0,
+        1.8 + Math.random() * 1.2,
+        {
+          vel: new THREE.Vector3(
+            (Math.random() - 0.5) * 0.55,
+            0.5 + Math.random() * 0.65,
+            (Math.random() - 0.5) * 0.55,
+          ),
+          grow: 2.6 + Math.random() * 1.2,
+          rise: 0.6,
+          opacity: Math.min(0.85, (0.42 + Math.random() * 0.18) * 1.25),
+          drag: 0.55,
+        },
+      );
+    }
   }
 
   /** Dark smoke rising off a wreck. A handful of puffs a second. */
@@ -1115,6 +1347,11 @@ export class Effects {
     sprite.visible = true;
     sprite.position.copy(pos);
     sprite.scale.set(scale, scale, 1);
+  }
+
+  /** True while any default fire-gif slot is showing (tanks, trucks, …). */
+  anyDamageFire() {
+    return !!this.damageFire?.sprites.some((s) => s.visible);
   }
 
   _blitDamageFire(frame) {

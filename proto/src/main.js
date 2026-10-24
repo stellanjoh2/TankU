@@ -6,7 +6,7 @@ import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader.js';
 import { LightProbeGenerator } from 'three/examples/jsm/lights/LightProbeGenerator.js';
 import { SkyMesh } from 'three/examples/jsm/objects/SkyMesh.js';
 import { createPost } from './post.js';
-import { buildTerrain, heightAt, isGrassable, PLAYER_SPAWN, BRIDGE } from './terrain.js';
+import { buildTerrain, heightAt, isGrassable, PLAYER_SPAWN, BRIDGE, ENEMY_SPAWN, ENEMY_SPAWN_BASE } from './terrain.js';
 import { buildProps } from './props.js';
 import { buildAirfield } from './airfield.js';
 import { buildPort } from './port.js';
@@ -16,7 +16,8 @@ import { createVisualsEditor } from './visuals.js';
 import { shadowTint, patchShadowTint } from './shadowTint.js';
 import { createCloudShadows } from './cloudShadows.js';
 import { Input } from './input.js';
-import { Tank, RELOAD } from './tank.js';
+import { Tank, RELOAD, REPAIR_TIME } from './tank.js';
+import { installTankLods, updateTankLod } from './tankLod.js';
 import { Effects } from './fx.js';
 import { TankCamera } from './TankCamera.js';
 import { Sfx, distGain } from './sfx.js';
@@ -24,6 +25,8 @@ import { NavGrid } from './navgrid.js';
 import { TankAI, pickSpawn } from './ai.js';
 import { createMatch } from './match.js';
 import { createHud } from './hud.js';
+import { createSmokeField } from './smoke.js';
+import { createAirSupport } from './airSupport.js';
 import { createDebug } from './debug.js';
 import { FreeFlight } from './freeflight.js';
 import { buildPlanes } from './planes.js';
@@ -34,6 +37,7 @@ import { buildBridge } from './bridge.js';
 import { buildFlag } from './flag.js';
 import { buildBarrels } from './barrels.js';
 import { buildTrucks } from './truck.js';
+import { buildPatrolBoat } from './patrolBoat.js';
 import { buildPebbles } from './pebbles.js';
 import { createEngineHeatHaze } from './heatHaze.js';
 import './style.css';
@@ -145,7 +149,7 @@ async function main() {
   buildProps(RAPIER, world, scene);
   const airfield = buildAirfield(RAPIER, world, scene);
   const port = buildPort(RAPIER, world, scene);
-  const [grass, vegetation, planes, , waterTower, flag, barrels, trucks, bridge] = await Promise.all([
+  const [grass, vegetation, planes, , waterTower, flag, barrels, trucks, bridge, patrolBoat] = await Promise.all([
     buildGrass(scene),
     buildVegetation(scene, { RAPIER, world }),
     buildPlanes(scene),
@@ -155,11 +159,13 @@ async function main() {
     buildBarrels(scene, { RAPIER, world }),
     buildTrucks(scene, { RAPIER, world }),
     buildBridge(scene, { RAPIER, world }),
+    buildPatrolBoat(scene, { RAPIER, world }),
   ]);
   await buildPebbles(scene, vegetation.pebbleAnchors, terrain.groundSets, terrain.palette.concrete);
 
   const loader = new GLTFLoader();
-  const [gltf, enemyGltf, wreckGltf] = await Promise.all([
+  const [gltf, enemyGltf, enemyGltfB, wreckGltf] = await Promise.all([
+    loader.loadAsync('./models/sherman.glb'),
     loader.loadAsync('./models/sherman.glb'),
     loader.loadAsync('./models/sherman.glb'),
     loader.loadAsync('./models/sherman_destroyed.glb'),
@@ -167,13 +173,14 @@ async function main() {
   const { x: sx, z: sz } = PLAYER_SPAWN;
   const spawn = { x: sx, y: heightAt(sx, sz) + 0.6, z: sz, yaw: Math.atan2(-(BRIDGE.z - sz), BRIDGE.x - sx) };
   const wreckSrc = wreckGltf.scene;
-  const tank = new Tank(gltf, RAPIER, world, spawn, { wreck: wreckSrc });
+  const tank = new Tank(gltf, RAPIER, world, spawn, { wreck: wreckSrc, repairGlow: true });
   scene.add(tank.model);
   const heatHaze = createEngineHeatHaze();
   heatHaze.visible = false;
   tank.model.add(heatHaze);
   const fx = new Effects(scene, RAPIER, world, tank.body, barrels.dynamic);
   fx.camera = camera;
+  const smoke = createSmokeField(fx);
 
   const nav = new NavGrid();
   nav.setObstacles([
@@ -181,16 +188,28 @@ async function main() {
     ...port.navObstacles(), ...waterTower.navObstacles(), ...flag.navObstacles(),
     ...trucks.navObstacles(),
   ]);
-  const enemySpawn = pickSpawn(nav, spawn);
-  const enemy = new Tank(enemyGltf, RAPIER, world, enemySpawn, { tint: ENEMY_TINT, wreck: wreckSrc });
-  scene.add(enemy.model);
-  const ai = new TankAI({ tank: enemy, enemy: tank, nav, world, RAPIER, coverRocks: vegetation.coverRocks });
+  const foeSpecs = [
+    { src: enemyGltf, anchor: ENEMY_SPAWN, fireSlot: 1, mgId: 'enemy' },
+    { src: enemyGltfB, anchor: ENEMY_SPAWN_BASE, spawnR: 10, patrolR: [8, 16], fireSlot: 6, mgId: 'enemy2' },
+  ];
+  const foes = foeSpecs.map(({ src, anchor, fireSlot, mgId, patrolR, spawnR }) => {
+    const foe = new Tank(src, RAPIER, world, pickSpawn(nav, spawn, anchor, spawnR), { tint: ENEMY_TINT, wreck: wreckSrc });
+    scene.add(foe.model);
+    const brain = new TankAI({ tank: foe, enemy: tank, nav, world, RAPIER, coverRocks: vegetation.coverRocks, anchor, patrolR });
+    return { tank: foe, ai: brain, anchor, spawnR, fireSlot, mgId };
+  });
+  const enemy = foes[0].tank;
+  const ai = foes[0].ai;
   const hud = createHud();
 
   const tankCam = new TankCamera(camera);
   tankCam.setColliders([terrain.mesh, vegetation.coverRoot, bridge.root, trucks.root]);
   const sfx = new Sfx();
-  await Promise.all([sfx.load(), fx.load()]);
+  await Promise.all([
+    sfx.load(),
+    fx.load(),
+    ...foes.map((f) => installTankLods(f.tank)),
+  ]);
   sfx.setMusicMuted(localStorage.getItem(MUSIC_MUTE_KEY) === '1');
   {
     const saved = localStorage.getItem(MUSIC_VOL_KEY);
@@ -206,12 +225,40 @@ async function main() {
   addEventListener('keydown', unlockAudio, { once: true });
 
   const match = createMatch({
-    tank, enemy, ai, nav, fx, hud, sfx, tankCam, input,
-    vegetation, airfield, port, waterTower, barrels, trucks, spawn,
+    tank, foes, nav, fx, hud, sfx, tankCam, input,
+    vegetation, airfield, port, waterTower, barrels, trucks, patrolBoat, spawn,
+    smoke,
     onRestart: (opts) => onMatchRestart(opts),
   });
   match.wireFx();
   const { game } = match;
+
+  function nearestLivingFoe() {
+    let best = null;
+    let bestD = Infinity;
+    const p = tank.position;
+    for (const f of foes) {
+      if (!f.tank.alive) continue;
+      const e = f.tank.position;
+      const d = (e.x - p.x) ** 2 + (e.z - p.z) ** 2;
+      if (d < bestD) { bestD = d; best = f; }
+    }
+    return best;
+  }
+
+  const airSupport = createAirSupport({
+    planes,
+    fx,
+    sfx,
+    getTarget: () => {
+      if (game.solo) return null;
+      const f = nearestLivingFoe();
+      if (!f) return null;
+      const p = f.tank.position;
+      return { x: p.x, z: p.z };
+    },
+    getOwner: () => tank.body,
+  });
 
   const pathLine = new THREE.Line(
     new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(256 * 3), 3)),
@@ -242,7 +289,7 @@ async function main() {
   }
 
   sky.name = 'SkyDome';
-  const debug = createDebug(scene, world, { tanks: [tank, enemy], grass });
+  const debug = createDebug(scene, world, { tanks: [tank, ...foes.map((f) => f.tank)], grass });
   const fly = new FreeFlight(camera);
 
   patchShadowTint(scene);
@@ -250,7 +297,7 @@ async function main() {
     renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe, terrain, grass, vegetation, barrels, trucks, post, shadowTint, fx, clouds,
     getEnvIntensity: () => scene.environmentIntensity,
     setEnvIntensity: (v) => { scene.environmentIntensity = v; },
-    tanks: [tank, enemy],
+    tanks: [tank, ...foes.map((f) => f.tank)],
     game: {
       getSolo: () => game.solo,
       setSolo: (v) => match.setSolo(v),
@@ -290,8 +337,10 @@ async function main() {
   });
 
   // ---------------------------------------------------------------- camera + aim helpers
-  // Mouse look is free; the turret slews toward the reticle at traverse speed.
-  // TankCamera still stays mostly behind the hull (turretFollowWeight).
+  // Soft orbit: mouse leads the barrel within this window; boom follows look
+  // (TankCamera turretFollowWeight). Past the lead, the window slides as the
+  // turret catches the reticle — never a hard lock, never free 360 freelook.
+  const TURRET_CAM_LEAD = THREE.MathUtils.degToRad(55);
   let lookYaw = spawn.yaw;
   let lookPitch = -0.08;
   const viewDir = new THREE.Vector3();
@@ -301,7 +350,6 @@ async function main() {
   const _fwd = new THREE.Vector3();
   const _q = new THREE.Quaternion();
   const _euler = new THREE.Euler();
-  let prevLookYaw = spawn.yaw;
 
   function bodyYaw() {
     _fwd.set(1, 0, 0).applyQuaternion(_q.copy(tank.body.rotation()));
@@ -342,7 +390,6 @@ async function main() {
   function snapCam() {
     lookYaw = turretAimYaw() ?? bodyYaw();
     lookPitch = -0.08;
-    prevLookYaw = lookYaw;
     tankCam.snap(camState());
   }
 
@@ -352,23 +399,76 @@ async function main() {
   }
 
   onMatchRestart = ({ resetCam = true } = {}) => {
+    sfx.repairStop();
     lookYaw = spawn.yaw;
     lookPitch = -0.08;
-    prevLookYaw = lookYaw;
     if (fly.enabled) fly.exit();
     if (resetCam) tankCam.resetDefaults();
     snapCam();
     updatePathLine();
   };
 
-  $('reset-cam').addEventListener('click', (e) => {
+  // ---------------------------------------------------------------- pause (one overlay: Esc / unlock)
+  // True pause whenever the menu is up — sim, camera, FX time, and audio all freeze.
+  let menuPaused = true;
+  // Esc that exits pointer-lock must not also count as "resume" on the same keypress.
+  let escHeld = false;
+  let suppressEscResume = false;
+  const overlayEl = $('overlay');
+  const canvasEl = renderer.domElement;
+
+  function setMenuPaused(on) {
+    on = !!on;
+    if (menuPaused === on) return;
+    menuPaused = on;
+    overlayEl.classList.toggle('hidden', !on || visuals.open);
+    sfx.setPaused(on);
+    if (on) {
+      if (document.pointerLockElement) document.exitPointerLock();
+    }
+  }
+
+  function resumeFromMenu() {
+    setMenuPaused(false);
+    canvasEl.requestPointerLock();
+  }
+
+  addEventListener('keydown', (e) => {
+    if (e.code !== 'Escape') return;
+    escHeld = true;
+  }, true);
+  addEventListener('keyup', (e) => {
+    if (e.code !== 'Escape') return;
+    escHeld = false;
+    suppressEscResume = false;
+  }, true);
+
+  document.addEventListener('pointerlockchange', () => {
+    if (document.pointerLockElement === canvasEl) {
+      setMenuPaused(false);
+    } else if (!visuals.open) {
+      setMenuPaused(true);
+      if (escHeld) suppressEscResume = true;
+    }
+  });
+
+  overlayEl.addEventListener('click', (e) => {
+    if (e.target.closest('button')) return;
+    resumeFromMenu();
+  });
+  $('pause-resume').addEventListener('click', (e) => {
     e.stopPropagation();
-    resetCameraDefaults();
+    resumeFromMenu();
   });
   $('restart-game').addEventListener('click', (e) => {
     e.stopPropagation();
     match.restart();
   });
+  $('reset-cam').addEventListener('click', (e) => {
+    e.stopPropagation();
+    resetCameraDefaults();
+  });
+  sfx.setPaused(true);
 
   function setDebug(on) {
     debug.setEnabled(on);
@@ -389,7 +489,45 @@ async function main() {
     }
   }
 
+  // Gadget hotkeys: 1 = smoke, 2 = air support, 3 = repair (select + fire)
+  let activeGadget = 'smoke';
+
+  function useSmoke() {
+    activeGadget = 'smoke';
+    if (fly.enabled || !tank.alive) return;
+    const pose = tank.trySmoke();
+    if (!pose) return;
+    smoke.deploy(pose);
+    sfx.smokeBomb();
+    input.rumble(0.2, 0.45, 140);
+  }
+
+  function useAir() {
+    activeGadget = 'air';
+    if (fly.enabled || !tank.alive) return;
+    if (airSupport.call()) input.rumble(0.15, 0.35, 120);
+  }
+
+  function useRepair() {
+    activeGadget = 'repair';
+    if (fly.enabled || !tank.alive) return;
+    if (!tank.tryRepair()) return;
+    sfx.repairStart();
+    input.rumble(0.16, 0.28, 90);
+  }
+
   input.onPress = (code) => {
+    if (code === 'Escape') {
+      if (visuals.open) { visuals.setOpen(false); return; }
+      if (menuPaused) {
+        if (!suppressEscResume) resumeFromMenu();
+        return;
+      }
+      suppressEscResume = true;
+      setMenuPaused(true);
+      return;
+    }
+    if (menuPaused) return;
     if (code === 'KeyR' && !fly.enabled) { tank.reset(heightAt); snapCam(); }
     if (code === 'KeyC' && !fly.enabled) resetCameraDefaults();
     // Space: hop upright only when flipped (ignored while upright / in freefly)
@@ -397,6 +535,9 @@ async function main() {
     if (code === 'KeyV') visuals.toggle();
     if (code === 'F3' || code === 'Backquote') setDebug(!game.debug);
     if (code === 'KeyF') toggleFly();
+    if (code === 'Digit1' || code === 'Numpad1') useSmoke();
+    if (code === 'Digit2' || code === 'Numpad2') useAir();
+    if (code === 'Digit3' || code === 'Numpad3') useRepair();
   };
 
   function castFrom(origin, dir, maxDist, out) {
@@ -411,10 +552,14 @@ async function main() {
       return;
     }
 
-    // Free look — no clamp to barrel yaw. Soft per-frame cap only so a huge
-    // mouse spike can't wrap past π in one sample.
+    // Soft lead: free within ±LEAD of the barrel; held turn slides the window
+    // at traverse speed as the gun chases the reticle.
     lookYaw = wrapYaw(lookYaw - THREE.MathUtils.clamp(inp.aimX, -Math.PI, Math.PI));
     lookPitch = THREE.MathUtils.clamp(lookPitch - inp.aimY, -0.75, 0.45);
+    const gunYaw = turretAimYaw();
+    if (gunYaw != null) {
+      lookYaw = gunYaw + THREE.MathUtils.clamp(wrapYaw(lookYaw - gunYaw), -TURRET_CAM_LEAD, TURRET_CAM_LEAD);
+    }
 
     if (inp.zoom) {
       const k = 1 + inp.zoom * 0.08;
@@ -423,10 +568,8 @@ async function main() {
       tankCam.cfg.distanceMax = d;
     }
 
-    const turretTurn = THREE.MathUtils.clamp(
-      (lookYaw - prevLookYaw) / Math.max(dt, 1e-4) / 2.6, -1, 1,
-    );
-    prevLookYaw = lookYaw;
+    // Camera lean from real turret motion (prev frame), not raw mouse delta.
+    const turretTurn = THREE.MathUtils.clamp(tank.turretSlew / 2.6, -1, 1);
 
     tankCam.update(dt, camState(turretTurn));
 
@@ -472,12 +615,26 @@ async function main() {
     }
     hud.setNitro(tank.nitroCharge, tank.nitroActive);
     hud.setReload(tank.alive ? tank.reload : 0, RELOAD);
-    hud.setStress(
-      tank.alive ? tank.stress / 100 : 0,
-      !game.solo && enemy.alive ? enemy.stress / 100 : 0,
+    const gadgetCd = activeGadget === 'smoke' ? tank.smokeCd : activeGadget === 'air' ? airSupport.cd : 0;
+    hud.setGadget(activeGadget, gadgetCd, activeGadget === 'repair' ? {
+      repairing: tank.repairing,
+      repairLeft: tank.repairT,
+      charges: tank.repairs,
+    } : null);
+    hud.setRepair(tank.repairT, REPAIR_TIME);
+    // HIT% = stress jitter + smoke (−10% when either tank is in a cloud)
+    const pPos = tank.position;
+    const near = game.solo ? null : nearestLivingFoe();
+    const ePos = near ? near.tank.position : enemy.position;
+    const pSmoke = tank.alive ? smoke.missBonus(pPos.x, pPos.z, ePos.x, ePos.z) : 0;
+    const eSmoke = near ? smoke.missBonus(ePos.x, ePos.z, pPos.x, pPos.z) : 0;
+    hud.setHitRate(
+      tank.alive ? tank.hitRate(pSmoke) : 1,
+      near ? near.tank.hitRate(eSmoke) : 1,
+      pSmoke > 0,
+      eSmoke > 0,
     );
-    // Hide while driving, on gamepad, or while the visuals editor has the cursor
-    $('overlay').classList.toggle('hidden', input.locked || !!inp.pad || visuals.open);
+    overlayEl.classList.toggle('hidden', !menuPaused || visuals.open);
   }
 
   // ---------------------------------------------------------------- loop
@@ -494,9 +651,9 @@ async function main() {
   // Hull local: +X forward, exhaust sits on the rear deck
   const EXHAUST_LOCAL = new THREE.Vector3(-2.55, 1.85, 0);
   const WRECK_LOCAL = new THREE.Vector3(-0.2, 2.6, 0);
-  const BURN_LOCAL = new THREE.Vector3(-1.7, 2.05, 0.35);   // engine deck behind the turret
-  // Dark grille on the rear deck (Hull_Details, metal). Underside is ~1.88; flame base sits just under it.
-  const FIRE_LOCAL = new THREE.Vector3(-2.02, 1.82, 0);
+  const BURN_LOCAL = new THREE.Vector3(-1.7, 1.8, 0.35);   // engine deck behind the turret
+  // Dark grille on the rear deck (Hull_Details, metal). Flame base sits into the deck, not on top.
+  const FIRE_LOCAL = new THREE.Vector3(-2.02, 1.55, 0);
   const burnPoint = new THREE.Vector3();
   const firePoint = new THREE.Vector3();
 
@@ -510,7 +667,7 @@ async function main() {
   }
 
   function setTankFire(t, stage) {
-    const slot = t === tank ? 0 : 1;
+    const slot = t === tank ? 0 : (foes.find((f) => f.tank === t)?.fireSlot ?? 1);
     if (t === tank) heatHaze.visible = stage > 0;
     if (stage <= 0) {
       fx.setDamageFire(null, 0, slot);
@@ -598,19 +755,25 @@ async function main() {
   function frame(now) {
     const dt = Math.min(0.1, (now - last) / 1000);
     last = now;
-    input.setEnabled(!visuals.open);
+    input.setEnabled(!visuals.open && !menuPaused);
     const inp = input.read(dt);
-    if (inp.padPressed.includes(9) && !fly.enabled) { tank.reset(heightAt); snapCam(); }
+    // Gamepad: any button leaves the pause menu (no pointer lock needed)
+    if (menuPaused) {
+      if (inp.padPressed.length) setMenuPaused(false);
+    } else if (inp.padPressed.includes(9) && !fly.enabled) {
+      tank.reset(heightAt); snapCam();
+    }
 
     const versus = !game.solo;
     const flying = fly.enabled;
-    // Freefly freezes the sim so screenshots don't fight moving tanks / FX.
-    const paused = flying;
+    // Menu = hard freeze. Freefly = soft freeze (screenshots) without the overlay.
+    const paused = flying || menuPaused;
     if (!paused) elapsed += dt;
 
-    if (versus && !paused) ai.update(dt, { halt: game.overT > 0 });
+    if (versus && !paused) {
+      for (const f of foes) f.ai.update(dt, { halt: game.overT > 0 });
+    }
     const playerDrive = (!flying && tank.alive) ? inp : IDLE;
-    const enemyDrive = (!paused && enemy.alive) ? ai.drive : IDLE;
 
     if (!paused && tank.alive && !flying) {
       tank.updateNitro(dt, playerDrive.boost);
@@ -629,8 +792,10 @@ async function main() {
     } else if (!paused) {
       tank.updateNitro(dt, false);
     }
-    if (versus && !paused && enemy.alive) {
-      enemy.updateNitro(dt, enemyDrive.boost);
+    if (versus && !paused) {
+      for (const f of foes) {
+        if (f.tank.alive) f.tank.updateNitro(dt, f.ai.drive.boost);
+      }
     }
 
     if (!paused) {
@@ -638,69 +803,129 @@ async function main() {
       let steps = 0;
       while (acc >= FIXED_DT && steps < MAX_SUBSTEPS) {
         tank.physicsStep(FIXED_DT, playerDrive);
-        if (versus) enemy.physicsStep(FIXED_DT, enemyDrive);
+        if (versus) {
+          for (const f of foes) f.tank.physicsStep(FIXED_DT, f.tank.alive ? f.ai.drive : IDLE);
+        }
         world.step();
         acc -= FIXED_DT;
         steps++;
       }
+      patrolBoat.update(dt, {
+        player: tank,
+        fx,
+        onContact: versus ? (pos) => {
+          for (const f of foes) f.ai.alert(pos.x, pos.z);
+        } : null,
+      });
       // Drop the backlog instead of spiralling: a slow frame shouldn't make the next one slower.
       if (steps === MAX_SUBSTEPS) acc = Math.min(acc, FIXED_DT);
+      vegetation?.checkRams?.([
+        tank.body,
+        ...(versus ? foes.filter((f) => f.tank.alive).map((f) => f.tank.body) : []),
+      ]);
     }
     barrels.sync();
-    clouds.update(dt);
+    vegetation?.sync?.();
     if (!paused) {
+      clouds.update(dt);
       planes.update(dt);
     }
 
-    updateCamera(dt, inp);
+    if (!menuPaused) updateCamera(dt, inp);
+    else camera.getWorldDirection(viewDir);
     castFrom(camera.position, viewDir, 1200, aimPoint);
     // Freefly owns the look — leave the turret alone so the hull doesn't track the ghost cam
     if (!paused) tank.update(dt, tank.alive ? aimPoint : null);
+    if (tank.repairCancelled) sfx.repairStop();
+    if (tank.repairDone) {
+      sfx.repairStop();
+      sfx.repairComplete();
+    }
+    tank.repairDone = false;
+    tank.repairCancelled = false;
     if (tank.reloadDone && tank.alive) sfx.reload();
     tank.reloadDone = false;
     const m = tank.muzzle();
     castFrom(m.pos, m.dir, 1200, gunPoint);
 
     if (inp.fire && tank.alive && !flying) {
-      const shot = tank.tryFire();
+      const aimed = versus ? nearestLivingFoe() : null;
+      const tp = aimed ? aimed.tank.position : gunPoint;
+      const p = tank.position;
+      const shot = tank.tryFire(smoke.missBonus(p.x, p.z, tp.x, tp.z));
       if (shot) {
         fx.fire({ ...shot, owner: tank.body });
         fx.muzzleFlash(shot.pos, shot.dir);
         tankCam.kick(0.5, RELOAD);
         sfx.fire();
         input.rumble(1.0, 0.8, 220);
-        if (versus) ai.hearShot(shot.pos);
+        if (versus) for (const f of foes) f.ai.hearShot(shot.pos);
       }
     }
 
     if (versus && !paused) {
-      enemy.update(dt, enemy.alive ? ai.aimPoint : null);
-      if (ai.wantsFire) {
-        const shot = enemy.tryFire();
-        if (shot) {
-          fx.fire({ ...shot, owner: enemy.body });
-          fx.muzzleFlash(shot.pos, shot.dir);
-          ai.onFired();
-          sfx.fire(0.9 * distGain(shot.pos.distanceTo(tank.model.position), 160));
+      for (const f of foes) {
+        const e = f.tank;
+        e.update(dt, e.alive ? f.ai.aimPoint : null);
+        if (f.ai.wantsSmoke) {
+          const pose = e.trySmoke();
+          if (pose) {
+            smoke.deploy(pose);
+            sfx.smokeBomb(0.85 * distGain(e.model.position.distanceTo(tank.model.position), 120));
+          }
         }
+        if (f.ai.wantsFire) {
+          const ep = e.position;
+          const pp = tank.position;
+          const shot = e.tryFire(smoke.missBonus(ep.x, ep.z, pp.x, pp.z));
+          if (shot) {
+            fx.fire({ ...shot, owner: e.body });
+            fx.muzzleFlash(shot.pos, shot.dir);
+            f.ai.onFired();
+            const hearD = shot.pos.distanceTo(tank.model.position);
+            sfx.fire(0.9 * distGain(hearD, 160), hearD);
+          }
+        }
+        tankFx(e, dt);
       }
-      tankFx(enemy, dt);
     } else if (!versus) {
-      fx.setDamageFire(null, 0, 1);
+      for (const f of foes) fx.setDamageFire(null, 0, f.fireSlot);
     }
 
-    // Roof .50 cal — player RMB/R1; enemy AI sprays sometimes while its main gun reloads
+    // Roof .50 cal — player RMB/R1; enemy AI sprays sometimes while its main gun reloads.
+    // Hostile loops are a second voice: quieter and duller the farther the shooter is.
     const mgFire = inp.mgFire && tank.alive && !flying;
-    const enemyMg = versus && !paused && enemy.alive && ai.wantsMg;
-    sfx.setMgFire(mgFire || enemyMg);
+    let hostileMgDist = null;
+    const hearFrom = (p) => {
+      const d = p.distanceTo(tank.model.position);
+      if (hostileMgDist == null || d < hostileMgDist) hostileMgDist = d;
+    };
+    for (const f of foes) {
+      if (versus && !paused && f.tank.alive && f.ai.wantsMg) {
+        hearFrom(f.tank.model.position);
+        fx.setMgFlash(f.tank.mgMuzzle(), f.tank.body, f.mgId);
+      } else {
+        fx.setMgFlash(null, null, f.mgId);
+      }
+    }
+    let boatMg = false;
+    if (!paused) {
+      for (const b of patrolBoat.boats) {
+        if (!b.firing) continue;
+        boatMg = true;
+        hearFrom(b.root.position);
+      }
+    }
+    sfx.setMgFire(mgFire);
+    sfx.setHostileMg(hostileMgDist);
     if (mgFire) {
       fx.setMgFlash(tank.mgMuzzle(), tank.body, 'player');
       input.rumble(0.12, 0.35, 50);
     } else {
       fx.setMgFlash(null, null, 'player');
     }
-    if (enemyMg) fx.setMgFlash(enemy.mgMuzzle(), enemy.body, 'enemy');
-    else fx.setMgFlash(null, null, 'enemy');
+    if (boatMg) fx.setMgFlash(patrolBoat.mgMuzzle(), patrolBoat.firingBody(), 'boat');
+    else fx.setMgFlash(null, null, 'boat');
     if (!paused) tankFx(tank, dt);
 
     if (!paused) match.tick(dt);
@@ -710,32 +935,50 @@ async function main() {
     vegetation?.updateLod?.(camera.position);
     barrels.updateLod(camera.position);
     trucks.updateLod(camera.position);
+    patrolBoat.updateLod(camera.position);
+    for (const f of foes) updateTankLod(f.tank, camera.position);
     if (!paused) {
+      smoke.update(dt);
+      airSupport.update(dt);
       fx.update(dt, heightAt);
       barrels.update(dt, fx);
       waterTower.update(dt, fx);
       trucks.update(dt, fx);
+      airfield.update?.(dt);
       grass.update(elapsed);
       vegetation?.update?.(elapsed);
       flag.update(elapsed, vegetation?.getWind?.());
+      // Backdrop P-51 runup — audible across more of the scout orbit (~200 m).
+      {
+        const sp = planes.scoutPos?.();
+        const orbit = sp
+          ? distGain(sp.distanceTo(tank.model.position), 200)
+          : 0;
+        sfx.setP51Orbit(orbit);
+      }
+      sfx.setFire(fx.anyDamageFire());
       sfx.update(dt, {
         speed: tank.forwardSpeed(),
         throttle: tank.cmd.throttle,
         maxSpeed: 12.5,
         turretSlew: tank.turretSlew,
       });
-    } else {
+    } else if (!menuPaused) {
+      // Freefly soft-pause: keep loops quiet but audio context running
+      sfx.setP51Orbit(0);
+      sfx.setFire(fx.anyDamageFire());
       sfx.update(dt, { speed: 0, throttle: 0, maxSpeed: 12.5, turretSlew: 0 });
     }
     updateSun();
     updateHud(inp);
-    hud.update(dt, camera);
-    post.render(dt);
+    const freezeDt = menuPaused ? 0 : dt;
+    hud.update(freezeDt, camera);
+    post.render(freezeDt);
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
   $('loading').remove();
-  window.__sherman = { renderer, tank, enemy, ai, nav, game, match, input, fx, tankCam, sfx, world, grass, vegetation, terrain, visuals, debug, fly, lightProbe, sky, planes, flag, barrels, clouds };
+  window.__sherman = { renderer, tank, enemy, foes, ai, nav, game, match, input, fx, smoke, airSupport, tankCam, sfx, world, grass, vegetation, terrain, visuals, debug, fly, lightProbe, sky, planes, flag, barrels, clouds, patrolBoat };
 }
 
 main().catch((e) => {

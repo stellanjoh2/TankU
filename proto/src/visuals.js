@@ -1,6 +1,7 @@
 // Live Visuals editor — sky / sun / ground / grass / grading / post. Toggle with V.
 import * as THREE from 'three';
 import { VISUAL_DEFAULTS } from './visualDefaults.js';
+import { getTankLodScale, setTankLodScale } from './tankLod.js';
 
 const SKY_CLOUD_SPEED = 0.00002; // SkyMesh default cloudSpeed = slider 1×
 
@@ -581,6 +582,7 @@ export function createVisualsEditor(ctx) {
           }
         });
     }
+    addSlider(s, 'Enemy LOD distance ×', 0.25, 4, 0.05, getTankLodScale, setTankLodScale);
   }
 
   // Ground

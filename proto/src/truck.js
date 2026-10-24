@@ -5,6 +5,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { AIRFIELD_Y, heightAt } from './terrain.js';
 import { pickLod } from './lod.js';
 import { createEngineHeatHaze } from './heatHaze.js';
+import { applyBurntMetal } from './burntMetal.js';
 
 const SLAB_T = 0.06;
 const NODE = 'ArmyTruck';
@@ -84,6 +85,7 @@ export async function buildTrucks(scene, { RAPIER, world }) {
   ruinSrc.position.set(0, 0, 0);
   ruinSrc.rotation.set(0, 0, 0);
   ruinSrc.scale.set(1, 1, 1);
+  applyBurntMetal(ruinSrc);
 
   const root = new THREE.Group();
   root.name = 'ArmyTrucks';
@@ -197,16 +199,6 @@ export async function buildTrucks(scene, { RAPIER, world }) {
     const ruin = ruinSrc.clone(true);
     ruin.name = `${obj.name}_Destroyed`;
     ruin.visible = false;
-    ruin.traverse((o) => {
-      if (!o.isMesh) return;
-      o.castShadow = true;
-      o.receiveShadow = false;
-      for (const mat of [].concat(o.material)) {
-        if (!mat || mat.userData.truckRuinPatched) continue;
-        mat.userData.truckRuinPatched = true;
-        mat.side = THREE.DoubleSide;
-      }
-    });
     obj.add(ruin);
 
     const haze = createEngineHeatHaze({
@@ -235,7 +227,6 @@ export async function buildTrucks(scene, { RAPIER, world }) {
 
     const t = {
       obj, lods, ruin, haze, lod: -2, body, collider, spot, dead: false,
-      smokeY: y0 + 1.1,
       fireSlot: FIRE_SLOT0 + i,
     };
     live.push(t);
@@ -288,7 +279,8 @@ export async function buildTrucks(scene, { RAPIER, world }) {
     update(dt, fx) {
       for (const t of live) {
         if (!t.dead || !fx) continue;
-        smokeAt.set(t.spot.x, t.smokeY, t.spot.z);
+        // Fire gif is bottom-anchored — sit on terrain so flames don't float over the wreck.
+        smokeAt.set(t.spot.x, heightAt(t.spot.x, t.spot.z), t.spot.z);
         fx.plume(smokeAt, dt * 0.85);
         if (t.haze.visible) fx.setDamageFire(smokeAt, FIRE_STAGE, t.fireSlot);
         else fx.setDamageFire(null, 0, t.fireSlot);

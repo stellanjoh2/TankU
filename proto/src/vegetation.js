@@ -67,6 +67,13 @@ const COVER_HEIGHT = [3.4, 4.8];
 const COVER_MAX_FOOTPRINT = 15;
 const COVER_SPAWN_CLEAR = 18;
 const PALM_TRUNK_R = 0.4;
+/** kg/m³ — light wood; shell / .50 impulses topple a standing trunk in one hit. */
+const PALM_DENSITY = 135;
+/** .50 cal shove at the impact point (main-gun uses fx IMPACT_IMPULSE after we go dynamic). */
+const PALM_MG_IMPULSE = 1800;
+/** Hull ram: base tip + per m/s of tank speed (applied once when contact starts). */
+const PALM_RAM_BASE = 2200;
+const PALM_RAM_PER_SPEED = 380;
 
 /** Visible palms at slider 1.0. −20% from the previous 35. */
 export const PALM_AMOUNT_DEFAULT = 1;
@@ -408,7 +415,12 @@ function lowestGround(x, z, radius) {
  *   getPlantCull: () => number,
  *   setPlantCull: (v: number) => void,
  *   update: (time: number) => void,
+ *   sync: () => void,
  *   updateLod: (camPos: THREE.Vector3) => void,
+ *   shellHit: (body: object, dir?: THREE.Vector3, point?: THREE.Vector3) => boolean,
+ *   mgHit: (body: object, dir?: THREE.Vector3, point?: THREE.Vector3) => boolean,
+ *   checkRams: (bodies: object[]) => void,
+ *   reset: () => void,
  * }>}
  */
 export async function buildVegetation(scene, { RAPIER, world }) {
@@ -722,7 +734,7 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     // Palms: foot bone stays planted; lean is shared across upper trunk/crown bones.
     const palmLean = windAmp * PALM_WIND_LEAN;
     for (const p of palms) {
-      if (!p.visible) continue;
+      if (!p.visible || p.userData.fallen) continue;
       const ph = p.userData.windPhase ?? 0;
       p.rotation.y = p.userData.yaw ?? p.rotation.y;
       p.rotation.x = 0;
@@ -739,9 +751,24 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     }
   }
 
+  function sync() {
+    for (const p of palms) {
+      if (!p.userData.fallen) continue;
+      const body = p.userData.body;
+      if (!body) continue;
+      p.position.copy(body.translation());
+      p.quaternion.copy(body.rotation());
+    }
+  }
+
   function applyPalmVisibility() {
     const show = Math.round(BASE_PALM_TARGET * palmAmount);
-    for (let i = 0; i < palms.length; i++) palms[i].visible = i < show;
+    for (let i = 0; i < palms.length; i++) {
+      const p = palms[i];
+      const on = i < show;
+      p.visible = on;
+      p.userData.collider?.setEnabled(on);
+    }
   }
 
   function setPalmAmount(v) {
@@ -1003,18 +1030,147 @@ export async function buildVegetation(scene, { RAPIER, world }) {
   }
 
   // Palm trunk feet in world space (the crowns lean, so the bbox centre isn't the trunk).
+  // Fixed cylinder colliders so shells / .50 can hit; knockPalm turns them dynamic.
+  const palmByHandle = new Map();
+  const _palmQ = new THREE.Quaternion();
+  const _palmYaw = new THREE.Vector3(0, 1, 0);
   for (const p of palms) {
     const item = catalog.tree.find((t) => t.name === p.name);
     const b = item?.base ?? new THREE.Vector2();
-    const c = Math.cos(p.rotation.y), s = Math.sin(p.rotation.y), k = p.scale.x;
+    const yaw = p.userData.yaw ?? p.rotation.y;
+    const c = Math.cos(yaw), s = Math.sin(yaw), k = p.scale.x;
     p.userData.trunk = { x: p.position.x + (b.x * c + b.y * s) * k, z: p.position.z + (-b.x * s + b.y * c) * k };
+    const h = Math.max(2, (item?.height ?? 8) * k);
+    const halfH = h * 0.5;
+    _palmQ.setFromAxisAngle(_palmYaw, yaw);
+    const body = world.createRigidBody(
+      RAPIER.RigidBodyDesc.fixed()
+        .setTranslation(p.position.x, p.position.y, p.position.z)
+        .setRotation(_palmQ)
+        .setLinearDamping(0.15)
+        .setAngularDamping(0.3)
+        .setCcdEnabled(true)
+        .setUserData({ palm: true }),
+    );
+    const collider = world.createCollider(
+      RAPIER.ColliderDesc.cylinder(halfH, PALM_TRUNK_R)
+        .setTranslation(b.x * k, halfH, b.y * k)
+        .setDensity(PALM_DENSITY)
+        .setFriction(0.75)
+        .setRestitution(0.05),
+      body,
+    );
+    p.userData.body = body;
+    p.userData.collider = collider;
+    p.userData.fallen = false;
+    p.userData.spawnPos = p.position.clone();
+    p.userData.spawnYaw = yaw;
+    palmByHandle.set(body.handle, p);
+  }
+
+  function zeroPalmBones(p) {
+    const bones = p.userData.palmBones;
+    if (!bones) return;
+    for (const bone of bones) {
+      bone.rotation.x = 0;
+      bone.rotation.z = 0;
+    }
+  }
+
+  /** Stand → fall: fixed collider becomes a dynamic trunk that reacts to impulses. */
+  function knockPalm(p, dir, point, impulse) {
+    const body = p.userData.body;
+    if (!body) return;
+    if (!p.userData.fallen) {
+      p.userData.fallen = true;
+      zeroPalmBones(p);
+      body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+    }
+    if (impulse > 0 && dir && point) {
+      body.applyImpulseAtPoint(
+        dir.clone().multiplyScalar(impulse),
+        point,
+        true,
+      );
+    }
+  }
+
+  function shellHit(hitBody, dir, point) {
+    const p = palmByHandle.get(hitBody?.handle);
+    if (!p || !p.visible) return false;
+    // Impulse comes from fx._explode (IMPACT_IMPULSE) once the body is dynamic.
+    knockPalm(p, dir, point, 0);
+    return true;
+  }
+
+  function mgHit(hitBody, dir, point) {
+    const p = palmByHandle.get(hitBody?.handle);
+    if (!p || !p.visible) return false;
+    knockPalm(p, dir, point, PALM_MG_IMPULSE);
+    return true;
+  }
+
+  /** After world.step: a tank hull touching a standing palm knocks it over. */
+  function checkRams(bodies) {
+    if (!bodies?.length) return;
+    const handles = new Set();
+    for (const b of bodies) if (b) handles.add(b.handle);
+    if (!handles.size) return;
+    const dir = new THREE.Vector3();
+    const point = new THREE.Vector3();
+    for (const p of palms) {
+      if (!p.visible || p.userData.fallen) continue;
+      const col = p.userData.collider;
+      if (!col) continue;
+      let rammer = null;
+      world.contactPairsWith(col, (other) => {
+        const ob = other.parent();
+        if (ob && handles.has(ob.handle)) rammer = ob;
+      });
+      if (!rammer) continue;
+      const vel = rammer.linvel();
+      const speed = Math.hypot(vel.x, vel.y, vel.z);
+      dir.set(vel.x, Math.max(0, vel.y * 0.2), vel.z);
+      if (dir.lengthSq() < 0.35) {
+        const t = rammer.translation();
+        dir.set(p.position.x - t.x, 0.08, p.position.z - t.z);
+      }
+      if (dir.lengthSq() < 1e-6) continue;
+      dir.normalize();
+      const trunk = p.userData.trunk;
+      point.set(trunk.x, p.position.y + 1.25, trunk.z);
+      knockPalm(p, dir, point, PALM_RAM_BASE + PALM_RAM_PER_SPEED * Math.max(speed, 1.2));
+    }
+  }
+
+  function reset() {
+    for (const p of palms) {
+      const body = p.userData.body;
+      if (!body) continue;
+      const pos = p.userData.spawnPos;
+      const yaw = p.userData.spawnYaw ?? 0;
+      _palmQ.setFromAxisAngle(_palmYaw, yaw);
+      p.userData.fallen = false;
+      p.position.copy(pos);
+      p.rotation.set(0, yaw, 0);
+      p.userData.yaw = yaw;
+      zeroPalmBones(p);
+      body.setBodyType(RAPIER.RigidBodyType.Fixed, true);
+      body.setTranslation(pos, true);
+      body.setRotation(_palmQ, true);
+      body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    }
+    applyPalmVisibility();
   }
 
   /** Solid things the AI should route around: cover rocks + currently visible palm trunks. */
   function navObstacles() {
     const list = coverRocks.map((r) => ({ type: 'box', x: r.x, z: r.z, hx: r.hx * 0.8, hz: r.hz * 0.8, yaw: r.yaw }));
     for (const p of palms) {
-      if (p.visible) list.push({ type: 'circle', x: p.userData.trunk.x, z: p.userData.trunk.z, r: PALM_TRUNK_R });
+      if (p.visible && !p.userData.fallen) {
+        list.push({ type: 'circle', x: p.userData.trunk.x, z: p.userData.trunk.z, r: PALM_TRUNK_R });
+      }
     }
     return list;
   }
@@ -1089,6 +1245,11 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     getPlantCull: () => plantCull,
     setPlantCull: (v) => { plantCull = THREE.MathUtils.clamp(v, 10, 1000); },
     update,
+    sync,
     updateLod,
+    shellHit,
+    mgHit,
+    checkRams,
+    reset,
   };
 }

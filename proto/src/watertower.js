@@ -2,6 +2,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { AIRFIELD_Y, PORT_YARD, heightAt } from './terrain.js';
+import { applyBurntMetal } from './burntMetal.js';
 
 const SLAB_T = 0.06;
 
@@ -48,11 +49,14 @@ export async function buildWaterTower(scene, { RAPIER, world }) {
   root.name = 'WaterTower';
   ruined.name = 'WaterTowerDestroyed';
   const y0 = AIRFIELD_Y + SLAB_T;
+  applyBurntMetal(ruined);
   for (const obj of [root, ruined]) {
     obj.position.set(WATER_TOWER.x, y0, WATER_TOWER.z);
-    obj.traverse((o) => {
-      if (o.isMesh) o.castShadow = o.receiveShadow = true;
-    });
+    if (obj === root) {
+      obj.traverse((o) => {
+        if (o.isMesh) o.castShadow = o.receiveShadow = true;
+      });
+    }
     scene.add(obj);
   }
   ruined.visible = false;

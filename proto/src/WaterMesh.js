@@ -1,5 +1,6 @@
 // Local copy of three/examples/jsm/objects/WaterMesh.js with a `timeScale` uniform
-// (the stock version drives the ripples off raw `time` with no speed control).
+// (the stock version drives the ripples off raw `time` with no speed control)
+// plus screen-space depth foam / shallow tint where the surface meets geometry.
 import {
 	Color,
 	Mesh,
@@ -7,7 +8,11 @@ import {
 	NodeMaterial
 } from 'three/webgpu';
 
-import { Fn, add, cameraPosition, div, normalize, positionWorld, sub, time, texture, vec2, max, dot, reflect, pow, length, float, uniform, reflector, mul, mix } from 'three/tsl';
+import {
+	Fn, add, cameraPosition, div, normalize, positionWorld, positionView, sub, time, texture,
+	vec2, vec3, max, dot, reflect, pow, length, float, uniform, reflector, mul, mix,
+	viewportDepthTexture, perspectiveDepthToViewZ, cameraNear, cameraFar, smoothstep,
+} from 'three/tsl';
 
 class WaterMesh extends Mesh {
 
@@ -29,6 +34,13 @@ class WaterMesh extends Mesh {
 		this.sunDirection = uniform( options.sunDirection !== undefined ? options.sunDirection : new Vector3( 0.70707, 0.70707, 0.0 ) );
 		this.waterColor = uniform( new Color( options.waterColor !== undefined ? options.waterColor : 0x7f7f7f ) );
 		this.distortionScale = uniform( options.distortionScale !== undefined ? options.distortionScale : 20.0 );
+
+		// Depth-based shore look (view-space metres between water and opaque geometry behind it).
+		this.shallowColor = uniform( new Color( options.shallowColor !== undefined ? options.shallowColor : 0x5ec8c4 ) );
+		this.shallowDepth = uniform( options.shallowDepth !== undefined ? options.shallowDepth : 2.8 );
+		this.foamDepth = uniform( options.foamDepth !== undefined ? options.foamDepth : 0.45 );
+		this.foamIntensity = uniform( options.foamIntensity !== undefined ? options.foamIntensity : 0.65 );
+		this.shoreOpacity = uniform( options.shoreOpacity !== undefined ? options.shoreOpacity : 0.55 );
 
 		const getNoise = Fn( ( [ uv ] ) => {
 
@@ -65,9 +77,19 @@ class WaterMesh extends Mesh {
 
 		const distortion = surfaceNormal.xz.mul( float( 0.001 ).add( float( 1.0 ).div( distance ) ) ).mul( this.distortionScale );
 
-		material.transparent = true;
+		// Opaque scene depth vs water surface → contact / shallow masks.
+		const sceneViewZ = perspectiveDepthToViewZ( viewportDepthTexture(), cameraNear, cameraFar );
+		const thickness = positionView.z.sub( sceneViewZ ).max( 0.0 );
+		const shallow = float( 1.0 ).sub( thickness.div( this.shallowDepth ).saturate() );
+		const foamEdge = float( 1.0 ).sub( thickness.div( this.foamDepth ).saturate() );
+		// Break the foam line with the same normal-noise field so it isn't a hard ring.
+		const foamNoise = smoothstep( 0.15, 0.75, noise.x.mul( 0.5 ).add( 0.5 ) );
+		const foam = foamEdge.mul( foamNoise ).mul( this.foamIntensity );
 
-		material.opacityNode = this.alpha;
+		material.transparent = true;
+		material.depthWrite = false;
+
+		material.opacityNode = mix( this.alpha, this.shoreOpacity, shallow.mul( 0.9 ) );
 
 		material.receivedShadowPositionNode = positionWorld.add( distortion );
 
@@ -82,10 +104,15 @@ class WaterMesh extends Mesh {
 			const theta = max( dot( eyeDirection, surfaceNormal ), 0.0 );
 			const rf0 = float( 0.02 );
 			const reflectance = mul( pow( float( 1.0 ).sub( theta ), 5.0 ), float( 1.0 ).sub( rf0 ) ).add( rf0 );
-			const scatter = max( 0.0, dot( surfaceNormal, eyeDirection ) ).mul( this.waterColor );
-			const albedo = mix( this.sunColor.mul( diffuseLight ).mul( 0.3 ).add( scatter ), mirrorSampler.rgb.add( specularLight ), reflectance );
 
-			return albedo;
+			// Turquoise absorption near contact; keep reflections in deep water.
+			const tint = mix( this.waterColor, this.shallowColor, shallow.mul( shallow ) );
+			const scatter = max( 0.0, dot( surfaceNormal, eyeDirection ) ).mul( tint );
+			const deepAlbedo = mix( this.sunColor.mul( diffuseLight ).mul( 0.3 ).add( scatter ), mirrorSampler.rgb.add( specularLight ), reflectance );
+			const shoreAlbedo = mix( deepAlbedo, tint, shallow.mul( 0.65 ) );
+			const foamColor = vec3( 0.92, 0.96, 0.98 );
+
+			return mix( shoreAlbedo, foamColor, foam );
 
 		} )();
 

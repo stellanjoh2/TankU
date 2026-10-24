@@ -96,11 +96,26 @@ export class Input {
     }).catch?.(() => {});
   }
 
+  /** Pad button edges only — used while input is disabled (pause menu) so a pad can resume. */
+  readPadPresses() {
+    const pad = this.gamepad();
+    const pressed = [];
+    if (pad) {
+      pad.buttons.forEach((btn, i) => {
+        if (btn.pressed && !this._padButtons[i]) pressed.push(i);
+        this._padButtons[i] = btn.pressed;
+      });
+    } else {
+      this._padButtons.length = 0;
+    }
+    return { padPressed: pressed, pad };
+  }
+
   /** Sample everything once per frame. Aim deltas are in radians (yaw right = positive). */
   read(dt) {
     if (!this.enabled) {
       this.mouseDX = this.mouseDY = this.wheel = 0;
-      return NEUTRAL;
+      return { ...NEUTRAL, ...this.readPadPresses() };
     }
     const k = (c) => this.keys.has(c);
     let throttle = (k('KeyW') || k('ArrowUp') ? 1 : 0) - (k('KeyS') || k('ArrowDown') ? 1 : 0);

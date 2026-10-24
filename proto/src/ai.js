@@ -1,16 +1,21 @@
 // Enemy tank brain.
-//  * Perception: ray-cast line of sight (terrain + rocks block it), plus "hearing" — your shots,
-//    your engine up close, and a periodic fuzzy radio fix so it keeps hunting when it loses you.
+//  * Perception: ray-cast line of sight (terrain + rocks block it), plus hearing — your shots
+//    and your engine, but only nearby. Until a tank spots you, hears you close, or a patrol
+//    boat opens fire, it has no fix on you and stays on patrol. After that, a fuzzy radio
+//    fix keeps the hunt going when it loses you.
 //  * Mood from the health balance: ahead → hunter (pushes, flanks, punishes your reload),
 //    behind → cautious (long range, hides, routes around your sight lines), even → in between.
-//  * Modes: hunt → engage → (shoot) → cover → peek → engage …, with flank / evade as fallbacks.
+//  * Modes: patrol → (contact) → hunt → engage → (shoot) → cover → peek → engage …,
+//    with flank / evade as fallbacks.
 //  * Driving: threat-aware A* from NavGrid (exposed cells cost more), pure-pursuit steering,
 //    unstick + unflip recovery. Aim leads the target with deliberately imperfect, settling error.
 import * as THREE from 'three';
 import { heightAt, ENEMY_SPAWN } from './terrain.js';
-import { SHELL_SPEED } from './tank.js';
+import { SHELL_SPEED, STRESS_MAX } from './tank.js';
 
 const SIGHT_RANGE = 170;
+const HEAR_SHOT = 80;       // a cannon past this doesn't pull an unalerted patrol
+const PATROL_R = [14, 26];  // default lap; a guard post passes a tighter ring
 const EYE_H = 2.6;          // turret roof above the body origin
 const HULL_H = 1.3;         // aim at hull centre
 const TURRET_H = 2.3;       // …or at the turret when the hull is behind a crest
@@ -20,6 +25,10 @@ const REPLAN_EVERY = 2.0;
 const LOOKAHEAD = 7;
 const ARRIVE_R = 3.5;
 const GRAVITY = 9.81;
+/** Goals / probes must stay this far from blocked cells (water, rocks). */
+const MIN_CLEAR = 4;
+/** Abort forward drive if ground this far ahead isn't dry. */
+const WATER_PROBE = [3, 6, 10];
 
 const MOODS = {
   hunter:   { threat: 1.5, avoidR: 0,  avoidW: 0, range: [20, 50], hide: [0.3, 1.0], react: [0.9, 1.5] },
@@ -55,7 +64,7 @@ function terrainLos(ax, az, bx, bz, h = EYE_H) {
 
 /**
  * Random drivable spawn near `near` (default ENEMY_SPAWN on the far side of the island).
- * Faces `face` when given (usually the player), preferring a spot out of its sight.
+ * Prefers a spot out of `face`'s sight (usually the player). Heading is random — patrol, not a bearing on the player.
  * Small radius keeps each round feeling familiar but not identical.
  */
 export function pickSpawn(nav, face = null, near = ENEMY_SPAWN, radius = 18) {
@@ -67,7 +76,7 @@ export function pickSpawn(nav, face = null, near = ENEMY_SPAWN, radius = 18) {
     const x = near.x + Math.cos(a) * d, z = near.z + Math.sin(a) * d;
     if (!nav.passable(x, z) || nav.clearanceAt(x, z) < 6 || nav.gradeAt(x, z) > 0.2) continue;
     if (home && nav.regionAt(x, z) !== home) continue;
-    const spawn = { x, y: heightAt(x, z) + 0.6, z, yaw: yawOf(faceX - x, faceZ - z) };
+    const spawn = { x, y: heightAt(x, z) + 0.6, z, yaw: Math.random() * Math.PI * 2 };
     if (face && !terrainLos(faceX, faceZ, x, z)) return spawn;
     fallback ??= spawn;
   }
@@ -78,19 +87,22 @@ export function pickSpawn(nav, face = null, near = ENEMY_SPAWN, radius = 18) {
     if (!Number.isFinite(nav.cost[k])) continue;
     if (home && nav.region[k] !== home) continue;
     const x = nav.xOf(k), z = nav.zOf(k), d = Math.hypot(x - near.x, z - near.z);
-    if (d < bestD) { bestD = d; best = { x, y: heightAt(x, z) + 0.6, z, yaw: yawOf(faceX - x, faceZ - z) }; }
+    if (d < bestD) { bestD = d; best = { x, y: heightAt(x, z) + 0.6, z, yaw: Math.random() * Math.PI * 2 }; }
   }
   return best;
 }
 
 export class TankAI {
-  constructor({ tank, enemy, nav, world, RAPIER, coverRocks }) {
+  constructor({ tank, enemy, nav, world, RAPIER, coverRocks, anchor, patrolR }) {
     Object.assign(this, { tank, enemy, nav, world, RAPIER, coverRocks });
+    this.anchor = anchor ?? ENEMY_SPAWN;
+    this.patrolR = patrolR ?? PATROL_R;
     this.ray = new RAPIER.Ray({ x: 0, y: 0, z: 0 }, { x: 1, y: 0, z: 0 });
     this.drive = { throttle: 0, turn: 0, boost: false };
     this.aimPoint = new THREE.Vector3();
     this.wantsFire = false;
     this.wantsMg = false;
+    this.wantsSmoke = false;
     this.exposure = new Int8Array(nav.n * nav.n);
     this.exposureFrom = { x: Infinity, z: Infinity };
     this.pos = new THREE.Vector3();
@@ -102,21 +114,22 @@ export class TankAI {
   }
 
   reset() {
-    this.mode = 'hunt';
+    this.mode = 'patrol';
+    this.alerted = false;
     this.modeT = 0;
     this.path = [];
     this.wp = 0;
     this.pathGoal = null;
     this.pathAge = 0;
+    this.pathReached = false;
     this.arrived = false;
     this.goal = null;
     this.spot = null;
     this.hurry = false;
     this.speedScale = 1;
     this.face = null;
-    const e = this.enemy.body.translation();
-    this.known = { x: 0, z: 0, eyeY: 0 };
-    this._learn(e.x, e.z, 25);
+    const t = this.tank.body.translation();
+    this.known = { x: t.x, z: t.z, eyeY: heightAt(t.x, t.z) + EYE_H };
     this.visible = false;
     this.aimH = HULL_H;
     this.seenFor = 0;
@@ -159,16 +172,34 @@ export class TankAI {
   get debug() { return { mode: this.mode, mood: this.mood, path: this.path, wp: this.wp }; }
 
   // ------------------------------------------------------------------ events from the game
-  /** The enemy fired: the muzzle blast gives its position away. */
+  /** The enemy fired. A distant shot doesn't wake a patrol that hasn't found anyone. */
   hearShot(pos) {
+    const d = Math.hypot(pos.x - this.pos.x, pos.z - this.pos.z);
+    if (!this.alerted && d > HEAR_SHOT) return;
     if (!this.visible) this._learn(pos.x, pos.z, 8);
+    this._markContact();
+  }
+
+  /** A patrol boat opened fire: share the reported position and start the hunt. */
+  alert(x, z) {
+    this._learn(x, z, 12);
+    this.alerted = true;
+    if (this.mode === 'patrol') this._setMode('hunt');
   }
 
   /** We took a hit: we know roughly where it came from, and we want out of there. */
   onHit() {
     const e = this.enemy.body.translation();
     this._learn(e.x, e.z, 4);
+    this.alerted = true;
     this._setMode('cover');
+  }
+
+  /** First real contact (sight, close noise, a hit, or a boat report). */
+  _markContact() {
+    if (this.alerted) return;
+    this.alerted = true;
+    if (this.mode === 'patrol') this._setMode('hunt');
   }
 
   /** Our shell hit the enemy: ease off, so a second hit isn't instant. */
@@ -196,6 +227,7 @@ export class TankAI {
 
     this.wantsFire = false;
     this.wantsMg = false;
+    this.wantsSmoke = false;
     if (halt || !this.tank.alive) {
       this.drive.throttle = this.drive.turn = 0;
       this.drive.boost = false;
@@ -213,6 +245,8 @@ export class TankAI {
     this._aim(dt);
     this._trigger(dt);
     this._triggerMg(dt);
+    // BF panic: full stress → pop smoke (cooldown lives on the tank)
+    if (this.tank.stress >= STRESS_MAX && this.tank.smokeReady) this.wantsSmoke = true;
     this._flipCheck(dt);
   }
 
@@ -242,6 +276,7 @@ export class TankAI {
       this.seenFor += dt;
       this.unseenFor = 0;
       this._learn(e.x, e.z, 0);
+      this._markContact();
     } else {
       this.seenFor = 0;
       this.unseenFor += dt;
@@ -251,7 +286,9 @@ export class TankAI {
     if (!this.visible && d < 45 && Math.abs(this.enemy.forwardSpeed()) > 2 && this.hearT <= 0) {
       this._learn(e.x, e.z, 6);
       this.hearT = 1;
+      this._markContact();
     }
+    if (!this.alerted) return;
     this.intelT -= dt;
     if (this.intelT <= 0) {
       this.intelT = rnd(6, 9);
@@ -317,6 +354,7 @@ export class TankAI {
     this.wp = 0;
     this.pathGoal = { x: this.goal.x, z: this.goal.z };
     this.pathAge = 0;
+    this.pathReached = res.reached;
     this.arrived = !this.path.length;
   }
 
@@ -335,10 +373,15 @@ export class TankAI {
   _bestSpot(cands, { hidden, pref, prefW = 0.5, towardPenalty = 0, maxTests = 24 }) {
     const { known, pos, nav } = this;
     const dK = Math.hypot(known.x - pos.x, known.z - pos.z) || 1;
+    const home = nav.regionAt(pos.x, pos.z);
     const scored = [];
     for (const c of cands) {
       const p = nav.nearestOpen(c.x, c.z, 3);
       if (!p) continue;
+      // Stay on our connected landmass (avoids shoreline dead-ends when a goal is cut off).
+      if (home && nav.region[p.k] !== home) continue;
+      // Never pick a beach-edge goal — A* would still path there and the hull can slide in.
+      if (nav.clearance[p.k] < MIN_CLEAR) continue;
       const travel = Math.hypot(p.x - pos.x, p.z - pos.z);
       const dE = Math.hypot(p.x - known.x, p.z - known.z);
       if (dE < 12) continue;
@@ -423,14 +466,31 @@ export class TankAI {
     return sneaky ?? this._bestSpot(c, { pref });
   }
 
+  /** A lap around the spawn anchor. Stays on the same landmass, off the beach. */
+  _patrolSpot() {
+    const { nav, anchor, pos } = this;
+    const home = nav.regionAt(anchor.x, anchor.z);
+    for (let i = 0; i < 40; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const d = rnd(...this.patrolR);
+      const p = nav.nearestOpen(anchor.x + Math.cos(a) * d, anchor.z + Math.sin(a) * d, 4);
+      if (!p || nav.clearance[p.k] < MIN_CLEAR) continue;
+      if (home && nav.region[p.k] !== home) continue;
+      if (Math.hypot(p.x - pos.x, p.z - pos.z) < 12) continue;
+      return { x: p.x, z: p.z };
+    }
+    return null;
+  }
+
   /** No cover in reach: weave across the line of fire. */
   _weaveSpot() {
-    const { known, pos } = this;
+    const { known, pos, nav } = this;
     const ax = known.x - pos.x, az = known.z - pos.z, al = Math.hypot(ax, az) || 1;
     this.weaveSign = -this.weaveSign;
     const px = (-az / al) * this.weaveSign, pz = (ax / al) * this.weaveSign;
-    const p = this.nav.nearestOpen(pos.x + px * 16 - (ax / al) * 4, pos.z + pz * 16 - (az / al) * 4, 4);
-    return p ? { x: p.x, z: p.z } : null;
+    const p = nav.nearestOpen(pos.x + px * 16 - (ax / al) * 4, pos.z + pz * 16 - (az / al) * 4, 4);
+    if (!p || nav.clearance[p.k] < MIN_CLEAR) return null;
+    return { x: p.x, z: p.z };
   }
 
   // ------------------------------------------------------------------ decisions
@@ -453,7 +513,7 @@ export class TankAI {
     const dE = this.pos.distanceTo(this.enemyPos);
     this.hurry = false;
     this.speedScale = 1;
-    this.face = { x: known.x, z: known.z };
+    this.face = this.alerted ? { x: known.x, z: known.z } : null;
 
     // You just fired and we're loaded: punish the reload window (unless we're the one losing).
     if (this.visible && loaded && this.enemy.reload > 0.9 && mood !== 'cautious' && this.mode !== 'engage') {
@@ -461,6 +521,24 @@ export class TankAI {
     }
 
     switch (this.mode) {
+      case 'patrol': {
+        if (this.visible) { this._setMode('engage'); break; }
+        if (this.alerted) { this._setMode('hunt'); break; }
+        if (this.arrived && this.spot) {
+          this.holdT += THINK_EVERY;
+          if (this.holdT < 1.8) break;
+        }
+        if (!this.spot || this.arrived || this.modeT > 24) {
+          this.spot = this._patrolSpot();
+          this.holdT = 0;
+          this.modeT = 0;
+        }
+        if (this.spot) {
+          this._goTo(this.spot);
+          this.face = this.spot;
+        }
+        break;
+      }
       case 'hunt': {
         if (this.visible) { this._setMode('engage'); break; }
         // only re-pick when the intel has genuinely moved, so the route doesn't flip-flop
@@ -554,18 +632,64 @@ export class TankAI {
   }
 
   // ------------------------------------------------------------------ driving
+  /** True if the hull centre this far along body +X sits on dry, open ground. */
+  _dryAlong(fx, fz, dist, minClear = 2) {
+    const { pos, nav } = this;
+    const x = pos.x + fx * dist, z = pos.z + fz * dist;
+    return nav.passable(x, z) && nav.clearanceAt(x, z) >= minClear;
+  }
+
+  /** Furthest path point within LOOKAHEAD that still has a passable straight line from here. */
+  _lookTarget(P) {
+    const { pos, nav } = this;
+    let t = P[Math.min(this.wp, P.length - 1)];
+    for (let i = this.wp; i < P.length; i++) {
+      const p = P[i];
+      if (!nav._lineOk(pos.x, pos.z, p.x, p.z, null, 0)) break;
+      t = p;
+      if (Math.hypot(p.x - pos.x, p.z - pos.z) >= LOOKAHEAD) break;
+    }
+    return t;
+  }
+
   _steer(dt) {
     const d = this.drive;
     d.boost = false;
     if (this.unstickT > 0) {
       this.unstickT -= dt;
+      // Never reverse into water while unsticking.
+      _v.set(1, 0, 0).applyQuaternion(_q.copy(this.tank.body.rotation()));
+      if (!this._dryAlong(-_v.x, -_v.z, 4, 1.5)) {
+        this.unstickT = 0;
+        this.pathGoal = null;
+        d.throttle = 0;
+        d.turn = 0;
+        return;
+      }
       d.throttle = -0.8;
       d.turn = this.unstickTurn;
       return;
     }
-    const { pos } = this;
+    const { pos, nav } = this;
     let thr = 0, turn = 0;
     const P = this.path;
+
+    // Near water / blocked ground: crawl back inland before the hull slides in.
+    if (!nav.passable(pos.x, pos.z) || nav.clearanceAt(pos.x, pos.z) < 2.5) {
+      const safe = nav.nearestOpen(pos.x, pos.z, 12);
+      if (safe) {
+        const want = yawOf(safe.x - pos.x, safe.z - pos.z);
+        const err = wrap(want - this.yaw);
+        turn = THREE.MathUtils.clamp(-err * 2.2, -1, 1);
+        _v.set(1, 0, 0).applyQuaternion(_q.copy(this.tank.body.rotation()));
+        const towardDry = this._dryAlong(_v.x, _v.z, 4, 2);
+        thr = Math.abs(err) > 1.0 ? (towardDry ? 0 : -0.6) : (towardDry ? 0.7 : -0.5);
+        d.throttle = thr;
+        d.turn = turn;
+        return;
+      }
+    }
+
     if (P.length && !this.arrived) {
       // advance past waypoints we've reached or driven beyond
       while (this.wp < P.length - 1) {
@@ -577,13 +701,20 @@ export class TankAI {
       }
       const end = P[P.length - 1];
       const remaining = Math.hypot(end.x - pos.x, end.z - pos.z);
-      if (remaining < ARRIVE_R) {
-        this.arrived = true;
-      } else {
-        let t = end;
-        for (let i = this.wp; i < P.length; i++) {
-          if (Math.hypot(P[i].x - pos.x, P[i].z - pos.z) >= LOOKAHEAD) { t = P[i]; break; }
+      // Incomplete routes end at the shore facing an unreachable goal — bail early, don't nose in.
+      if (!this.pathReached && remaining < 14 && nav.clearanceAt(end.x, end.z) < MIN_CLEAR) {
+        this.pathGoal = null;
+        this.spot = null;
+        this.arrived = false;
+        this.path = [];
+      } else if (remaining < ARRIVE_R) {
+        this.arrived = this.pathReached !== false;
+        if (!this.arrived) {
+          this.pathGoal = null;
+          this.spot = null;
         }
+      } else {
+        const t = this._lookTarget(P);
         const want = yawOf(t.x - pos.x, t.z - pos.z);
         const err = wrap(want - this.yaw);
         const a = Math.abs(err);
@@ -613,6 +744,29 @@ export class TankAI {
         turn = be > 0 ? 1 : -1;
       }
     }
+    // Hard water gate: never drive forward into wet / blocked ground.
+    if (thr > 0) {
+      _v.set(1, 0, 0).applyQuaternion(_q.copy(this.tank.body.rotation()));
+      let wetAhead = false;
+      for (const dist of WATER_PROBE) {
+        if (!this._dryAlong(_v.x, _v.z, dist, 2)) { wetAhead = true; break; }
+      }
+      if (wetAhead) {
+        d.boost = false;
+        const safe = nav.nearestOpen(pos.x + _v.x * 2, pos.z + _v.z * 2, 14)
+          ?? nav.nearestOpen(pos.x, pos.z, 14);
+        if (safe) {
+          const want = yawOf(safe.x - pos.x, safe.z - pos.z);
+          const err = wrap(want - this.yaw);
+          turn = THREE.MathUtils.clamp(-err * 2.4, -1, 1);
+          thr = Math.abs(err) > 0.7 ? 0 : (this._dryAlong(_v.x, _v.z, 4, 2) ? 0.35 : -0.55);
+        } else {
+          thr = -0.6;
+        }
+        // Drop the route once so the next think picks an inland goal.
+        if (this.pathGoal) { this.pathGoal = null; this.spot = null; this.path = []; }
+      }
+    }
     // following a path but neither moving nor turning (wedged on a crate, slope or hull) →
     // back out with a twist, then replan
     this.progT += dt;
@@ -621,9 +775,13 @@ export class TankAI {
       const turned = Math.abs(wrap(this.yaw - this.progYaw));
       if (P.length && !this.arrived && moved < 1.2 && turned < 0.35) {
         _v.set(1, 0, 0).applyQuaternion(_q.copy(this.tank.body.rotation()));
-        this.nav.penalize(pos.x + _v.x * 4, pos.z + _v.z * 4);
+        // Prefer reversing away from water / blocked ground when unsticking.
+        const fwd = this._dryAlong(_v.x, _v.z, 4, 1.5);
+        const back = this._dryAlong(-_v.x, -_v.z, 4, 1.5);
+        nav.penalize(pos.x + _v.x * 4, pos.z + _v.z * 4);
         this.unstickT = 1.3;
         this.unstickTurn = Math.random() < 0.5 ? -1 : 1;
+        if (!back && fwd) this.unstickT = 0; // don't reverse into water — replan instead
         this.pathGoal = null;
       }
       this.progT = 0;
@@ -647,6 +805,14 @@ export class TankAI {
   // ------------------------------------------------------------------ gunnery
   _aim(dt) {
     if (!this.visible) {
+      if (!this.alerted) {
+        this.aimPoint.set(
+          this.pos.x + Math.cos(this.yaw) * 40,
+          this.pos.y + HULL_H,
+          this.pos.z - Math.sin(this.yaw) * 40,
+        );
+        return;
+      }
       this.aimPoint.set(this.known.x, this.known.eyeY - EYE_H + HULL_H, this.known.z);
       return;
     }

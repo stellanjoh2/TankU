@@ -14,9 +14,14 @@ const FRONT_DMG = 0.75;
 const REAR_DMG = 1.25;
 const STRESS_PER_SHELL = 55;           // side hit; scaled by shellDamage (rear hits harder)
 const HIT_KICK_RETURN = 2;             // s, camera shove when a shell hits you
+const MG_FLYBY_MAX = 9;               // m miss distance that still whooshes
+const MG_TRACER_SPEED = 220 * 0.75;    // keep in sync with fx.js tracer travel
 
 const _hitP = new THREE.Vector3();
 const _hitQ = new THREE.Quaternion();
+const _flybyEar = new THREE.Vector3();
+const _flybyTo = new THREE.Vector3();
+const _flybyClosest = new THREE.Vector3();
 
 /** Front plate takes 25% less, a hit in the engine 25% more. Side and turret stay at 1. */
 function shellDamage(victim, point) {
@@ -34,8 +39,9 @@ function shellDamage(victim, point) {
  * @param {() => void} [deps.onRestart]  main resets look / cam / path / freefly after entity reset
  */
 export function createMatch({
-  tank, enemy, ai, nav, fx, hud, sfx, tankCam, input,
-  vegetation, airfield, port, waterTower, barrels, trucks, spawn,
+  tank, foes, nav, fx, hud, sfx, tankCam, input,
+  vegetation, airfield, port, waterTower, barrels, trucks, patrolBoat, spawn,
+  smoke = null,
   onRestart = () => {},
 }) {
   const game = {
@@ -43,31 +49,65 @@ export function createMatch({
     showPath: false,
     debug: false,
     overT: 0,          // > 0 while a wreck burns before the auto-restart
-    wreck: null,       // the destroyed tank
+    wreck: null,       // the destroyed tank that ended the round
   };
+  const combatants = [tank, ...foes.map((f) => f.tank)];
+
+  function foeOf(body) {
+    if (!body) return null;
+    return foes.find((f) => f.tank.body.handle === body.handle) ?? null;
+  }
+
+  /** Living enemy tanks (skipped in solo) plus patrol boats still afloat. */
+  function hostilesRemain() {
+    if (!game.solo && foes.some((f) => f.tank.alive)) return true;
+    return patrolBoat?.boats?.some((b) => b.alive) ?? false;
+  }
+
+  function pushHealth() {
+    hud.setHealth(tank.hp / tank.maxHp, foes.map((f) => f.tank.hp / f.tank.maxHp));
+  }
+
+  function endRound(playerDead, victim = null) {
+    if (game.overT > 0) return;
+    game.overT = ROUND_RESTART_DELAY;
+    game.wreck = victim;
+    hud.banner(
+      playerDead ? 'YOU WERE DESTROYED' : 'ENEMIES CLEARED',
+      'next round in a moment',
+      playerDead ? 'lose' : 'win',
+    );
+    if (!playerDead) sfx.victory();
+  }
 
   function restart({ resetCam = true } = {}) {
     tank.respawn(spawn);
     fx.clearShells();
+    smoke?.clear();
     barrels.reset();
     waterTower.reset();
     trucks.reset(fx);
+    patrolBoat?.reset(fx);
+    airfield.reset?.();
+    vegetation.reset?.();
     nav.setObstacles([   // palm slider may have changed
       ...vegetation.navObstacles(), ...airfield.navObstacles(),
       ...port.navObstacles(), ...waterTower.navObstacles(),
       ...trucks.navObstacles(),
     ]);
-    enemy.setActive(!game.solo);
-    if (!game.solo) {
-      enemy.respawn(pickSpawn(nav, spawn));
-      ai.reset();
+    for (const f of foes) {
+      f.tank.setActive(!game.solo);
+      if (!game.solo) {
+        f.tank.respawn(pickSpawn(nav, spawn, f.anchor, f.spawnR));
+        f.ai.reset();
+      }
     }
     game.overT = 0;
     game.wreck = null;
     hud.banner(null);
     hud.clearHits();
     hud.showEnemy(!game.solo);
-    hud.setHealth(1, 1);
+    hud.setHealth(1, foes.map(() => 1));
     hud.setNitro(1, false);
     onRestart({ resetCam });
   }
@@ -83,21 +123,16 @@ export function createMatch({
     fx.wreck(origin);
     victim.obliterate();
     tankCam.addShake(victim === tank ? 1 : 0.4);
-    game.overT = ROUND_RESTART_DELAY;
-    game.wreck = victim;
-    hud.banner(
-      victim === tank ? 'YOU WERE DESTROYED' : 'ENEMY DESTROYED',
-      'next round in a moment',
-      victim === tank ? 'lose' : 'win',
-    );
+    if (victim === tank) endRound(true, victim);
+    else if (!hostilesRemain()) endRound(false, victim);
   }
 
   /** Fuel-drum blast: full shell hit point-blank, a graze further out. */
   function onBarrelExplode(point) {
     sfx.fire(distGain(point.distanceTo(tank.model.position), 160));
     if (game.overT > 0) return;
-    for (const victim of [tank, enemy]) {
-      if (!victim.alive || (victim === enemy && game.solo) || game.overT > 0) continue;
+    for (const victim of combatants) {
+      if (!victim.alive || (victim !== tank && game.solo) || game.overT > 0) continue;
       const d = point.distanceTo(victim.body.translation());
       const dmg = d < BARREL_BLAST_FULL ? 1 : d < BARREL_BLAST_EDGE ? 0.35 : 0;
       if (!dmg) continue;
@@ -108,7 +143,7 @@ export function createMatch({
       } else if (victim.alive) {
         victim.flashHit();
       }
-      hud.setHealth(tank.hp / tank.maxHp, enemy.hp / enemy.maxHp);
+      pushHealth();
       if (!victim.alive) onTankDestroyed(victim);
     }
   }
@@ -123,17 +158,53 @@ export function createMatch({
       }
     };
     barrels.onExplode = onBarrelExplode;
-    fx.onMgShot = ({ owner } = {}) => {
+    fx.onMgShot = ({ owner, pos, dir, reach, hitBody } = {}) => {
       if (owner === tank.body) tankCam.pulseMgShake();
+      // Bass thump under the .50 loop. Player is dry; hostile rounds fade with range.
+      const ownerFoe = foeOf(owner);
+      if (owner === tank.body) sfx.mgBassThump();
+      else if (ownerFoe || patrolBoat?.isBody(owner)) {
+        const d = pos ? pos.distanceTo(tank.model.position) : 150;
+        sfx.mgBassThump(0.42 * distGain(d, 150), d);
+      }
+      // Enemy .50 near-miss — skip if this round actually hit you
+      const hostile = !!ownerFoe || patrolBoat?.isBody(owner);
+      if (!hostile || !tank.alive || hitBody === tank.body) return;
+      if (!pos || !dir) return;
+      const len = dir.length();
+      if (len < 1e-6) return;
+      const t = tank.body.translation();
+      _flybyEar.set(t.x, t.y + 1.4, t.z);
+      _flybyTo.copy(_flybyEar).sub(pos);
+      const along = _flybyTo.dot(dir) / (len * len);
+      const maxAlong = reach == null ? 450 : reach;
+      // Closest approach must lie on the fired segment (muzzle → impact)
+      if (along < 1 || along > maxAlong) return;
+      _flybyClosest.copy(pos).addScaledVector(dir, along);
+      const miss = _flybyClosest.distanceTo(_flybyEar);
+      if (miss > MG_FLYBY_MAX) return;
+      const intensity = 1 - miss / MG_FLYBY_MAX;
+      sfx.flyby(intensity, along / MG_TRACER_SPEED);
     };
 
     fx.onShellHit = ({ collider, owner, point, dir }) => {
       const body = collider?.parent();
       if (!body || game.overT > 0) return;
+      if (airfield.shellHit?.(body, dir, point, collider)) return;
       if (waterTower.shellHit(body, dir)) return;
       if (trucks.shellHit(body, dir)) return;
-      const victim = [tank, enemy].find((t) => t.body.handle === body.handle);
+      const boat = patrolBoat?.boats?.find((b) => b.body.handle === body.handle);
+      const boatWasAlive = !!boat?.alive;
+      if (patrolBoat?.shellHit(body, dir)) {
+        if (boatWasAlive && tank.alive && !hostilesRemain()) endRound(false);
+        return;
+      }
+      if (vegetation.shellHit?.(body, dir, point)) return;
+      const victim = combatants.find((t) => t.body.handle === body.handle);
       if (!victim || victim.body === owner || !victim.alive) return;
+      const ownerFoe = foeOf(owner);
+      const victimFoe = victim === tank ? null : foeOf(victim.body);
+      if (ownerFoe && victimFoe) return;
       const dmg = shellDamage(victim, point);
       victim.hp = Math.max(0, victim.hp - dmg);
       // Main-gun only — MG path never calls addStress. Rear hits spike harder.
@@ -146,26 +217,32 @@ export function createMatch({
       if (victim === tank) {
         hud.flash();
         if (owner) hud.hitFrom(owner.translation());
-        if (owner === enemy.body) ai.onScored();
+        ownerFoe?.ai.onScored();
         input.rumble(1, 1, 450);
         // Fire-kick envelope, shoved along the shell's travel (away from where it came).
         tankCam.kick(1.0, HIT_KICK_RETURN, dir);
       } else {
         if (victim.alive) victim.flashHit();
-        ai.onHit();
+        victimFoe?.ai.onHit();
       }
-      hud.setHealth(tank.hp / tank.maxHp, enemy.hp / enemy.maxHp);
+      pushHealth();
       if (!victim.alive) onTankDestroyed(victim);
     };
 
     // Traced .50 hits: metal ricochet SFX (body.userData.mat === 'metal') + chip damage on tanks.
-    fx.onMgHit = ({ collider, owner, point, dir }) => {
+    // `damage` overrides chip amount (Air Support strafe uses a heavier per-round).
+    fx.onMgHit = ({ collider, owner, point, dir, damage }) => {
       const body = collider?.parent();
       if (!body || game.overT > 0) return;
-      const victim = [tank, enemy].find((t) => t.body.handle === body.handle);
+      if (vegetation.mgHit?.(body, dir, point)) return;
+      if (patrolBoat?.isBody(body) && body !== owner) patrolBoat.flashHit(body);
+      const victim = combatants.find((t) => t.body.handle === body.handle);
       const isTank = !!victim && victim.body !== owner && victim.alive;
       const isMetal = body.userData?.mat === 'metal';
       if (!isTank && !isMetal) return;
+      const ownerFoe = foeOf(owner);
+      const victimFoe = victim && victim !== tank ? foeOf(victim.body) : null;
+      if (ownerFoe && victimFoe) return;
 
       // Local impact SFX — fades by ~90 m (was linear to 180 m with a 0.12 floor).
       sfx.ricochet(distGain(point.distanceTo(tank.model.position), 90));
@@ -175,17 +252,27 @@ export function createMatch({
         return;
       }
       const wasAlive = victim.alive;
-      victim.hp = Math.max(0, victim.hp - MG_DAMAGE);
+      const chip = damage != null ? damage : MG_DAMAGE;
+      victim.hp = Math.max(0, victim.hp - chip);
       if (victim === tank) {
         if (owner) hud.hitFrom(owner.translation());
+        else if (point) hud.hitFrom(point); // air raid — no rigid owner
         input.rumble(0.08, 0.18, 40);
+      } else if (victim.alive) {
+        victim.flashHit();
       }
-      hud.setHealth(tank.hp / tank.maxHp, enemy.hp / enemy.maxHp);
+      pushHealth();
       if (wasAlive && !victim.alive) {
-        if (victim === tank && owner === enemy.body) ai.onScored();
-        if (victim === enemy) ai.onHit();
+        if (victim === tank) ownerFoe?.ai.onScored();
+        else victimFoe?.ai.onHit();
         onTankDestroyed(victim);
       }
+    };
+
+    // Air-raid dirt impacts — thump synced to the strafe rate of fire.
+    fx.onMgDirtHit = ({ point, air }) => {
+      if (!air || !point) return;
+      sfx.dirtThump(distGain(point.distanceTo(tank.model.position), 110));
     };
   }
 

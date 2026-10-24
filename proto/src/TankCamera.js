@@ -25,17 +25,17 @@ export const CAMERA_CONFIG = {
   yawLambda: 12.0,           // heading follow. High = camera stays behind the hull
   yawLambdaFast: 16.0,       // tighter at speed. A lazy fast yaw swings the cam off the tank
   maxYawLagDeg: 8,           // hard cap on smoothed heading error
-  maxAimLagDeg: 10,          // hard cap on look-target smoothing
+  maxAimLagDeg: 8,           // hard cap on look-target smoothing (tight = snappier mouse→view)
   steerYawOffsetDeg: 14,     // camera swings toward outside of a turn by this much at full steer + speed
   reverseFlip: false,        // true: camera swings to look the other way when reversing
   reverseThreshold: 1.5,     // m/s before reverse counts as reversing
 
   // ---------- Turret influence ----------
-  // Hull-locked chase: cam stays mostly behind the hull so big mouse turns don't orbit the world.
-  // Look still tracks the gun (soft lag). Tiny follow + light slew cues keep it from feeling bolted on.
-  turretFollowWeight: 0.1,   // 0 = camera ignores turret, 1 = camera fully follows turret yaw
-  turretLookWeight: 0.92,    // how much the LOOK target aims along the turret (0 = tank heading)
-  turretYawLambda: 4.8,      // smoothing for turret-driven aim (lower = floatier)
+  // Soft orbit: boom follows look enough to keep the subject framed, with some hull bias
+  // so driving still feels planted. Look tracks mouse almost 1:1 (high lambda, tight lag cap).
+  turretFollowWeight: 0.65,  // 0 = camera ignores look/turret, 1 = boom fully orbits with look
+  turretLookWeight: 0.95,    // how much the LOOK target aims along look yaw (0 = tank heading)
+  turretYawLambda: 14.0,     // smoothing for look-driven aim (lower = floatier)
   turretSwingRollDeg: 1.1,   // extra roll when turret slews quickly
   turretSwingOffset: 0.28,   // sideways camera shift (m) while turret slews
   // Gun elev (lookPitch): gentle vertical react — raise look when aiming up, drop cam slightly
@@ -47,7 +47,10 @@ export const CAMERA_CONFIG = {
   // ---------- Steering tilt / lean ----------
   maxRollDeg: 4.5,           // horizon roll into turns at full steer + speed
   rollMinSpeedFactor: 0.25,  // fraction of roll kept at standstill (0 = none when stopped)
-  rollLambda: 5.0,           // how quickly roll follows
+  rollLambda: 5.0,           // how quickly roll follows bankSteer
+  // Bank engages on sustained steer — taps barely move bankSteer, then scales linearly.
+  rollSteerLambda: 1.8,      // damp rate of steer→bank (lower = ignore quick taps)
+  rollSteerDeadzone: 0.2,    // |bankSteer| below this = level; remapped linearly above
   invertRoll: false,         // flip if the lean feels wrong-way
   steerLateralOffset: 0.9,   // camera slides sideways (m) on steer, like racing cams
   lateralLambda: 4.0,
@@ -61,7 +64,7 @@ export const CAMERA_CONFIG = {
   brakeThrottle: 0.08,       // throttle below this while moving = braking (matches taillights)
 
   // ---------- Nitro FOV punch ----------
-  nitroFovDeg: 10,           // extra degrees at peak
+  nitroFovDeg: 11,           // extra degrees at peak
   nitroFovDuration: 2.0,     // total widen→settle window
   nitroFovPeakAt: 1.0,       // seconds in when FOV is widest
 
@@ -76,7 +79,7 @@ export const CAMERA_CONFIG = {
   kickReturnDuration: 4.0,   // total fire→rest window; match tank RELOAD
   kickShake: 0.45,           // trauma added to shake on fire (0..1)
   // Soft peak trauma refreshed each .50 round (snap, don’t stack — stacking becomes an earthquake).
-  mgShake: 0.3,
+  mgShake: 0.45,
 
   // ---------- Shake ----------
   shakeMaxAngleDeg: 2.0,     // rotation at trauma = 1
@@ -150,6 +153,7 @@ export class TankCamera {
     this.aimYaw = 0;
     this.pivot = new THREE.Vector3();
     this.roll = 0;
+    this.bankSteer = 0;            // lagged steer used only for roll / lateral bank
     this.lateral = 0;
     this.slew = 0;
     this.pitch = 0;
@@ -254,6 +258,7 @@ export class TankCamera {
     this.trauma = 0;
     this.collisionDist = Infinity;
     this.roll = 0;
+    this.bankSteer = 0;
     this.lateral = 0;
     this.slew = 0;
     this.pitch = 0;
@@ -353,11 +358,18 @@ export class TankCamera {
     }
 
     // ----- roll / lateral / slew -----
+    // Lag steer into bankSteer so quick taps stay near level; deadzone then linear remap.
+    this.bankSteer = damp(this.bankSteer, steer, c.rollSteerLambda, dt);
+    const bankAbs = Math.abs(this.bankSteer);
+    const bankDz = c.rollSteerDeadzone;
+    const bankSteer = bankAbs <= bankDz
+      ? 0
+      : Math.sign(this.bankSteer) * ((bankAbs - bankDz) / (1 - bankDz));
     const rollSign = c.invertRoll ? -1 : 1;
     const rollSpeedFactor = lerp(c.rollMinSpeedFactor, 1, speedT);
-    const targetRoll = rollSign * (-steer * deg(c.maxRollDeg) * rollSpeedFactor - turretTurn * deg(c.turretSwingRollDeg));
+    const targetRoll = rollSign * (-bankSteer * deg(c.maxRollDeg) * rollSpeedFactor - turretTurn * deg(c.turretSwingRollDeg));
     this.roll = damp(this.roll, targetRoll, c.rollLambda, dt);
-    this.lateral = damp(this.lateral, steer * c.steerLateralOffset * rollSpeedFactor, c.lateralLambda, dt);
+    this.lateral = damp(this.lateral, bankSteer * c.steerLateralOffset * rollSpeedFactor, c.lateralLambda, dt);
     this.slew = damp(this.slew, turretTurn, 6, dt);
     this.pitch = damp(this.pitch, (s.pitch ?? 0) * c.pitchFollowTilt, c.pitchLambda, dt);
     this.gunPitch = damp(this.gunPitch, s.turretPitch ?? 0, c.turretPitchLambda, dt);

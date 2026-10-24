@@ -14,10 +14,12 @@
   <div id="gun-marker"></div>
   <div id="overlay">
     <div class="overlay-inner">
-      <div>Click to drive (mouse captures) — or press any gamepad button</div>
-      <div class="overlay-hint">Shift nitro · F freefly · F3 debug · V visuals · Space unflip · R reset tank · C reset camera</div>
-      <button type="button" id="restart-game">Restart game</button>
-      <button type="button" id="reset-cam">Reset camera to defaults (C)</button>
+      <strong class="pause-title">Paused</strong>
+      <div>Esc / click to resume — or press any gamepad button</div>
+      <div class="overlay-hint">1 smoke · 2 air · 3 repair · RMB .50 · Shift nitro · Esc pause · F freefly · F3 debug · V visuals · Space unflip · R reset · C camera</div>
+      <button type="button" id="pause-resume">Resume</button>
+      <button type="button" id="restart-game">Restart</button>
+      <button type="button" id="reset-cam">Reset camera (C)</button>
     </div>
   </div>
   <script type="module" src="/src/main.js"></script>

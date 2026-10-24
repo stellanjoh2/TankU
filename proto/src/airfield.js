@@ -1,5 +1,6 @@
 // WWII hangar + concrete apron near spawn (refuel / "airport" pad).
 // Door clear opening is sized so a Sherman (~3.3 m wide × ~2.8 m tall) just fits.
+// Walls are pre-fractured into ~130 shell-hittable panels (roof / door / shed stay solid).
 import * as THREE from 'three';
 import { AIRFIELD, AIRFIELD_Y, heightAt } from './terrain.js';
 import { applyConcreteMaps, prepareSlabGeometry } from './concreteTex.js';
@@ -16,6 +17,24 @@ const BUILD_D = 20.0;   // exterior depth (X in hangar-local, door on −X)
 const SLAB = 4.0;
 const SLAB_GAP = 0.08;
 const SLAB_T = 0.06;
+
+// Finer grid (~1.3–2 m panels). One shell clears a small blast cluster so holes aren't perfect squares.
+const SIDE_COLS = 10;
+const SIDE_ROWS = 4;
+const BACK_COLS = 8;
+const BACK_ROWS = 4;
+const FRONT_COLS = 2;
+const FRONT_ROWS = 4;
+const LINTEL_COLS = 2;
+const SHELL_BLAST = 1.85;   // m: panels whose centres fall inside also go
+const DEBRIS_PER_HIT = 3;
+const DEBRIS_MAX = 40;
+const DEBRIS_LINGER = 1.2;
+const SCRAP = [
+  { size: [0.55, 0.04, 0.4], color: 0xb8c0c4 },
+  { size: [0.4, 0.035, 0.5], color: 0x8a9094 },
+  { size: [0.3, 0.03, 0.3], color: 0x6b3a22 },
+];
 
 /** Hangar group origin (building centre): door on the west face, apron toward spawn. */
 export const HANGAR = {
@@ -74,7 +93,9 @@ function corrugatedMap() {
 }
 
 /**
- * @returns {{ root: THREE.Group, navObstacles: () => object[] }}
+ * @returns {{ root: THREE.Group, navObstacles: () => object[],
+ *   shellHit: (body: object, dir?: THREE.Vector3, point?: THREE.Vector3, collider?: object) => boolean,
+ *   update: (dt: number) => void, reset: () => void }}
  */
 export function buildAirfield(RAPIER, world, scene) {
   const root = new THREE.Group();
@@ -119,35 +140,181 @@ export function buildAirfield(RAPIER, world, scene) {
   const hd = BUILD_D * 0.5;
   // Local: door face at x = −hd, back at +hd, sides ±hw.
 
+  /** @type {{ mesh: THREE.Mesh, collider: object, dead: boolean, lx: number, ly: number, lz: number, sx: number, sy: number, sz: number }[]} */
+  const pieces = [];
+  const byCollider = new Map();
+  /** @type {{ mesh: THREE.Mesh, body: object, age: number, linger: number }[]} */
+  const debris = [];
+
+  function addPiece(lx, ly, lz, sx, sy, sz) {
+    const mesh = boxMesh(unit, metal, lx, ly, lz, sx, sy, sz);
+    hangar.add(mesh);
+    const col = world.createCollider(
+      RAPIER.ColliderDesc.cuboid(sx * 0.5, sy * 0.5, sz * 0.5)
+        .setTranslation(lx, ly, lz)
+        .setFriction(0.85),
+      body,
+    );
+    const piece = { mesh, collider: col, dead: false, lx, ly, lz, sx, sy, sz, extras: [] };
+    pieces.push(piece);
+    byCollider.set(col.handle, piece);
+    return piece;
+  }
+
+  function removeDebris(d) {
+    scene.remove(d.mesh);
+    d.mesh.geometry.dispose();
+    d.mesh.material.dispose();
+    world.removeRigidBody(d.body);
+  }
+
+  function spawnDebris(piece, dir) {
+    while (debris.length >= DEBRIS_MAX) {
+      removeDebris(debris.shift());
+    }
+    const wx = HANGAR.x + piece.lx;
+    const wy = y0 + piece.ly;
+    const wz = HANGAR.z + piece.lz;
+    const n = Math.min(DEBRIS_PER_HIT, SCRAP.length);
+    for (let i = 0; i < n; i++) {
+      const { size, color } = SCRAP[i];
+      const [w, h, d] = size;
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(w, h, d),
+        new THREE.MeshStandardMaterial({ color, metalness: 0.55, roughness: 0.55 }),
+      );
+      mesh.castShadow = true;
+      const ox = (Math.random() - 0.5) * piece.sx * 0.4;
+      const oy = (Math.random() - 0.5) * piece.sy * 0.35;
+      const oz = (Math.random() - 0.5) * piece.sz * 0.4;
+      const px = wx + ox;
+      const py = wy + oy;
+      const pz = wz + oz;
+      const quat = new THREE.Quaternion().setFromEuler(new THREE.Euler(
+        Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI,
+      ));
+      mesh.position.set(px, py, pz);
+      mesh.quaternion.copy(quat);
+      scene.add(mesh);
+      const rb = world.createRigidBody(
+        RAPIER.RigidBodyDesc.dynamic()
+          .setTranslation(px, py, pz)
+          .setRotation(quat)
+          .setLinearDamping(0.12)
+          .setAngularDamping(0.2)
+          .setCcdEnabled(true)
+          .setUserData({ mat: 'metal' }),
+      );
+      world.createCollider(
+        RAPIER.ColliderDesc.cuboid(w / 2, h / 2, d / 2)
+          .setDensity(180)
+          .setFriction(0.55)
+          .setRestitution(0.2),
+        rb,
+      );
+      const vel = new THREE.Vector3(
+        (Math.random() - 0.5) * 4,
+        4 + Math.random() * 4,
+        (Math.random() - 0.5) * 4,
+      );
+      if (dir) vel.addScaledVector(dir, 6 + Math.random() * 3);
+      rb.setLinvel({ x: vel.x, y: vel.y, z: vel.z }, true);
+      rb.setAngvel({
+        x: (Math.random() - 0.5) * 14,
+        y: (Math.random() - 0.5) * 14,
+        z: (Math.random() - 0.5) * 14,
+      }, true);
+      debris.push({ mesh, body: rb, age: 0, linger: -1 });
+    }
+  }
+
+  function destroyPiece(piece, dir, withDebris) {
+    if (piece.dead) return;
+    piece.dead = true;
+    piece.mesh.visible = false;
+    for (const m of piece.extras) m.visible = false;
+    piece.collider.setEnabled(false);
+    if (withDebris) spawnDebris(piece, dir);
+  }
+
+  /** Knock out the hit panel plus neighbours in a small blast so the hole isn't one clean rectangle. */
+  function destroyAt(hitPiece, dir, point) {
+    let cx = hitPiece.lx;
+    let cy = hitPiece.ly;
+    let cz = hitPiece.lz;
+    if (point) {
+      cx = point.x - HANGAR.x;
+      cy = point.y - y0;
+      cz = point.z - HANGAR.z;
+    }
+    let primary = null;
+    let primaryD = Infinity;
+    const hit = [];
+    for (const p of pieces) {
+      if (p.dead) continue;
+      const d = Math.hypot(p.lx - cx, p.ly - cy, p.lz - cz);
+      if (d > SHELL_BLAST) continue;
+      hit.push(p);
+      if (d < primaryD) {
+        primaryD = d;
+        primary = p;
+      }
+    }
+    for (const p of hit) destroyPiece(p, dir, p === primary);
+  }
+
   // --- Floor (interior) ---
   hangar.add(boxMesh(unit, interior, 0, 0.04, 0, BUILD_D - 0.4, 0.08, BUILD_W - 0.4));
 
-  // --- Side walls ---
-  const sideY = EAVE_H * 0.5;
+  // --- Side walls (pre-fractured grid) ---
+  const colW = BUILD_D / SIDE_COLS;
+  const rowH = EAVE_H / SIDE_ROWS;
   for (const sz of [-1, 1]) {
-    const wall = boxMesh(unit, metal, 0, sideY, sz * (hw - WALL_T * 0.5), BUILD_D, EAVE_H, WALL_T);
-    hangar.add(wall);
-    addCollider(RAPIER, world, body, BUILD_D * 0.5, EAVE_H * 0.5, WALL_T * 0.5, 0, sideY, sz * (hw - WALL_T * 0.5));
+    const z = sz * (hw - WALL_T * 0.5);
+    for (let c = 0; c < SIDE_COLS; c++) {
+      for (let r = 0; r < SIDE_ROWS; r++) {
+        const lx = -hd + colW * (c + 0.5);
+        const ly = rowH * (r + 0.5);
+        addPiece(lx, ly, z, colW, rowH, WALL_T);
+      }
+    }
   }
 
   // --- Back wall ---
-  hangar.add(boxMesh(unit, metal, hd - WALL_T * 0.5, sideY, 0, WALL_T, EAVE_H, BUILD_W));
-  addCollider(RAPIER, world, body, WALL_T * 0.5, EAVE_H * 0.5, hw, hd - WALL_T * 0.5, sideY, 0);
+  const backColW = BUILD_W / BACK_COLS;
+  const backRowH = EAVE_H / BACK_ROWS;
+  for (let c = 0; c < BACK_COLS; c++) {
+    for (let r = 0; r < BACK_ROWS; r++) {
+      const lz = -hw + backColW * (c + 0.5);
+      const ly = backRowH * (r + 0.5);
+      addPiece(hd - WALL_T * 0.5, ly, lz, WALL_T, backRowH, backColW);
+    }
+  }
 
   // --- Front wall (door opening centred) ---
   const doorHalf = DOOR_W * 0.5;
   const sidePanelW = (BUILD_W - DOOR_W) * 0.5;
   const frontX = -hd + WALL_T * 0.5;
+  const frontColW = sidePanelW / FRONT_COLS;
+  const frontRowH = EAVE_H / FRONT_ROWS;
   for (const sz of [-1, 1]) {
-    const cz = sz * (doorHalf + sidePanelW * 0.5);
-    hangar.add(boxMesh(unit, metal, frontX, sideY, cz, WALL_T, EAVE_H, sidePanelW));
-    addCollider(RAPIER, world, body, WALL_T * 0.5, EAVE_H * 0.5, sidePanelW * 0.5, frontX, sideY, cz);
+    const z0 = sz * (doorHalf + sidePanelW * 0.5) - sidePanelW * 0.5;
+    for (let c = 0; c < FRONT_COLS; c++) {
+      for (let r = 0; r < FRONT_ROWS; r++) {
+        addPiece(
+          frontX, frontRowH * (r + 0.5), z0 + frontColW * (c + 0.5),
+          WALL_T, frontRowH, frontColW,
+        );
+      }
+    }
   }
   // Lintel above door
   const lintelH = EAVE_H - DOOR_H;
   const lintelY = DOOR_H + lintelH * 0.5;
-  hangar.add(boxMesh(unit, metal, frontX, lintelY, 0, WALL_T, lintelH, DOOR_W));
-  addCollider(RAPIER, world, body, WALL_T * 0.5, lintelH * 0.5, doorHalf, frontX, lintelY, 0);
+  const lintelColW = DOOR_W / LINTEL_COLS;
+  for (let c = 0; c < LINTEL_COLS; c++) {
+    addPiece(frontX, lintelY, -doorHalf + lintelColW * (c + 0.5), WALL_T, lintelH, lintelColW);
+  }
 
   // --- Sliding door (parked open to +Z, leaving the clear opening free) ---
   const doorPanel = new THREE.Group();
@@ -204,14 +371,21 @@ export function buildAirfield(RAPIER, world, scene) {
     hangar.add(gable);
   }
 
-  // --- Side window strip (high industrial panes) ---
+  // --- Side window strip (tied to upper wall panels so they vanish with the hole) ---
   const winY = EAVE_H * 0.72;
   for (const sz of [-1, 1]) {
-    const z = sz * (hw - 0.02);
+    const zWall = sz * (hw - WALL_T * 0.5);
     for (let i = 0; i < 8; i++) {
       const x = -hd + 1.8 + i * 2.1;
-      hangar.add(boxMesh(unit, frame, x, winY, z, 1.6, 1.35, 0.08));
-      hangar.add(boxMesh(unit, glass, x, winY, z + sz * 0.04, 1.4, 1.15, 0.04));
+      const fr = boxMesh(unit, frame, x, winY, sz * (hw - 0.02), 1.6, 1.35, 0.08);
+      const gl = boxMesh(unit, glass, x, winY, sz * (hw - 0.02) + sz * 0.04, 1.4, 1.15, 0.04);
+      hangar.add(fr, gl);
+      const host = pieces.find((p) => (
+        Math.abs(p.lz - zWall) < 0.01
+        && Math.abs(x - p.lx) <= p.sx * 0.5 + 0.05
+        && Math.abs(winY - p.ly) <= p.sy * 0.5 + 0.05
+      ));
+      if (host) host.extras.push(fr, gl);
     }
   }
 
@@ -290,8 +464,47 @@ export function buildAirfield(RAPIER, world, scene) {
   // Sanity: door vs Sherman
   console.info(
     `[airfield] pad @ (${AIRFIELD.cx}, ${AIRFIELD.cz}) y=${y0.toFixed(2)}; ` +
-      `hangar door ${DOOR_W}×${DOOR_H} m (Sherman ~3.3×2.8); terrain h@door=${heightAt(HANGAR.x - hd, HANGAR.z).toFixed(2)}`,
+      `hangar door ${DOOR_W}×${DOOR_H} m (Sherman ~3.3×2.8); ` +
+      `${pieces.length} wall panels; terrain h@door=${heightAt(HANGAR.x - hd, HANGAR.z).toFixed(2)}`,
   );
 
-  return { root, navObstacles };
+  return {
+    root,
+    navObstacles,
+    /** Main-gun shell: punch out the hit wall panel. Returns true if this hangar body was hit. */
+    shellHit(hitBody, dir, point, collider) {
+      if (hitBody?.handle !== body.handle) return false;
+      const piece = collider ? byCollider.get(collider.handle) : null;
+      if (piece) destroyAt(piece, dir, point);
+      return true;
+    },
+    update(dt) {
+      for (let i = debris.length - 1; i >= 0; i--) {
+        const d = debris[i];
+        const t = d.body.translation();
+        d.mesh.position.set(t.x, t.y, t.z);
+        d.mesh.quaternion.copy(d.body.rotation());
+        d.age += dt;
+        if (d.linger < 0) {
+          const v = d.body.linvel();
+          const onGround = t.y - heightAt(t.x, t.z) < 0.45 && v.y < 1;
+          const settled = d.age > 0.35 && Math.hypot(v.x, v.y, v.z) < 1.2;
+          if (onGround || settled || d.age > 5) d.linger = DEBRIS_LINGER;
+        } else if ((d.linger -= dt) <= 0) {
+          removeDebris(d);
+          debris.splice(i, 1);
+        }
+      }
+    },
+    reset() {
+      for (const p of pieces) {
+        p.dead = false;
+        p.mesh.visible = true;
+        for (const m of p.extras) m.visible = true;
+        p.collider.setEnabled(true);
+      }
+      for (const d of debris) removeDebris(d);
+      debris.length = 0;
+    },
+  };
 }

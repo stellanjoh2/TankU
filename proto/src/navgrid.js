@@ -6,16 +6,28 @@
 //    ray-cast exposure map ("can the enemy see this cell?") plus a proximity term, so one search
 //    gives sneaky covered routes when outgunned and direct ones when it has the edge.
 //  * String-pulling smooths the grid path but never cuts through blocked or more-exposed cells.
-import { SIZE, WATER_Y, heightAt, shoreSigned, onBridge } from './terrain.js';
+import { SIZE, WATER_Y, BRIDGE, heightAt, shoreSigned, bridgeLocal } from './terrain.js';
 
 export const CELL = 2;
 const N = Math.ceil(SIZE / CELL);
 const HALF = SIZE / 2;
 const HULL_R = 2.5;      // hull centre must stay this far from blocked cells (m)
-const KEEP_CLEAR = 4;    // soft-penalty band beyond HULL_R (m)
+const KEEP_CLEAR = 6;    // soft-penalty band beyond HULL_R (m) — keep routes inland of the waterline
+const WET_SHORE = 3.5;   // metres inland of the waterline treated as undrivable
 const MAX_GRADE = 0.8;   // rise/run steeper than this is undrivable
 const STEEP_GRADE = 0.45; // above this, climbing gets expensive fast
 const SQRT2 = Math.SQRT2;
+// Bridge nav footprint: stretch a little onto each bank so the islands connect, but stay tight
+// across the deck — a uniform margin was marking the seabed beside the planks as driveable.
+const BRIDGE_ALONG = 4;
+const BRIDGE_ACROSS = 0.5;
+
+/** True on the roadway (and short bank ramps), not in the water beside the deck. */
+function onNavBridge(x, z) {
+  const { lx, lz } = bridgeLocal(x, z);
+  return Math.abs(lx) < BRIDGE.length * 0.5 + BRIDGE_ALONG
+    && Math.abs(lz) < BRIDGE.deckW * 0.5 + BRIDGE_ACROSS;
+}
 
 class MinHeap {
   constructor() { this.ids = []; this.keys = []; }
@@ -61,6 +73,7 @@ export class NavGrid {
     this.height = new Float32Array(cells);
     this.grade = new Float32Array(cells);
     this.terrainBlocked = new Uint8Array(cells);
+    this.bridge = new Uint8Array(cells);       // roadway cells (exempt from hull-radius wipe)
     this.blocked = new Uint8Array(cells);
     this.clearance = new Float32Array(cells);  // metres to nearest blocked cell
     this.cost = new Float32Array(cells);       // per-metre cost; Infinity = hull can't sit here
@@ -84,9 +97,12 @@ export class NavGrid {
         const grade = Math.hypot(gx, gz);
         this.height[k] = h;
         this.grade[k] = grade;
+        const onB = onNavBridge(x, z);
+        this.bridge[k] = onB ? 1 : 0;
         const edge = Math.max(Math.abs(x), Math.abs(z)) > HALF - 6;
-        const wet = !onBridge(x, z, 3) && (shoreSigned(x, z) < 3 || h < WATER_Y + 0.6);
-        this.terrainBlocked[k] = edge || wet || grade > MAX_GRADE ? 1 : 0;
+        // Mid-span height is seabed (deck is a separate mesh) — bridge mask keeps the roadway open.
+        const wet = !onB && (shoreSigned(x, z) < WET_SHORE || h < WATER_Y + 0.5);
+        this.terrainBlocked[k] = edge || wet || (!onB && grade > MAX_GRADE) ? 1 : 0;
       }
     }
     this.setObstacles([]);
@@ -159,9 +175,12 @@ export class NavGrid {
     }
 
     for (let k = 0; k < N * N; k++) {
+      if (blocked[k]) { cost[k] = Infinity; continue; }
       const d = clearance[k];
-      if (d < HULL_R) { cost[k] = Infinity; continue; }
-      const band = d < HULL_R + KEEP_CLEAR ? 1.5 * (1 - (d - HULL_R) / KEEP_CLEAR) ** 2 : 0;
+      // Narrow deck: side-water is only ~2.5 m away, so hull inflation would erase the crossing.
+      if (!this.bridge[k] && d < HULL_R) { cost[k] = Infinity; continue; }
+      const band = !this.bridge[k] && d < HULL_R + KEEP_CLEAR
+        ? 1.5 * (1 - (d - HULL_R) / KEEP_CLEAR) ** 2 : 0;
       const steep = Math.max(0, grade[k] - STEEP_GRADE) * 12;
       cost[k] = 1 + grade[k] * 3 + steep + band;
     }

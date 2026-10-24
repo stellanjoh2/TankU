@@ -1,14 +1,23 @@
-// Health bars (bottom-left), round banner, hit flash and an optional AI debug readout.
+// Health bars (bottom-left), hit-rate (stress + smoke), active gadget, round banner, hit flash.
+export const GADGETS = [
+  { id: 'smoke', key: '1', label: 'SMOKE' },
+  { id: 'air', key: '2', label: 'AIR SUPPORT' },
+  { id: 'repair', key: '3', label: 'REPAIR' },
+];
+
 export function createHud() {
   const root = document.createElement('div');
   root.id = 'hud';
   root.innerHTML = `
     <div class="hp" data-who="player"><span>YOU</span><div class="hp-bar"><i></i></div><b>100%</b></div>
-    <div class="stress hidden" data-who="player-stress"><span>STRESS</span><div class="stress-bar"><i></i></div><b>0</b></div>
+    <div class="repair hidden" data-who="repair"><span>REPAIRING</span><div class="repair-bar"><i></i></div><b>5.0s</b></div>
+    <div class="hit hidden" data-who="player-hit"><span>HIT</span><div class="hit-bar"><i></i></div><b>100%</b></div>
     <div class="nitro" data-who="nitro"><span>NITRO</span><div class="nitro-bar"><i></i></div><b>100%</b></div>
     <div class="reload hidden" data-who="reload"><span>RELOAD</span><div class="reload-bar"><i></i></div><b>0.0s</b></div>
+    <div class="gadget" data-who="gadget"><span>GADGET</span><b>1 SMOKE</b></div>
     <div class="hp enemy" data-who="enemy"><span>ENEMY</span><div class="hp-bar"><i></i></div><b>100%</b></div>
-    <div class="stress hidden" data-who="enemy-stress"><span>STRESS</span><div class="stress-bar"><i></i></div><b>0</b></div>
+    <div class="hp enemy" data-who="enemy2"><span>ENEMY 2</span><div class="hp-bar"><i></i></div><b>100%</b></div>
+    <div class="hit hidden" data-who="enemy-hit"><span>HIT</span><div class="hit-bar"><i></i></div><b>100%</b></div>
     <div class="ai-debug hidden"></div>`;
   const banner = document.createElement('div');
   banner.id = 'banner';
@@ -32,11 +41,13 @@ export function createHud() {
 
   const rows = {
     player: root.querySelector('[data-who="player"]'),
-    enemy: root.querySelector('[data-who="enemy"]'),
+    enemies: [...root.querySelectorAll('.hp.enemy')],
     nitro: root.querySelector('[data-who="nitro"]'),
     reload: root.querySelector('[data-who="reload"]'),
-    playerStress: root.querySelector('[data-who="player-stress"]'),
-    enemyStress: root.querySelector('[data-who="enemy-stress"]'),
+    gadget: root.querySelector('[data-who="gadget"]'),
+    repair: root.querySelector('[data-who="repair"]'),
+    playerHit: root.querySelector('[data-who="player-hit"]'),
+    enemyHit: root.querySelector('[data-who="enemy-hit"]'),
   };
   const debug = root.querySelector('.ai-debug');
 
@@ -48,24 +59,33 @@ export function createHud() {
     row.classList.toggle('dead', pct <= 0);
   }
 
-  function setStressRow(row, frac) {
+  /** Hit rate 0..1 (stress + smoke). Hidden at 100%. */
+  function setHitRow(row, frac, inSmoke = false) {
     const pct = Math.round(Math.max(0, Math.min(1, frac)) * 100);
-    const on = pct > 0;
+    const on = pct < 100;
     row.classList.toggle('hidden', !on);
+    row.classList.toggle('smoke', on && inSmoke);
     if (!on) return;
     row.querySelector('i').style.width = `${pct}%`;
-    row.querySelector('b').textContent = `${pct}`;
+    row.querySelector('b').textContent = `${pct}%`;
   }
 
   return {
     setHealth(player, enemy) {
       setBar(rows.player, player);
-      if (enemy != null) setBar(rows.enemy, enemy);
+      const list = Array.isArray(enemy) ? enemy : (enemy == null ? [] : [enemy]);
+      rows.enemies.forEach((row, i) => {
+        if (i < list.length) setBar(row, list[i]);
+      });
     },
-    /** Stress level 0..1 (meter shows 0..100). Hidden at 0. */
-    setStress(player, enemy) {
-      setStressRow(rows.playerStress, player);
-      setStressRow(rows.enemyStress, enemy ?? 0);
+    /**
+     * Effective direct-hit rate 0..1 (1 − stress miss − smoke miss).
+     * Hidden while at 100% so the meter only appears when aim is degraded.
+     * `*Smoke` tints the meter grey when the smoke penalty is active.
+     */
+    setHitRate(player, enemy, playerSmoke = false, enemySmoke = false) {
+      setHitRow(rows.playerHit, player, playerSmoke);
+      setHitRow(rows.enemyHit, enemy ?? 1, enemySmoke);
     },
     /** Seconds left on the main gun. Hidden when the gun is ready. */
     setReload(remaining, total) {
@@ -83,7 +103,39 @@ export function createHud() {
       rows.nitro.classList.toggle('empty', pct <= 0);
       rows.nitro.classList.toggle('active', !!active);
     },
-    showEnemy(on) { rows.enemy.classList.toggle('hidden', !on); },
+    /**
+     * Active gadget slot (1 smoke / 2 air / 3 repair).
+     * Repair shows charges left, or REPAIRING plus the channel timer.
+     * @param {'smoke'|'air'|'repair'} id
+     * @param {number} [cd=0]
+     * @param {{ repairing?: boolean, repairLeft?: number, charges?: number }|null} [info]
+     */
+    setGadget(id, cd = 0, info = null) {
+      const g = GADGETS.find((x) => x.id === id) || GADGETS[0];
+      const repairing = id === 'repair' && !!info?.repairing;
+      const empty = id === 'repair' && !repairing && (info?.charges ?? 0) <= 0;
+      const cooling = !repairing && (cd > 0.05 || empty);
+      let text;
+      if (repairing) text = `REPAIRING  ${info.repairLeft.toFixed(1)}s`;
+      else if (id === 'repair') text = `${g.key} ${g.label}  ×${info?.charges ?? 0}`;
+      else text = cooling ? `${g.key} ${g.label}  ${cd.toFixed(1)}s` : `${g.key} ${g.label}`;
+      rows.gadget.querySelector('b').textContent = text;
+      rows.gadget.classList.toggle('cooling', cooling);
+      rows.gadget.classList.toggle('repairing', repairing);
+    },
+    /** Repair channel. Hidden when idle. Bar fills over `total` seconds; label stays REPAIRING. */
+    setRepair(remaining, total) {
+      const on = remaining > 0.02 && total > 0;
+      rows.repair.classList.toggle('hidden', !on);
+      if (!on) return;
+      const done = 1 - remaining / total;
+      rows.repair.querySelector('i').style.width = `${Math.round(Math.max(0, Math.min(1, done)) * 100)}%`;
+      rows.repair.querySelector('b').textContent = `${remaining.toFixed(1)}s`;
+    },
+    showEnemy(on) {
+      for (const row of rows.enemies) row.classList.toggle('hidden', !on);
+      if (!on) rows.enemyHit.classList.add('hidden');
+    },
     banner(title, sub = '', tone = 'win') {
       banner.classList.remove('in', 'win', 'lose');
       if (!title) {

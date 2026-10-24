@@ -7,8 +7,13 @@ export const SIZE = 380;
 export const WATER_Y = 0.2;
 // Keep ~1.44 m cells after the map grew to fit the satellite island.
 const SEGS = 264;
+/** How far offshore (metres of shore distance) the detailed shore mesh eases down to the floor. */
+const SHORE_SHELF = 36;
 /** Keep a triangle if any corner is at least this far from shore (inland +, sea −). */
-const SEA_PRUNE = -10;
+const SEA_PRUNE = -SHORE_SHELF;
+/** Flat physical sea floor past the shelf. The shelf lands just above this so the two don't z-fight. */
+const SEA_FLOOR_Y = WATER_Y - 5.5;
+const SEA_FLOOR_LIP = 0.15;
 
 // Hills: [cx, cz, height, radius] — ~50% taller + tighter falloff than the old 500 m map.
 const HILLS = [
@@ -90,8 +95,11 @@ export const PORT_YARD = {
   z1: PORT.z0,
 };
 
-/** Enemy spawn focus: far north of the main island — opposite the satellite, so rounds start with a hunt. */
-export const ENEMY_SPAWN = { x: -10, z: 63 };
+/** Enemy spawn focus: northeast end of the north shore, opposite the satellite. */
+export const ENEMY_SPAWN = { x: 6, z: 88 };
+
+/** Second enemy guards the apron in front of the hangar. The south hills hide it from the satellite. */
+export const ENEMY_SPAWN_BASE = { x: -11, z: -9 };
 
 const smooth = (x, a, b) => THREE.MathUtils.smoothstep(x, a, b);
 const clamp01 = (v) => Math.min(1, Math.max(0, v));
@@ -304,7 +312,7 @@ function ridgeHeight(x, z) {
 
 /**
  * Natural terrain height (no airfield flatten).
- * Island interior with dramatic hills; beach shelf; seabed below WATER_Y offshore.
+ * Island interior with dramatic hills; beach shelf eases out to the flat sea floor.
  */
 function naturalHeightAt(x, z) {
   const main = mainShoreSigned(x, z);
@@ -313,9 +321,11 @@ function naturalHeightAt(x, z) {
   const onSat = sat > main;
 
   if (signed < -1.5) {
-    // Seabed slopes away from shore
-    const depth = -signed;
-    return WATER_Y - 0.8 - Math.min(12, depth * 0.12) - 0.15 * Math.sin(x * 0.08) * Math.cos(z * 0.07);
+    // Ease from the intertidal lip (same height as the blend below) out to the flat floor.
+    const u = clamp01((-signed - 1.5) / (SHORE_SHELF - 1.5));
+    const y = THREE.MathUtils.lerp(WATER_Y - 0.5, SEA_FLOOR_Y + SEA_FLOOR_LIP, smooth(u, 0, 1));
+    const ripple = 0.12 * Math.sin(Math.PI * u) * Math.sin(x * 0.08) * Math.cos(z * 0.07);
+    return y + ripple;
   }
 
   const inland = clamp01(signed / 22);
@@ -590,7 +600,18 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   mesh.name = 'IslandTerrain';
   scene.add(mesh);
 
-  // WebGPU ocean (three.js WaterMesh). Seabed collider stays on the terrain mesh.
+  // Flat sea floor under the whole ocean: two triangles, so anything past the shore shelf lands.
+  const floorGeo = new THREE.PlaneGeometry(SIZE * 6, SIZE * 6, 1, 1);
+  floorGeo.rotateX(-Math.PI / 2);
+  floorGeo.translate(0, SEA_FLOOR_Y, 0);
+  const floorColor = palette.wetSand.clone().multiplyScalar(0.4);
+  const floorMat = new MeshStandardNodeMaterial({ metalness: 0, roughness: 1 });
+  floorMat.colorNode = uniform(floorColor);
+  const seaFloor = new THREE.Mesh(floorGeo, floorMat);
+  seaFloor.name = 'SeaFloor';
+  scene.add(seaFloor);
+
+  // WebGPU ocean (three.js WaterMesh). Shore shelf stays on the terrain mesh; the floor is separate.
   const waterNormals = await loader.loadAsync('./textures/waternormals.jpg');
   waterNormals.wrapS = waterNormals.wrapT = THREE.RepeatWrapping;
   const water = new WaterMesh(
@@ -600,6 +621,12 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
       sunDirection: (sunDir || new THREE.Vector3(0.70707, 0.70707, 0)).clone().normalize(),
       sunColor: 0xffffff,
       waterColor: palette.water,
+      // Turquoise near shore / hull contact; foam line rides the depth intersection.
+      shallowColor: 0x5ec8c4,
+      shallowDepth: 2.8,
+      foamDepth: 0.45,
+      foamIntensity: 0.65,
+      shoreOpacity: 0.55,
       distortionScale: 3.7,
       size: 2.0,
       timeScale: 0.5,
@@ -609,6 +636,10 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   water.rotation.x = -Math.PI / 2;
   water.position.y = WATER_Y;
   water.receiveShadow = true;
+  // Transparent + depthWrite false: must draw before FX (default order 0). Order 2
+  // painted the ocean over muzzle flashes / explosions; distance sort also fails on
+  // this huge plane when order ties.
+  water.renderOrder = -1;
   water.name = 'Ocean';
   scene.add(water);
 
@@ -616,6 +647,15 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   const verts = new Float32Array(pos.array);
   const idx = new Uint32Array(geo.index.array);
   world.createCollider(RAPIER.ColliderDesc.trimesh(verts, idx).setFriction(0.9), body);
+
+  const floorBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+  world.createCollider(
+    RAPIER.ColliderDesc.trimesh(
+      new Float32Array(floorGeo.attributes.position.array),
+      new Uint32Array(floorGeo.index.array),
+    ).setFriction(0.9),
+    floorBody,
+  );
 
   const paletteListeners = [];
 
