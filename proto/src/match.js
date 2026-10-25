@@ -1,11 +1,14 @@
 // Round lifecycle + combat resolution (shell / MG hits → HP → wreck → auto-restart).
 import * as THREE from 'three';
-import { MG_DAMAGE } from './tank.js';
+import { MG_DAMAGE, REPAIR_CHARGES } from './tank.js';
 import { pickSpawn } from './ai.js';
 import { distGain } from './sfx.js';
+import { WATER_Y } from './terrain.js';
 
 const ROUND_RESTART_DELAY = 4;          // seconds the wreck burns before the next round
 const REMAIN_HOLD = 2.6;                // seconds "N ENEMIES REMAINING" stays up
+const START_DELAY = 2;                  // seconds of play before "Eliminate all invaders"
+const START_HOLD = 3;                   // seconds that callout stays up
 const BARREL_BLAST_FULL = 3;            // m from a fuel drum blast: 1 HP (same as a shell hit)
 const BARREL_BLAST_EDGE = 5.5;          // m: chip damage out to here
 const SOLO_KEY = 'sherman.solo';
@@ -13,10 +16,17 @@ const HULL_FRONT_X = 1.4;               // local +X is forward; past this is the
 const HULL_REAR_X = -1.5;               // engine bay
 const FRONT_DMG = 0.75;
 const REAR_DMG = 1.25;
+const SHELL_FULL_RANGE = 35;           // m: full damage inside this (close combat)
+const SHELL_FAR_RANGE = 150;           // m: across-map floor reached by here
+const SHELL_FAR_DMG = 0.25;            // multiplier at / past far range (snipe chip)
 const STRESS_PER_SHELL = 55;           // side hit; scaled by shellDamage (rear hits harder)
 const HIT_KICK_RETURN = 2;             // s, camera shove when a shell hits you
 const MG_FLYBY_MAX = 9;               // m miss distance that still whooshes
 const MG_TRACER_SPEED = 220 * 0.75;    // keep in sync with fx.js tracer travel
+// Match tank.js hull (offset 1.25, half-h 0.7) and turret (offset 2.4, half-h 0.45).
+const HULL_BOTTOM_Y = 1.25 - 0.7;      // wet: hull in the water → drown timer
+const TANK_TOP_Y = 2.4 + 0.45;         // fully under: instant kill
+const DROWN_TIME = 30;                 // s with hull in water before an enemy dies
 
 const _hitP = new THREE.Vector3();
 const _hitQ = new THREE.Quaternion();
@@ -24,15 +34,29 @@ const _flybyEar = new THREE.Vector3();
 const _flybyTo = new THREE.Vector3();
 const _flybyClosest = new THREE.Vector3();
 
-/** Front plate takes 25% less, a hit in the engine 25% more. Side and turret stay at 1. */
-function shellDamage(victim, point) {
-  if (!point) return 1;
-  const t = victim.body.translation();
-  _hitQ.copy(victim.body.rotation()).invert();
-  _hitP.set(point.x - t.x, point.y - t.y, point.z - t.z).applyQuaternion(_hitQ);
-  if (_hitP.x <= HULL_REAR_X) return REAR_DMG;
-  if (_hitP.x >= HULL_FRONT_X) return FRONT_DMG;
-  return 1;
+/** 1 at close range → SHELL_FAR_DMG at map distance. Squared so mid-long shots drop fast. */
+function shellRangeMul(owner, point) {
+  if (!owner || !point) return 1;
+  const o = owner.translation();
+  const d = Math.hypot(point.x - o.x, point.y - o.y, point.z - o.z);
+  if (d <= SHELL_FULL_RANGE) return 1;
+  if (d >= SHELL_FAR_RANGE) return SHELL_FAR_DMG;
+  const t = (d - SHELL_FULL_RANGE) / (SHELL_FAR_RANGE - SHELL_FULL_RANGE);
+  return 1 + (SHELL_FAR_DMG - 1) * (t * t);
+}
+
+/** Front plate takes 25% less, a hit in the engine 25% more. Side and turret stay at 1.
+ *  Then scaled by firer→impact range so long snipes chip instead of chunking a full HP. */
+function shellDamage(victim, point, owner) {
+  let face = 1;
+  if (point) {
+    const t = victim.body.translation();
+    _hitQ.copy(victim.body.rotation()).invert();
+    _hitP.set(point.x - t.x, point.y - t.y, point.z - t.z).applyQuaternion(_hitQ);
+    if (_hitP.x <= HULL_REAR_X) face = REAR_DMG;
+    else if (_hitP.x >= HULL_FRONT_X) face = FRONT_DMG;
+  }
+  return face * shellRangeMul(owner, point);
 }
 
 /**
@@ -41,7 +65,7 @@ function shellDamage(victim, point) {
  */
 export function createMatch({
   tank, foes, nav, fx, hud, sfx, tankCam, input,
-  vegetation, airfield, port, waterTower, barrels, trucks, patrolBoat, spawn,
+  vegetation, airfield, port, waterTower, barrels, woodenCrates, trucks, patrolBoat, spawn,
   smoke = null,
   onRestart = () => {},
 }) {
@@ -51,6 +75,7 @@ export function createMatch({
     debug: false,
     overT: 0,          // > 0 while a wreck burns before the auto-restart
     wreck: null,       // the destroyed tank that ended the round
+    startBannerT: 0,   // > 0 while waiting to show the round-start callout
   };
   const combatants = [tank, ...foes.map((f) => f.tank)];
 
@@ -81,7 +106,7 @@ export function createMatch({
   }
 
   function pushHealth() {
-    hud.setHealth(tank.hp / tank.maxHp, foes.map((f) => f.tank.hp / f.tank.maxHp));
+    hud.setHealth(tank.hp / tank.maxHp);
   }
 
   function endRound(playerDead, victim = null) {
@@ -101,6 +126,7 @@ export function createMatch({
     fx.clearShells();
     smoke?.clear();
     barrels.reset();
+    woodenCrates?.reset();
     waterTower.reset();
     trucks.reset(fx);
     patrolBoat?.reset(fx);
@@ -109,7 +135,7 @@ export function createMatch({
     nav.setObstacles([   // palm slider may have changed
       ...vegetation.navObstacles(), ...airfield.navObstacles(),
       ...port.navObstacles(), ...waterTower.navObstacles(),
-      ...trucks.navObstacles(),
+      ...trucks.navObstacles(), ...(woodenCrates?.navObstacles() ?? []),
     ]);
     for (const f of foes) {
       f.tank.setActive(!game.solo);
@@ -120,10 +146,10 @@ export function createMatch({
     }
     game.overT = 0;
     game.wreck = null;
+    game.startBannerT = START_DELAY;
     hud.banner(null);
     hud.clearHits();
-    hud.showEnemy(!game.solo);
-    hud.setHealth(1, foes.map(() => 1));
+    hud.setHealth(1);
     hud.setNitro(1, false);
     onRestart({ resetCam });
   }
@@ -170,6 +196,7 @@ export function createMatch({
   function wireFx() {
     fx.onImpact = (p) => {
       barrels.blastAt(p);
+      woodenCrates?.blastAt(p);
       const d = p.distanceTo(tank.model.position);
       if (d < 40) {
         input.rumble(0.6 * (1 - d / 40), 0.3, 160);
@@ -210,6 +237,7 @@ export function createMatch({
     fx.onShellHit = ({ collider, owner, point, dir, naval }) => {
       const body = collider?.parent();
       if (!body || game.overT > 0) return;
+      if (woodenCrates?.shellHit(body)) return;
       if (airfield.shellHit?.(body, dir, point, collider)) return;
       if (waterTower.shellHit(body, dir)) return;
       if (trucks.shellHit(body, dir)) return;
@@ -230,14 +258,15 @@ export function createMatch({
       const ownerFoe = foeOf(owner);
       const victimFoe = victim === tank ? null : foeOf(victim.body);
       if (!naval && ownerFoe && victimFoe) return;
-      const dmg = naval ? victim.hp : shellDamage(victim, point);
+      const dmg = naval ? victim.hp : shellDamage(victim, point, owner);
       victim.hp = Math.max(0, victim.hp - dmg);
       // Main-gun only — MG path never calls addStress. Rear hits spike harder.
       if (victim.alive) victim.addStress(STRESS_PER_SHELL * dmg);
-      // Clank at the impact — audible ~140 m, squared falloff (no distant floor)
+      // Clank at the impact — audible ~140 m, squared falloff (no distant floor).
+      // Enemy hits ~10% lower pitch so they read distinct from your own.
       {
         const d = (point ?? victim.model.position).distanceTo(tank.model.position);
-        sfx.hit(distGain(d, 140));
+        sfx.hit(distGain(d, 140), victim === tank ? 1 : 0.95);
       }
       if (victim === tank) {
         hud.flash();
@@ -260,6 +289,7 @@ export function createMatch({
       const body = collider?.parent();
       if (!body || game.overT > 0) return;
       if (vegetation.mgHit?.(body, dir, point)) return;
+      if (woodenCrates?.mgHit(body)) return;
       if (patrolBoat?.isBody(body) && body !== owner) {
         const sunk = air ? patrolBoat.airHit(body) : false;
         if (!air) patrolBoat.flashHit(body);
@@ -309,6 +339,37 @@ export function createMatch({
   }
 
   function tick(dt) {
+    if (game.startBannerT > 0) {
+      game.startBannerT -= dt;
+      if (game.startBannerT <= 0) {
+        game.startBannerT = 0;
+        if (game.overT <= 0) hud.banner('Eliminate all invaders', '', 'win', START_HOLD);
+      }
+    }
+    if (game.overT <= 0 && !game.solo) {
+      for (const f of foes) {
+        const victim = f.tank;
+        if (!victim.alive) {
+          f.drownT = 0;
+          continue;
+        }
+        const p = victim.body.translation();
+        // Fully under the surface → die now. Hull just wet → 30 s grace.
+        const fullyUnder = p.y + TANK_TOP_Y < WATER_Y;
+        const wet = p.y + HULL_BOTTOM_Y < WATER_Y;
+        if (!wet) {
+          f.drownT = 0;
+          continue;
+        }
+        f.drownT = (f.drownT || 0) + dt;
+        if (!fullyUnder && f.drownT < DROWN_TIME) continue;
+        victim.hp = 0;
+        pushHealth();
+        onTankDestroyed(victim);
+        f.drownT = 0;
+        if (game.overT > 0) break;
+      }
+    }
     if (game.overT <= 0) return;
     game.overT -= dt;
     if (game.overT <= 0) restart({ resetCam: false });
@@ -329,5 +390,14 @@ export function createMatch({
     return true;
   }
 
-  return { game, restart, tick, setSolo, wireFx, healFull };
+  /** Repair pickup: refill gadget charges. No-op if dead, round over, or already full. */
+  function grantRepair(victim) {
+    if (!victim?.alive || game.overT > 0) return false;
+    if (victim.repairs >= REPAIR_CHARGES) return false;
+    victim.repairs = REPAIR_CHARGES;
+    if (victim === tank) sfx.repairComplete();
+    return true;
+  }
+
+  return { game, restart, tick, setSolo, wireFx, healFull, grantRepair };
 }

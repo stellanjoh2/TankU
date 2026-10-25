@@ -20,6 +20,7 @@
 // + C-47 supply pass (Sounds/515293__breviceps__propeller-plane.wav, +5 dB).
 // + ship horn (Sounds/371535__robinhood76__06934-distant-ship-horn.wav).
 // + weapon switch (Sounds/414439__inspectorj__light-pulley-switch-on-b.wav).
+// + ocean ambience (Sounds/534911__lucas_schacht__ocean-waves-02.wav → 2.8s equal-power crossfade loop).
 const SHOT_URLS = [
   './sounds/tank_shot_1.wav',
   './sounds/tank_shot_2.wav',
@@ -70,6 +71,10 @@ const FIRE_URL = './sounds/fire_loop.wav';
 const FIRE_VOL = 0.62; // sample already +2 dB vs source
 /** Burn loop is silent past this. Squared falloff, same as other world sounds. */
 export const FIRE_HEAR = 70;
+const OCEAN_URL = './sounds/ocean_waves_loop.wav';
+const OCEAN_VOL = 0.48;
+/** Inland metres from the waterline where waves go silent. Full gain at/over water. */
+export const OCEAN_HEAR = 45;
 const MUSIC_VOL_DEFAULT = 0.35; // ~25% above prior 0.28
 // Base rate (+20% vs sample); L/R offset ~1.5 semitones each way
 const TURRET_BASE = 1.2;
@@ -137,6 +142,7 @@ export class Sfx {
     this.nitroBuf = null;
     this.reloadBuf = null;
     this.fireBuf = null;
+    this.oceanBuf = null;
     this.p51PassBuf = null;
     this.p51MgBuf = null;
     this.p51OrbitBuf = null;
@@ -176,6 +182,10 @@ export class Sfx {
     this._fireGain = null;
     this._fireVol = 0;
     this._fireWant = false;
+    this._ocean = null;
+    this._oceanGain = null;
+    this._oceanVol = 0;
+    this._oceanWant = false;
     this._p51Mg = null;
     this._p51MgGain = null;
     this._p51MgVol = 0;
@@ -220,7 +230,7 @@ export class Sfx {
       const res = await fetch(url);
       return this.ctx.decodeAudioData(await res.arrayBuffer());
     };
-    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, p51Pass, p51Mg, p51Orbit, c47, dirtThump, mgBass, smokeBomb, flyby, repair, repairDone, fanfare, shipHorn, weaponSwitch] = await Promise.all([
+    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, ocean, p51Pass, p51Mg, p51Orbit, c47, dirtThump, mgBass, smokeBomb, flyby, repair, repairDone, fanfare, shipHorn, weaponSwitch] = await Promise.all([
       Promise.all(SHOT_URLS.map(decode)),
       decode(ENGINE_URL),
       decode(MG50_URL),
@@ -231,6 +241,7 @@ export class Sfx {
       decode(NITRO_URL),
       decode(RELOAD_URL),
       decode(FIRE_URL),
+      decode(OCEAN_URL),
       decode(P51_PASS_URL),
       decode(P51_MG_URL),
       decode(P51_ORBIT_URL),
@@ -255,6 +266,7 @@ export class Sfx {
     this.nitroBuf = nitro;
     this.reloadBuf = reload;
     this.fireBuf = fire;
+    this.oceanBuf = ocean;
     this.p51PassBuf = p51Pass;
     this.p51MgBuf = p51Mg;
     this.p51OrbitBuf = p51Orbit;
@@ -408,8 +420,9 @@ export class Sfx {
   /**
    * Armor clang on a main-gun tank hit. `intensity` 0..1 scales volume
    * (pass distGain from the listener); light pitch variance so repeats don't stack.
+   * `rateScale` shifts pitch (e.g. 0.95 for enemy hits so they read slightly different).
    */
-  hit(intensity = 1) {
+  hit(intensity = 1, rateScale = 1) {
     if (!this.ready || !this.hitBuf) return;
     if (this._hitCool > 0) return;
     const t = Math.max(0, Math.min(1, intensity));
@@ -417,7 +430,7 @@ export class Sfx {
     this.unlock();
     const src = this.ctx.createBufferSource();
     src.buffer = this.hitBuf;
-    src.playbackRate.value = 0.96 + Math.random() * 0.08;
+    src.playbackRate.value = (0.96 + Math.random() * 0.08) * rateScale;
     const g = this.ctx.createGain();
     // No volume floor — distant hits must go silent (was 0.25 + t*0.75).
     g.gain.value = t * 0.9;
@@ -556,6 +569,7 @@ export class Sfx {
       this._mgWant = false;
       this._hmgDist = null;
       this._fireWant = false;
+      this._oceanWant = false;
       this._p51OrbitWant = 0;
       if (this.ctx.state === 'running') this.ctx.suspend().catch?.(() => {});
     } else if (this.ctx.state === 'suspended') {
@@ -606,6 +620,19 @@ export class Sfx {
     if (t > 0.02) {
       this.unlock();
       this._ensureFire();
+    }
+  }
+
+  /**
+   * Shore / sea ambience. `gain` is 0..1 (full at/over water, falloff inland).
+   * Call each frame.
+   */
+  setOcean(gain = 0) {
+    const t = Math.max(0, Math.min(1, Number(gain) || 0));
+    this._oceanWant = t;
+    if (t > 0.02) {
+      this.unlock();
+      this._ensureOcean();
     }
   }
 
@@ -871,6 +898,28 @@ export class Sfx {
     });
   }
 
+  _ensureOcean() {
+    if (!this.ready || !this.oceanBuf || this._ocean) return;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.oceanBuf;
+    src.loop = true;
+    const g = this.ctx.createGain();
+    g.gain.value = 0;
+    src.connect(g).connect(this.ctx.destination);
+    src.start();
+    this._ocean = src;
+    this._oceanGain = g;
+    this._track({
+      src, gain: g, vol: 0, rate: 1, target: 0, lambda: 2, targetRate: null, rateLambda: 5,
+      prep: (v) => {
+        const want = this._oceanWant || 0;
+        v.target = want * OCEAN_VOL;
+        // Slow ease — ocean shouldn't pump with every little move.
+        v.lambda = want > 0.02 ? 2.5 : 1.6;
+      },
+    });
+  }
+
   _ensureTurret() {
     if (!this.ready || !this.turretBuf || this._turret) return;
     const src = this.ctx.createBufferSource();
@@ -915,6 +964,7 @@ export class Sfx {
     this._ensureEngine();
     this._ensureMg();
     this._ensureFire();
+    this._ensureOcean();
     this._ensureP51Orbit();
     this._ensureTurret();
     for (const v of this._voices) stepVoice(v, dt);

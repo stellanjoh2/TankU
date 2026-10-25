@@ -31,17 +31,58 @@ canvas { display: block; }
 #reset-cam.pad-focus, #restart-game.pad-focus, #pause-resume.pad-focus {
   border-color: #ffd278; color: #ffd278;
 }
-.hidden { display: none !important; }
+.hidden, .chrome-off { display: none !important; }
 
+/* Screen-center aim. Cannon = hollow ring; .50 = +. Reload arc hugs the ring. */
 #crosshair {
-  position: fixed; left: 50%; top: 50%; z-index: 32; width: 6px; height: 6px; margin: -3px 0 0 -3px;
-  border-radius: 50%; background: rgba(255, 255, 255, 0.85); box-shadow: 0 0 4px #000; pointer-events: none;
+  position: fixed; left: 50%; top: 50%; z-index: 32;
+  width: 0; height: 0; pointer-events: none;
 }
+#crosshair .reticle { position: absolute; left: 0; top: 0; }
+#crosshair .reticle-cannon,
+#crosshair .reticle-mg { display: none; }
+#crosshair[data-gun="cannon"] .reticle-cannon,
+#crosshair[data-gun="mg"] .reticle-mg { display: block; }
+
+/* One SVG: aim + reload share cx/cy. Rotate so the arc fills from 12 o'clock. */
+#crosshair .reticle-cannon {
+  width: 36px; height: 36px; margin: -18px 0 0 -18px;
+  transform: rotate(-90deg);
+  overflow: visible;
+  filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.75));
+}
+#crosshair .reticle-cannon .aim-ring {
+  fill: none; stroke: rgba(255, 255, 255, 0.88); stroke-width: 5.6;
+}
+#crosshair .reload-track {
+  fill: none; stroke: rgba(0, 0, 0, 0.4); stroke-width: 6;
+}
+#crosshair .reload-arc {
+  fill: none; stroke: rgba(255, 210, 120, 0.95); stroke-width: 6;
+  stroke-linecap: butt; stroke-dasharray: 0 1;
+}
+
+#crosshair .reticle-mg .arm {
+  position: absolute; background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 0 3px #000;
+}
+#crosshair .reticle-mg .arm.n,
+#crosshair .reticle-mg .arm.s { width: 2px; height: 9px; left: 0; margin-left: -1px; }
+#crosshair .reticle-mg .arm.n { top: 0; margin-top: -15px; }
+#crosshair .reticle-mg .arm.s { top: 0; margin-top: 6px; }
+#crosshair .reticle-mg .arm.e,
+#crosshair .reticle-mg .arm.w { height: 2px; width: 9px; top: 0; margin-top: -1px; }
+#crosshair .reticle-mg .arm.w { left: 0; margin-left: -15px; }
+#crosshair .reticle-mg .arm.e { left: 0; margin-left: 6px; }
+
+/* Barrel aim (main gun). Fades out when it sits on the center reticle. */
 #gun-marker {
-  position: fixed; left: 0; top: 0; width: 26px; height: 26px; margin: -13px 0 0 -13px;
+  position: fixed; left: 0; top: 0; z-index: 31; width: 26px; height: 26px; margin: -13px 0 0 -13px;
   border: 2px solid rgba(255, 210, 120, 0.9); border-radius: 50%; pointer-events: none;
   box-shadow: 0 0 4px rgba(0, 0, 0, 0.6);
+  opacity: 1; transition: opacity 0.08s linear;
 }
+#gun-marker.aligned { opacity: 0; }
 
 /* —— Health / round HUD —————————————————————————————————— */
 #hud {
@@ -54,11 +95,9 @@ canvas { display: block; }
 #hud .overheat,
 #hud .repair,
 #hud .hit,
-#hud .gadget,
 #hud .weapon,
 #hud .pickup { display: grid; grid-template-columns: 56px 160px 44px; align-items: center; gap: 8px; }
 #hud .repair { grid-template-columns: 120px 120px 48px; }
-#hud .gadget,
 #hud .weapon { grid-template-columns: 56px 1fr; }
 #hud .pickup { grid-template-columns: 96px 1fr; }
 #hud .hp span,
@@ -67,7 +106,6 @@ canvas { display: block; }
 #hud .overheat span,
 #hud .repair span,
 #hud .hit span,
-#hud .gadget span,
 #hud .weapon span,
 #hud .pickup span {
   font-family: "Bebas Neue", sans-serif; font-size: 16px; font-weight: 400;
@@ -80,21 +118,14 @@ canvas { display: block; }
 #hud .overheat b,
 #hud .repair b,
 #hud .hit b,
-#hud .gadget b,
 #hud .weapon b,
 #hud .pickup b { font-weight: 600; font-size: 12px; text-align: right; text-shadow: 0 1px 3px #000; }
-#hud .gadget span,
 #hud .weapon span,
 #hud .pickup span { color: #d8c898; opacity: 1; }
-#hud .gadget b,
 #hud .weapon b,
 #hud .pickup b { text-align: left; color: #ffd278; letter-spacing: 0.04em; }
 #hud .weapon b { font-size: 14px; letter-spacing: 0.12em; }
 #hud .weapon.mg b { color: #ffb060; }
-#hud .gadget.cooling b { color: #a09880; }
-#hud .gadget.repairing b {
-  color: #c8ff7a; font-size: 14px; letter-spacing: 0.14em;
-}
 #hud .repair span {
   color: #c8ff7a; opacity: 1; font-size: 20px; letter-spacing: 0.08em;
   animation: repair-blink 0.7s ease-in-out infinite;
@@ -120,8 +151,6 @@ canvas { display: block; }
 #hud .hp-bar i { display: block; height: 100%; width: 100%; background: #8fbf4a; transition: width 0.25s; }
 #hud .hp.hurt .hp-bar i { background: #e0a030; }
 #hud .hp.dead .hp-bar i { background: #c0392b; }
-#hud .hp.enemy .hp-bar { height: 7px; }
-#hud .hp.enemy .hp-bar i { background: #c9584a; }
 #hud .nitro-bar { height: 8px; border-color: rgba(80, 220, 230, 0.45); }
 #hud .nitro-bar i {
   display: block; height: 100%; width: 100%;
@@ -169,6 +198,23 @@ canvas { display: block; }
   transition: width 0.08s linear;
 }
 #hud .ai-debug { font-size: 11px; opacity: 0.75; text-shadow: 0 1px 3px #000; white-space: pre; }
+
+/* Hull fixed (up = body forward); rotating cupola + barrel = turret yaw */
+#hud #turret-compass {
+  width: 88px; height: 88px; margin-top: 4px;
+  filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.75));
+}
+#hud #turret-compass.hidden { display: none !important; }
+#hud #turret-compass svg { display: block; width: 100%; height: 100%; overflow: visible; }
+#hud #turret-compass .ring {
+  fill: rgba(0, 0, 0, 0.55); stroke: rgba(255, 210, 120, 0.7); stroke-width: 2.5;
+}
+#hud #turret-compass .hull { fill: rgba(232, 228, 216, 0.75); }
+#hud #turret-compass .tick { fill: #ffd278; }
+#hud #turret-compass .barrel { fill: #ffd278; }
+#hud #turret-compass .cupola {
+  fill: #ffd278; stroke: rgba(0, 0, 0, 0.45); stroke-width: 1.5;
+}
 
 #banner {
   position: fixed; left: 50%; top: 24%; transform: translateX(-50%); z-index: 30; pointer-events: none;
@@ -311,7 +357,7 @@ canvas { display: block; }
 }
 .radial-wheel {
   position: relative;
-  width: min(460px, 70vmin);
+  width: var(--radial-wheel, min(460px, 70vmin));
   aspect-ratio: 1;
   filter: drop-shadow(0 18px 40px rgba(0, 0, 0, 0.6));
   --icon: 9%;

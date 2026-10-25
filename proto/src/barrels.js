@@ -4,7 +4,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { heightAt } from './terrain.js';
 import { HANGAR_PROP_SPOT } from './airfield.js';
-import { pickLod } from './lod.js';
+import { lodDist, pickLod } from './lod.js';
 
 /** Game-side upscale of the real-size drums in barrels.glb (0.88 m → 1.1 m) so they read from the chase cam. */
 const SCALE = 1.25;
@@ -69,23 +69,24 @@ function lyingStack(kind, cx, cz, base, top = 0, yaw = 0) {
   return out;
 }
 
-// Port deck spans x ≈ 12.4 → 23.9, z ≈ −19.4 → 0.4 (hangar on its west edge, flag at 17.6, −16.5);
-// the yard south of it holds the water tower around (20.4, −26.2).
+// Hangar footprint ≈ x −4.5…15.5, z −17.5…−4.5; east wall meets the port deck.
+// Keep the wooden quay walkway and mid-deck clear for driving — cluster drums
+// against the hangar instead (flag at 17.6, −16.5; trucks further south at z ≈ −20.6).
 const LAYOUT = [
-  // Fuel dump at the north end of the quay
-  ...standGroup(['red'], 21.2, -1.6, 2, 2, 0.1),
-  { kind: 'red', x: 22.9, z: -0.8, yaw: 0.4, lie: true },
-  // Blue drums stacked on their sides beside the hangar
-  ...lyingStack('blue', 18.6, -5.8, 2, 1, Math.PI / 2),
-  // Mixed working stock by the walkway
-  ...standGroup(['yellow', 'red', 'yellow'], 22.8, -9.4, 3, 1, -0.3),
-  { kind: 'yellow', x: 21.4, z: -10.9, yaw: 1.1, lie: true },
-  // Old empties near the flag
-  { kind: 'old', x: 21.8, z: -17.8, yaw: 0.5 },
-  { kind: 'old', x: 20.4, z: -18.7, yaw: 2.3, lie: true },
-  // Yard, west of the water tower
-  ...standGroup(['red', 'yellow'], 17.6, -21.6, 2, 1, Math.PI / 2),
-  { kind: 'blue', x: 18.9, z: -20.3, yaw: 0.2, lie: true },
+  // Fuel dump against hangar NE / east wall
+  ...standGroup(['red'], 16.4, -15.2, 2, 2, 0.15),
+  { kind: 'red', x: 17.1, z: -13.8, yaw: 0.4, lie: true },
+  // Blue drums stacked on their sides along hangar east wall
+  ...lyingStack('blue', 16.6, -8.2, 2, 1, Math.PI / 2),
+  // Mixed working stock at hangar SE corner
+  ...standGroup(['yellow', 'red', 'yellow'], 16.8, -5.0, 3, 1, -0.2),
+  { kind: 'yellow', x: 15.6, z: -3.6, yaw: 1.1, lie: true },
+  // Old empties by the flag / hangar back corner (pulled west off the walkway)
+  { kind: 'old', x: 16.2, z: -16.8, yaw: 0.5 },
+  { kind: 'old', x: 15.4, z: -17.6, yaw: 2.3, lie: true },
+  // South of hangar, east of the trucks
+  ...standGroup(['red', 'yellow'], 12.2, -19.4, 2, 1, Math.PI / 2),
+  { kind: 'blue', x: 13.4, z: -18.2, yaw: 0.2, lie: true },
   // Replaces the old green placeholder by the hangar
   { kind: 'old', x: HANGAR_PROP_SPOT.x, z: HANGAR_PROP_SPOT.z, yaw: 0 },
 ];
@@ -213,7 +214,7 @@ export async function buildBarrels(scene, { RAPIER, world }) {
       for (const b of live) {
         const d = b.obj.position.distanceTo(camPos);
         const cull = CULL_DIST * lodScale + (b.lod === -1 ? -cullPad : cullPad);
-        setLod(b, d > cull ? -1 : pickLod(d, LOD_EDGES, lodScale, b.lod));
+        setLod(b, lodDist(d) > cull ? -1 : pickLod(d, LOD_EDGES, lodScale, b.lod));
       }
     },
 

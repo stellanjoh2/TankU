@@ -1,10 +1,10 @@
-// Battlefield 3/4-style tank smoke: ring of canisters → LOS cloud with a hit-rate penalty.
+// Battlefield 3/4-style tank smoke: ring of canisters → LOS break + hit-rate penalty.
 export const SMOKE_COOLDOWN = 10;   // s (dev); raise for shipping
 /** Cloud life — keep in sync with `smoke_bomb.ogg` (~7.16 s). */
 export const SMOKE_DURATION = 7.16;
-export const SMOKE_RADIUS = 14 * 0.75; // m (−25% vs first pass)
-export const SMOKE_MISS = 0.10;        // additive miss chance while in / near cloud
-const SMOKE_DENSITY = 1.25;            // +25% emission / opacity
+export const SMOKE_RADIUS = 14 * 0.75 * 1.25; // m (+25% vs prior pass)
+export const SMOKE_MISS = 0.35;               // additive miss while in / near cloud
+const SMOKE_DENSITY = 1.25 * 1.25;            // emission / opacity (+25% vs prior)
 
 /**
  * World smoke volumes + FX drive. Call `deploy` from a tank gadget / AI panic.
@@ -52,12 +52,17 @@ export function createSmokeField(fx) {
       return false;
     },
 
+    /** Either endpoint in a cloud → no clear sight (AI treat as LOS break). */
+    blocksSight(ax, az, bx, bz) {
+      return this.covers(ax, az) || this.covers(bx, bz);
+    },
+
     /**
      * Extra miss chance when either endpoint is in smoke
      * (shooter near cloud, or target / enemy in cloud).
      */
     missBonus(ax, az, bx, bz) {
-      if (this.covers(ax, az) || this.covers(bx, bz)) return SMOKE_MISS;
+      if (this.blocksSight(ax, az, bx, bz)) return SMOKE_MISS;
       return 0;
     },
   };

@@ -98,8 +98,8 @@ export function pickSpawn(nav, face = null, near = ENEMY_SPAWN, radius = 18) {
 }
 
 export class TankAI {
-  constructor({ tank, enemy, nav, world, RAPIER, coverRocks, anchor, patrolR }) {
-    Object.assign(this, { tank, enemy, nav, world, RAPIER, coverRocks });
+  constructor({ tank, enemy, nav, world, RAPIER, coverRocks, anchor, patrolR, smoke = null }) {
+    Object.assign(this, { tank, enemy, nav, world, RAPIER, coverRocks, smoke });
     this.anchor = anchor ?? ENEMY_SPAWN;
     this.patrolR = patrolR ?? PATROL_R;
     this.ray = new RAPIER.Ray({ x: 0, y: 0, z: 0 }, { x: 1, y: 0, z: 0 });
@@ -274,8 +274,9 @@ export class TankAI {
     const d = p.distanceTo(e);
     const was = this.visible;
     const inRange = this.enemy.alive && d < SIGHT_RANGE;
-    const hull = inRange && this._clear(p.x, p.y + EYE_H, p.z, e.x, e.y + HULL_H, e.z);
-    this.visible = hull || (inRange && this._clear(p.x, p.y + EYE_H, p.z, e.x, e.y + EYE_H, e.z));
+    const smokey = !!this.smoke?.blocksSight(p.x, p.z, e.x, e.z);
+    const hull = inRange && !smokey && this._clear(p.x, p.y + EYE_H, p.z, e.x, e.y + HULL_H, e.z);
+    this.visible = hull || (inRange && !smokey && this._clear(p.x, p.y + EYE_H, p.z, e.x, e.y + EYE_H, e.z));
     // hull-down target: only the turret shows, so that's what we shoot at
     this.aimH = hull ? HULL_H : TURRET_H;
     if (this.visible) {
@@ -313,6 +314,7 @@ export class TankAI {
   _seenFromKnown(x, z) {
     const k = this.known;
     if (Math.hypot(x - k.x, z - k.z) > SIGHT_RANGE) return false;
+    if (this.smoke?.blocksSight(k.x, k.z, x, z)) return false;
     return this._clear(k.x, k.eyeY, k.z, x, this.nav.sampleHeight(x, z) + SPOT_EYE_H, z);
   }
 
@@ -380,6 +382,7 @@ export class TankAI {
           const x = nav.xOf(idx);
           const z = nav.zOf(idx);
           const seen = Math.hypot(x - known.x, z - known.z) < SIGHT_RANGE
+            && !this.smoke?.blocksSight(known.x, known.z, x, z)
             && this._clear(known.x, known.eyeY, known.z, x, nav.height[idx] + SPOT_EYE_H, z);
           this.exposure[idx] = seen ? 1 : 0;
           rays++;

@@ -2,11 +2,13 @@
 // slices, icon positions, and hit areas rebuild. Angles use screen space
 // (y grows downward): 0 is east, the first slice is centered on 12 o'clock.
 
-const SIZE = 400;
-const CX = 200;
-const CY = 200;
-const R_OUT = 172;
-const R_IN = 86;
+export const SIZE = 400;
+export const R_OUT = 172;
+export const R_IN = 86;
+/** CSS length for `.radial-wheel` width. */
+export const WHEEL_CSS = 'min(460px, 70vmin)';
+const CX = SIZE / 2;
+const CY = SIZE / 2;
 const TAU = Math.PI * 2;
 const BLINK = 0.22;
 
@@ -62,6 +64,8 @@ function normalize(item) {
 export function createRadialMenu(list, opts = {}) {
   const onSelect = opts.onSelect || (() => {});
   let items = (list || []).map(normalize);
+
+  document.documentElement.style.setProperty('--radial-wheel', WHEEL_CSS);
 
   const root = document.createElement('div');
   root.id = 'radial';
@@ -283,7 +287,11 @@ export function createRadialMenu(list, opts = {}) {
       }
       if (changed && isOpen) paint();
     },
-    /** Stick, −1..1, y-down. Absolute, so a held direction stays on that slice. */
+    /**
+     * Stick, −1..1, y-down. Absolute, so a held direction stays on that slice.
+     * Recenter keeps the last slice — the stick often snaps back a frame before
+     * the hold button comes up on a quick flick, and clearing would cancel it.
+     */
     pointAt(x, y) {
       if (!isOpen || blinking) return;
       const mag = Math.hypot(x, y);
@@ -293,8 +301,8 @@ export function createRadialMenu(list, opts = {}) {
       } else {
         cx = (x / mag) * reach;
         cy = (y / mag) * reach;
+        hover = sliceAt(cx, cy, items.length, R_IN);
       }
-      hover = sliceAt(cx, cy, items.length, R_IN);
       placeCursor();
       paint();
     },

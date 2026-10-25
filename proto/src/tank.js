@@ -1,7 +1,7 @@
 // Sherman: rigid body + raycast "track contacts" (spring/damper + skid-steer traction), the visual rig
 // driven from the GLB's extras (see scripts/sherman_rig.py), turret/gun aiming and firing.
 import * as THREE from 'three';
-import { float, materialEmissive, mix, positionWorld, smoothstep, uniform, vec3 } from 'three/tsl';
+import { float, materialEmissive, mix, positionWorld, smoothstep, uniform } from 'three/tsl';
 import { applyBurntMetal } from './burntMetal.js';
 import { createEngineHeatHaze } from './heatHaze.js';
 import {
@@ -727,17 +727,19 @@ export class Tank {
     this._updateRepairSweep(dt);
   }
 
-  /** Green band along the hull (local +X, rear → front). Installed before the wreck mesh exists. */
+  /** Sweep band along the hull (local +X, rear → front). Installed before the wreck mesh exists. */
   _installRepairGlow() {
     const origin = uniform(new THREE.Vector3());
     const forward = uniform(new THREE.Vector3(1, 0, 0));
     const t = uniform(0);
     const amp = uniform(0);
-    this._repairU = { origin, forward, t, amp };
+    // Default green (health). Repair channel sets shield violet before starting the sweep.
+    const color = uniform(new THREE.Color().setRGB(0.22, 2.4, 0.4));
+    this._repairU = { origin, forward, t, amp, color };
     const along = positionWorld.sub(origin).dot(forward);
     const center = mix(float(-4.2), float(4.6), t);
     const band = smoothstep(float(1.5), float(0.08), along.sub(center).abs());
-    const glow = vec3(0.22, 2.4, 0.4).mul(band).mul(amp);
+    const glow = color.mul(band).mul(amp);
     const seen = new Set();
     this.model.traverse((o) => {
       if (!o.isMesh) return;
@@ -755,9 +757,11 @@ export class Tank {
   _tickRepair(dt) { tickRepair(this, dt); }
   _updateRepairSweep(dt) { updateRepairSweep(this, dt); }
 
-  /** Green hull band, same sweep as a finished repair. */
+  /** Green hull band — health pickup. */
   showHeal() {
-    if (this._repairU) this._sweep = 0;
+    if (!this._repairU) return;
+    this._repairU.color.value.setRGB(0.22, 2.4, 0.4);
+    this._sweep = 0;
   }
 
   /** Brake lights, hit flash, repair sweep, or a hot .50 barrel. */

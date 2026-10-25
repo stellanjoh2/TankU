@@ -1,8 +1,8 @@
 // Supply drops. On a timer, a C-47 flies one straight pass and releases a
 // wooden crate under a parachute. It lands, the walls fall flat and fade, and
 // the pickup stays floating until you drive into it.
-// Each crate carries LOADOUT — a list, so later powerups sit beside the heart.
-// The heart fills the player's HP. tryPickup (wired in main) applies it.
+// Each crate is a coin-flip: health (green heart) or repair (purple wrench).
+// tryPickup (wired in main) applies the kind.
 import * as THREE from 'three';
 import {
   heightAt, shoreSigned, onBridge, WATER_Y,
@@ -12,7 +12,7 @@ import { HANGAR } from './airfield.js';
 import { WATER_TOWER } from './watertower.js';
 
 const DROP_EVERY = 2 * 60; // dev cadence; ship timing is 5 min
-const FIRST_DROP = 8;         // earliest the first pass starts; release waits out the inbound
+const FIRST_PASS = 30;        // earliest the first C-47 / "Pickup Incoming" starts
 const MAX_LIVE = 2;
 const DESCEND = 4;             // m/s under the chute
 const CHUTE_DELAY = 0.3;      // let the C-47 clear before the canopy blooms
@@ -30,8 +30,6 @@ const WALL_TIME = 0.7;         // walls flop out flat
 const FADE_TIME = 0.85;        // then the shell disappears
 const EMPTY_LINGER = 12;
 const CLEAR = 5.4;             // don't set the collider down inside a hull
-/** What every crate carries, in order. Add a kind here and a mesh in buildPickup. */
-const LOADOUT = ['health'];
 
 const _q = new THREE.Quaternion();
 const _fwd = new THREE.Vector3();
@@ -47,12 +45,19 @@ const canopyMat = new THREE.MeshStandardMaterial({
 });
 const cordMat = new THREE.MeshStandardMaterial({ color: 0x2a221c, roughness: 1 });
 const markMat = new THREE.MeshBasicMaterial({ color: 0xe36a1e, side: THREE.DoubleSide });
-/** Same HDR green as the repair-finished hull sweep in tank.js. */
-const REPAIR_GLOW = new THREE.Color().setRGB(0.22, 2.4, 0.4);
+/** HDR greens / shield-violets — keep in sync with tank.js hull sweeps. */
+const HEALTH_GLOW = new THREE.Color().setRGB(0.22, 2.4, 0.4);
+const SHIELD_GLOW = new THREE.Color().setRGB(0.95, 0.42, 2.55);
 const heartTemplate = new THREE.MeshStandardMaterial({
   color: 0x0d3f1c, roughness: 0.38, metalness: 0.08,
-  emissive: REPAIR_GLOW, emissiveIntensity: 1,
+  emissive: HEALTH_GLOW, emissiveIntensity: 1,
 });
+const wrenchTemplate = new THREE.MeshStandardMaterial({
+  color: 0x1a0a3d, roughness: 0.38, metalness: 0.08,
+  emissive: SHIELD_GLOW, emissiveIntensity: 1,
+});
+/** Shared ExtrudeGeometry from wrench_pickup.glb (Phosphor wrench, upright in XY). */
+let wrenchGeo = null;
 
 const postGeo = new THREE.BoxGeometry(POST, H, POST);
 const PANEL_H = H - 0.02;
@@ -156,16 +161,19 @@ function cordBetween(a, b) {
 const PICKUP_BOXED = 0.36 * 1.2 * 0.8;
 const PICKUP_SCALE = PICKUP_BOXED * 1.3 * 1.2;
 
-function slotX(i, n) {
-  if (n <= 1) return 0;
-  const span = Math.min(0.8, 0.4 * (n - 1));
-  return -span / 2 + (span * i) / (n - 1);
-}
-
 function buildPickup(kind) {
-  if (kind !== 'health') throw new Error(`[crates] no mesh for pickup "${kind}"`);
-  const mat = heartTemplate.clone();
-  const mesh = new THREE.Mesh(heartGeo, mat);
+  let mat;
+  let mesh;
+  if (kind === 'health') {
+    mat = heartTemplate.clone();
+    mesh = new THREE.Mesh(heartGeo, mat);
+  } else if (kind === 'repair') {
+    if (!wrenchGeo) throw new Error('[crates] wrench geometry not loaded');
+    mat = wrenchTemplate.clone();
+    mesh = new THREE.Mesh(wrenchGeo, mat);
+  } else {
+    throw new Error(`[crates] no mesh for pickup "${kind}"`);
+  }
   mesh.scale.setScalar(PICKUP_BOXED);
   mesh.castShadow = true;
   return { kind, mesh, mat, base: PICKUP_SCALE, phase: Math.random() * Math.PI * 2, takeT: -1, dead: false };
@@ -245,15 +253,12 @@ function buildVisual() {
   }
   root.add(chute);
 
-  const n = LOADOUT.length;
-  const items = LOADOUT.map((kind, i) => {
-    const item = buildPickup(kind);
-    item.mesh.position.set(slotX(i, n), REST_Y, 0);
-    root.add(item.mesh);
-    return item;
-  });
+  const kind = Math.random() < 0.5 ? 'health' : 'repair';
+  const item = buildPickup(kind);
+  item.mesh.position.set(0, REST_Y, 0);
+  root.add(item.mesh);
 
-  return { root, walls, lid, shell, shellMats, chute, items };
+  return { root, walls, lid, shell, shellMats, chute, items: [item] };
 }
 
 /**
@@ -262,18 +267,18 @@ function buildVisual() {
  * @param {() => object[]} deps.getTanks
  * @param {(kind: string) => boolean} deps.tryPickup  true if the pickup was consumed
  * @param {() => void} [deps.onIncoming]  the C-47 has started its pass
+ * @param {THREE.BufferGeometry} deps.wrenchGeo  extruded Phosphor wrench (shared)
  * @param {{ update: (dt: number) => void, beginPass: Function, inbound: number, untilRelease: () => number | null }} deps.transport
  */
-export function createCrates({ scene, RAPIER, world, fx, getPlayer, getTanks, tryPickup, onIncoming = () => {}, transport }) {
+export function createCrates({ scene, RAPIER, world, fx, getPlayer, getTanks, tryPickup, onIncoming = () => {}, transport, wrenchGeo: geo }) {
+  wrenchGeo = geo;
   const root = new THREE.Group();
   root.name = 'SupplyCrates';
   scene.add(root);
 
   const live = [];
-  // First release stays at FIRST_DROP; the pass starts one inbound earlier.
   function openingTimer() {
-    const lead = Math.min(transport.inbound, FIRST_DROP - 0.5);
-    return DROP_EVERY - (FIRST_DROP - lead);
+    return DROP_EVERY - FIRST_PASS;
   }
   let timer = openingTimer();
 

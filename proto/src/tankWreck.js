@@ -1,5 +1,6 @@
 // Kill-shot swap: freeze the hull, show the destroyed mesh, and pop the turret as a rigid body.
 import * as THREE from 'three';
+import { applyWreckMeshFade } from './fx.js';
 
 const WRECK_TURRET_LOCAL = new THREE.Vector3(-0.16, 2.35, 0);
 const WRECK_TURRET_HALF = { x: 0.9, y: 0.42, z: 0.72 };
@@ -15,12 +16,17 @@ export function obliterateTank(tank) {
   tank.model.quaternion.copy(tank.body.rotation());
   tank.model.updateMatrixWorld(true);
   for (const c of tank.intactRoots) c.visible = false;
-  if (tank.wreck) tank.wreck.visible = true;
+  if (tank.wreck) {
+    applyWreckMeshFade(tank.wreck, 1);
+    tank.wreck.visible = true;
+  }
   tank.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
   tank.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
   tank.body.setBodyType(tank.RAPIER.RigidBodyType.Fixed, true);
   tank.turretCollider?.setEnabled(false);
   tank.wrecked = true;
+  tank.wreckGone = false;
+  tank.wreckBurn = 0;
   spawnWreckTurret(tank);
 }
 
@@ -28,10 +34,16 @@ export function restoreTankWreck(tank) {
   if (!tank.wrecked) return;
   clearWreckTurret(tank);
   for (const c of tank.intactRoots) c.visible = true;
-  if (tank.wreck) tank.wreck.visible = false;
+  if (tank.wreck) {
+    applyWreckMeshFade(tank.wreck, 1);
+    tank.wreck.visible = false;
+  }
   tank.turretCollider?.setEnabled(true);
   tank.body.setBodyType(tank.RAPIER.RigidBodyType.Dynamic, true);
+  if (!tank.body.isEnabled()) tank.body.setEnabled(true);
   tank.wrecked = false;
+  tank.wreckGone = false;
+  tank.wreckBurn = 0;
 }
 
 export function spawnWreckTurret(tank) {

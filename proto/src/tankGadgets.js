@@ -112,6 +112,8 @@ export function tickRepair(tank, dt) {
   if (tank.repairT > 0) return;
   tank.hp = Math.min(tank.maxHp, tank.hp + tank.maxHp * REPAIR_HEAL);
   tank.repairDone = true;
+  // Shield-violet band (health pickup keeps the green via showHeal).
+  if (tank._repairU) tank._repairU.color.value.setRGB(0.95, 0.42, 2.55);
   tank._sweep = 0;
 }
 

@@ -2,7 +2,7 @@
 // Standard mapping (Chrome / Edge / Safari: Xbox, DualSense, Switch Pro):
 //   LS drive · RS aim
 //   R2/RT fires the selected gun · Triangle/Y switches gun
-//   R1/RB hold: gadget wheel (RS picks; stick centered = no pick, release exits)
+//   R1/RB hold: gadget wheel (RS picks; last slice latches if stick recenters; never aimed = cancel)
 //   LT focus · LB nitro
 //   A unflip (freefly up) · B freefly down
 //   D-pad up/right/down/left = smoke / air / repair / ship

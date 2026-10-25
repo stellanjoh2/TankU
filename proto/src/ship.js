@@ -8,6 +8,14 @@ const SCALE = 10;
 // Local Y of the dark hull stripe (top of red BOTTOM / waterline paint).
 const WATERLINE_Y = 0.16;
 
+// Slow swell — barely there at shore distance, reads as mass rather than bobbing.
+const ROLL_AMP = 0.01;    // ~0.6°
+const PITCH_AMP = 0.006;  // ~0.35°
+const BOB_AMP = 0.05;     // 5 cm
+const ROLL_W = 0.42;
+const PITCH_W = 0.55;
+const BOB_W = 0.48;
+
 // Length is along model +X; ±π/2 lays the keel north–south (side faces land).
 const PLACEMENTS = [
   {
@@ -51,7 +59,7 @@ function prepMaterials(root) {
 }
 
 /**
- * @returns {Promise<{ root: THREE.Group, ships: object[], wakeTurrets: () => void }>}
+ * @returns {Promise<{ root: THREE.Group, ships: object[], wakeTurrets: () => void, update: (t: number) => void }>}
  */
 export async function buildShip(scene) {
   const gltf = await new GLTFLoader().loadAsync('./models/ship.glb');
@@ -68,11 +76,16 @@ export async function buildShip(scene) {
     const ship = i === 0 ? proto : proto.clone(true);
     ship.name = i === 0 ? 'ShipEast' : 'ShipWest';
     ship.scale.setScalar(SCALE);
+    ship.rotation.order = 'YXZ';
     ship.rotation.y = p.yaw;
     ship.position.set(p.x, y, p.z);
     root.add(ship);
     ships.push({
       name: ship.name,
+      mesh: ship,
+      baseY: y,
+      baseYaw: p.yaw,
+      phase: i * 2.7 + 0.8,
       x: p.x,
       z: p.z,
       turrets: collectTurrets(ship),
@@ -81,9 +94,10 @@ export async function buildShip(scene) {
 
   scene.add(root);
 
-  /** Turrets are scenery until a barrage. Call after freezeStatic so they can yaw. */
+  /** Hull sway + turrets need live matrices. Call after freezeStatic. */
   function wakeTurrets() {
     for (const s of ships) {
+      s.mesh.matrixAutoUpdate = true;
       for (const t of s.turrets) {
         t.pivot.matrixAutoUpdate = true;
         for (const m of t.muzzles) m.matrixAutoUpdate = true;
@@ -91,7 +105,17 @@ export async function buildShip(scene) {
     }
   }
 
-  return { root, ships, wakeTurrets };
+  function update(t) {
+    for (const s of ships) {
+      const ph = s.phase;
+      s.mesh.rotation.y = s.baseYaw;
+      s.mesh.rotation.x = Math.sin(t * PITCH_W + ph) * PITCH_AMP;
+      s.mesh.rotation.z = Math.sin(t * ROLL_W + ph * 1.7) * ROLL_AMP;
+      s.mesh.position.y = s.baseY + Math.sin(t * BOB_W + ph * 0.9) * BOB_AMP;
+    }
+  }
+
+  return { root, ships, wakeTurrets, update };
 }
 
 /** Main-battery twins. Local +X is the bore; sign is which way the barrels point at rest.

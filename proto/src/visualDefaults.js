@@ -12,7 +12,7 @@ export const VISUAL_DEFAULTS = {
   cloudCoverage: 0.4,
   cloudDensity: 0.04,
   cloudElevation: 0.79,
-  showSunDisc: true,
+  showSunDisc: false,
   toneExposure: 0.85,
   sunIntensity: 8,
   sunColor: '#ffe2b3',

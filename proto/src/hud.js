@@ -1,11 +1,4 @@
-// Health bars (bottom-left), hit-rate (stress + smoke), active gadget, round banner, hit flash.
-export const GADGETS = [
-  { id: 'smoke', key: '1', label: 'SMOKE' },
-  { id: 'air', key: '2', label: 'AIR SUPPORT' },
-  { id: 'repair', key: '3', label: 'REPAIR' },
-  { id: 'ship', key: '4', label: 'SHIP SUPPORT' },
-];
-
+// Health bars (bottom-left), hit-rate (stress + smoke), turret compass, round banner, hit flash.
 export function createHud() {
   const root = document.createElement('div');
   root.id = 'hud';
@@ -17,11 +10,20 @@ export function createHud() {
     <div class="weapon" data-who="weapon"><span>GUN</span><b>MAIN GUN</b></div>
     <div class="reload hidden" data-who="reload"><span>RELOAD</span><div class="reload-bar"><i></i></div><b>0.0s</b></div>
     <div class="overheat hidden" data-who="overheat"><span>HEAT</span><div class="overheat-bar"><i></i></div><b>0.0s</b></div>
-    <div class="gadget" data-who="gadget"><span>GADGET</span><b>1 SMOKE</b></div>
     <div class="pickup" data-who="pickup"><span>PICKUP IN</span><b>2:00</b></div>
-    <div class="hp enemy" data-who="enemy"><span>ENEMY</span><div class="hp-bar"><i></i></div><b>100%</b></div>
-    <div class="hp enemy" data-who="enemy2"><span>ENEMY 2</span><div class="hp-bar"><i></i></div><b>100%</b></div>
-    <div class="hit hidden" data-who="enemy-hit"><span>HIT</span><div class="hit-bar"><i></i></div><b>100%</b></div>
+    <div id="turret-compass" aria-hidden="true">
+      <svg viewBox="0 0 80 80">
+        <circle class="ring" cx="40" cy="40" r="36"/>
+        <g class="hull">
+          <path d="M40 12 L54 36 L47 36 L47 58 L33 58 L33 36 L26 36 Z"/>
+        </g>
+        <g class="turret">
+          <path class="barrel" d="M38 40 L38 14 L40 8 L42 14 L42 40 Z"/>
+          <circle class="cupola" cx="40" cy="40" r="9"/>
+        </g>
+        <circle class="tick" cx="40" cy="6" r="2.2"/>
+      </svg>
+    </div>
     <div class="ai-debug hidden"></div>`;
   const banner = document.createElement('div');
   banner.id = 'banner';
@@ -32,6 +34,8 @@ export function createHud() {
   flash.id = 'hit-flash';
   const dirRoot = document.createElement('div');
   dirRoot.id = 'hit-dirs';
+  const compass = root.querySelector('#turret-compass');
+  const turretNeedle = compass.querySelector('.turret');
   document.body.append(root, banner, flash, dirRoot);
 
   // Directional hit markers: a red arc around the screen centre, turned toward the shooter.
@@ -47,16 +51,13 @@ export function createHud() {
 
   const rows = {
     player: root.querySelector('[data-who="player"]'),
-    enemies: [...root.querySelectorAll('.hp.enemy')],
     nitro: root.querySelector('[data-who="nitro"]'),
     weapon: root.querySelector('[data-who="weapon"]'),
     reload: root.querySelector('[data-who="reload"]'),
     overheat: root.querySelector('[data-who="overheat"]'),
-    gadget: root.querySelector('[data-who="gadget"]'),
     pickup: root.querySelector('[data-who="pickup"]'),
     repair: root.querySelector('[data-who="repair"]'),
     playerHit: root.querySelector('[data-who="player-hit"]'),
-    enemyHit: root.querySelector('[data-who="enemy-hit"]'),
   };
   const debug = root.querySelector('.ai-debug');
 
@@ -80,21 +81,31 @@ export function createHud() {
   }
 
   return {
-    setHealth(player, enemy) {
+    /** Photomode / pause: hide bars, compass, banners, and hit markers. */
+    setVisible(on) {
+      root.classList.toggle('hidden', !on);
+      banner.classList.toggle('chrome-off', !on);
+      flash.classList.toggle('chrome-off', !on);
+      dirRoot.classList.toggle('chrome-off', !on);
+    },
+    setHealth(player) {
       setBar(rows.player, player);
-      const list = Array.isArray(enemy) ? enemy : (enemy == null ? [] : [enemy]);
-      rows.enemies.forEach((row, i) => {
-        if (i < list.length) setBar(row, list[i]);
-      });
     },
     /**
      * Effective direct-hit rate 0..1 (1 − stress miss − smoke miss).
      * Hidden while at 100% so the meter only appears when aim is degraded.
-     * `*Smoke` tints the meter grey when the smoke penalty is active.
+     * `inSmoke` tints the meter grey when the smoke penalty is active.
      */
-    setHitRate(player, enemy, playerSmoke = false, enemySmoke = false) {
+    setHitRate(player, _enemy, playerSmoke = false) {
       setHitRow(rows.playerHit, player, playerSmoke);
-      setHitRow(rows.enemyHit, enemy ?? 1, enemySmoke);
+    },
+    /** Turret yaw relative to hull (rad). Hull stays fixed; needle rotates. */
+    setTurretYaw(yaw, visible = true) {
+      compass.classList.toggle('hidden', !visible);
+      if (!visible) return;
+      // Three +Y is CCW from above; SVG +rotate is CW — negate so left stays left.
+      const deg = (-yaw * 180) / Math.PI;
+      turretNeedle.setAttribute('transform', `rotate(${deg} 40 40)`);
     },
     /**
      * Roof-gun heat 0..1. Hidden when cold.
@@ -146,26 +157,6 @@ export function createHud() {
       const r = s % 60;
       rows.pickup.querySelector('b').textContent = `${m}:${String(r).padStart(2, '0')}`;
     },
-    /**
-     * Active gadget slot (1 smoke / 2 air / 3 repair / 4 ship).
-     * Repair shows charges left, or REPAIRING plus the channel timer.
-     * @param {'smoke'|'air'|'repair'|'ship'} id
-     * @param {number} [cd=0]
-     * @param {{ repairing?: boolean, repairLeft?: number, charges?: number }|null} [info]
-     */
-    setGadget(id, cd = 0, info = null) {
-      const g = GADGETS.find((x) => x.id === id) || GADGETS[0];
-      const repairing = id === 'repair' && !!info?.repairing;
-      const empty = id === 'repair' && !repairing && (info?.charges ?? 0) <= 0;
-      const cooling = !repairing && (cd > 0.05 || empty);
-      let text;
-      if (repairing) text = `REPAIRING  ${info.repairLeft.toFixed(1)}s`;
-      else if (id === 'repair') text = `${g.key} ${g.label}  ×${info?.charges ?? 0}`;
-      else text = cooling ? `${g.key} ${g.label}  ${cd.toFixed(1)}s` : `${g.key} ${g.label}`;
-      rows.gadget.querySelector('b').textContent = text;
-      rows.gadget.classList.toggle('cooling', cooling);
-      rows.gadget.classList.toggle('repairing', repairing);
-    },
     /** Repair channel. Hidden when idle. Bar fills over `total` seconds; label stays REPAIRING. */
     setRepair(remaining, total) {
       const on = remaining > 0.02 && total > 0;
@@ -174,10 +165,6 @@ export function createHud() {
       const done = 1 - remaining / total;
       rows.repair.querySelector('i').style.width = `${Math.round(Math.max(0, Math.min(1, done)) * 100)}%`;
       rows.repair.querySelector('b').textContent = `${remaining.toFixed(1)}s`;
-    },
-    showEnemy(on) {
-      for (const row of rows.enemies) row.classList.toggle('hidden', !on);
-      if (!on) rows.enemyHit.classList.add('hidden');
     },
     /**
      * Round callout. `hold` > 0 dismisses itself (remaining-enemy notices);

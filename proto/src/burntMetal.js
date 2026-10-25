@@ -15,12 +15,30 @@ function burntMetalMap() {
   return _burntMap;
 }
 
+/** Planar UV from local XY so WebGPU materials with a map don't warn on UV-less GLBs. */
+function ensureUv(geometry) {
+  if (geometry.getAttribute('uv')) return;
+  const pos = geometry.getAttribute('position');
+  if (!pos) return;
+  geometry.computeBoundingBox();
+  const { min, max } = geometry.boundingBox;
+  const sx = Math.max(1e-6, max.x - min.x);
+  const sy = Math.max(1e-6, max.y - min.y);
+  const uv = new Float32Array(pos.count * 2);
+  for (let i = 0; i < pos.count; i++) {
+    uv[i * 2] = (pos.getX(i) - min.x) / sx;
+    uv[i * 2 + 1] = (pos.getY(i) - min.y) / sy;
+  }
+  geometry.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+}
+
 /** Swap every mesh on `root` to the default destruction / burning texture. */
 export function applyBurntMetal(root, tint) {
   const burnt = burntMetalMap();
   root.traverse((o) => {
     if (!o.isMesh) return;
     o.castShadow = o.receiveShadow = true;
+    ensureUv(o.geometry);
     const mats = [].concat(o.material).filter(Boolean).map((m) => m.clone());
     o.material = Array.isArray(o.material) ? mats : mats[0];
     for (const m of mats) {

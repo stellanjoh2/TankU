@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { SIZE, WATER_Y, PORT, shoreSigned, onBridge } from './terrain.js';
-import { pickLod } from './lod.js';
+import { lodDist, pickLod } from './lod.js';
 import { applyBurntMetal } from './burntMetal.js';
 
 const HULL = 'PatrolBoat';
@@ -812,7 +812,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
       const d = root.position.distanceTo(camPos);
       const pad = CULL_DIST * lodScale * 0.05;
       const cull = CULL_DIST * lodScale + (lod === -1 ? -pad : pad);
-      if (d > cull) {
+      if (lodDist(d) > cull) {
         setLod(-1);
         wake.group.visible = false;
         return;

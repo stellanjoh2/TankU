@@ -7,7 +7,7 @@ import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader.js';
 import { LightProbeGenerator } from 'three/examples/jsm/lights/LightProbeGenerator.js';
 import { SkyMesh } from 'three/examples/jsm/objects/SkyMesh.js';
 import { createPost } from './post.js';
-import { buildTerrain, heightAt, isGrassable, PLAYER_SPAWN, BRIDGE, ENEMY_SPAWN, ENEMY_SPAWN_BASE, WATER_Y } from './terrain.js';
+import { buildTerrain, heightAt, isGrassable, PLAYER_SPAWN, BRIDGE, ENEMY_SPAWN, ENEMY_SPAWN_BASE, WATER_Y, shoreSigned } from './terrain.js';
 import { buildProps } from './props.js';
 import { buildAirfield } from './airfield.js';
 import { buildPort } from './port.js';
@@ -20,9 +20,10 @@ import { Input, PAD } from './input.js';
 import { Tank, RELOAD, REPAIR_TIME, MG_HEAT_TIME } from './tank.js';
 import { tankPose, boatPose } from './combatPose.js';
 import { installTankLods, updateTankLod } from './tankLod.js';
-import { Effects, wreckFireFade } from './fx.js';
+import { setLodFov } from './lod.js';
+import { Effects, wreckFireFade, wreckMeshFade, applyWreckMeshFade } from './fx.js';
 import { TankCamera } from './TankCamera.js';
-import { Sfx, distGain, FIRE_HEAR } from './sfx.js';
+import { Sfx, distGain, FIRE_HEAR, OCEAN_HEAR } from './sfx.js';
 import { NavGrid } from './navgrid.js';
 import { TankAI, pickSpawn } from './ai.js';
 import { createMatch } from './match.js';
@@ -45,6 +46,7 @@ import { buildWaterTower } from './watertower.js';
 import { buildBridge } from './bridge.js';
 import { buildFlag } from './flag.js';
 import { buildBarrels } from './barrels.js';
+import { buildWoodenCrates } from './woodenCrates.js';
 import { createCrates } from './crates.js';
 import { buildTrucks } from './truck.js';
 import { buildPatrolBoat } from './patrolBoat.js';
@@ -170,7 +172,7 @@ async function main() {
   freezeStatic(airfield.root);
   const port = buildPort(RAPIER, world, scene);
   freezeStatic(port.root);
-  const [grass, vegetation, planes, transport, ship, waterTower, flag, barrels, trucks, bridge, patrolBoat] = await Promise.all([
+  const [grass, vegetation, planes, transport, ship, waterTower, flag, barrels, woodenCrates, trucks, bridge, patrolBoat] = await Promise.all([
     buildGrass(scene),
     buildVegetation(scene, { RAPIER, world }),
     buildPlanes(scene),
@@ -179,6 +181,7 @@ async function main() {
     buildWaterTower(scene, { RAPIER, world }),
     buildFlag(scene, { RAPIER, world }),
     buildBarrels(scene, { RAPIER, world }),
+    buildWoodenCrates(scene, { RAPIER, world }),
     buildTrucks(scene, { RAPIER, world }),
     buildBridge(scene, { RAPIER, world }),
     buildPatrolBoat(scene, { RAPIER, world }),
@@ -210,10 +213,16 @@ async function main() {
   }
 
   const loader = new GLTFLoader();
-  const [gltf, wreckGltf] = await Promise.all([
+  const [gltf, wreckGltf, wrenchGltf] = await Promise.all([
     loader.loadAsync('./models/sherman.glb'),
     loader.loadAsync('./models/sherman_destroyed.glb'),
+    loader.loadAsync('./models/wrench_pickup.glb'),
   ]);
+  let wrenchGeo = null;
+  wrenchGltf.scene.traverse((o) => {
+    if (o.isMesh && !wrenchGeo) wrenchGeo = o.geometry;
+  });
+  if (!wrenchGeo) throw new Error('wrench_pickup.glb: missing mesh');
   const { x: sx, z: sz } = PLAYER_SPAWN;
   const spawn = { x: sx, y: heightAt(sx, sz) + 0.6, z: sz, yaw: Math.atan2(-(BRIDGE.z - sz), BRIDGE.x - sx) };
   const wreckSrc = wreckGltf.scene;
@@ -232,7 +241,7 @@ async function main() {
   nav.setObstacles([
     ...vegetation.navObstacles(), ...airfield.navObstacles(),
     ...port.navObstacles(), ...waterTower.navObstacles(), ...flag.navObstacles(),
-    ...trucks.navObstacles(),
+    ...trucks.navObstacles(), ...woodenCrates.navObstacles(),
   ]);
   const foeSpecs = [
     { src: enemyScenes[0], anchor: ENEMY_SPAWN, fireSlot: 1, mgId: 'enemy' },
@@ -241,7 +250,7 @@ async function main() {
   const foes = foeSpecs.map(({ src, anchor, fireSlot, mgId, patrolR, spawnR }) => {
     const foe = new Tank(src, RAPIER, world, pickSpawn(nav, spawn, anchor, spawnR), { tint: ENEMY_TINT, wreck: wreckSrc });
     scene.add(foe.model);
-    const brain = new TankAI({ tank: foe, enemy: tank, nav, world, RAPIER, coverRocks: vegetation.coverRocks, anchor, patrolR });
+    const brain = new TankAI({ tank: foe, enemy: tank, nav, world, RAPIER, coverRocks: vegetation.coverRocks, anchor, patrolR, smoke });
     return { tank: foe, ai: brain, anchor, spawnR, fireSlot, mgId };
   });
   const enemy = foes[0].tank;
@@ -282,7 +291,7 @@ async function main() {
 
   const match = createMatch({
     tank, foes, nav, fx, hud, sfx, tankCam, input,
-    vegetation, airfield, port, waterTower, barrels, trucks, patrolBoat, spawn,
+    vegetation, airfield, port, waterTower, barrels, woodenCrates, trucks, patrolBoat, spawn,
     smoke,
     onRestart: (opts) => onMatchRestart(opts),
   });
@@ -292,8 +301,12 @@ async function main() {
     scene, RAPIER, world, fx,
     getPlayer: () => tank,
     getTanks: () => [tank, ...foes.map((f) => f.tank)],
+    wrenchGeo,
     tryPickup: (kind) => {
-      if (kind !== 'health' || !match.healFull(tank)) return false;
+      const ok = kind === 'health' ? match.healFull(tank)
+        : kind === 'repair' ? match.grantRepair(tank)
+        : false;
+      if (!ok) return false;
       input.rumble(0.22, 0.48, 110);
       return true;
     },
@@ -733,13 +746,10 @@ async function main() {
       padRadial = true;
     }
     if (radial.isOpen && padRadial) {
-      const releasing = released.includes(PAD.RB);
-      const centered = !inp.stickRX && !inp.stickRY;
-      // Letting go of R1 often flicks the right stick into the deadzone on that
-      // same frame. Keep the slice already highlighted; a stick that was already
-      // centered still releases with nothing selected.
-      if (!(releasing && centered)) radial.pointAt(inp.stickRX || 0, inp.stickRY || 0);
-      if (releasing) {
+      // pointAt latches the last slice when the stick recenters (common a frame
+      // or two before R1 comes up on a quick flick). Never-moved stick stays empty.
+      radial.pointAt(inp.stickRX || 0, inp.stickRY || 0);
+      if (released.includes(PAD.RB)) {
         radial.release();
         padRadial = false;
       }
@@ -827,39 +837,59 @@ async function main() {
 
   // ---------------------------------------------------------------- reticle + start overlay
   const gunMarker = $('gun-marker');
+  const crosshair = $('crosshair');
+  const reloadRing = crosshair.querySelector('.reload-ring');
+  const reloadArc = crosshair.querySelector('.reload-arc');
   const projected = new THREE.Vector3();
 
   function updateHud(inp) {
-    // Freefly screenshots: hide reticle chrome so the frame is clean to draw on
-    if (fly.enabled) {
+    const gunId = MAIN_GUNS[mainGun].id;
+    const useMg = gunId === 'mg';
+    crosshair.dataset.gun = gunId;
+    // Photomode / pause: clean frame (no bars, reticle, or hit chrome)
+    const hideChrome = fly.enabled || menuPaused;
+    hud.setVisible(!hideChrome);
+    if (hideChrome) {
       gunMarker.style.display = 'none';
-      $('crosshair').style.display = 'none';
+      crosshair.style.display = 'none';
     } else if (radial.isOpen) {
       gunMarker.style.display = 'none';
-      $('crosshair').style.display = '';
+      crosshair.style.display = '';
     } else {
-      $('crosshair').style.display = '';
-      projected.copy(gunPoint).project(camera);
-      const visible = projected.z < 1;
-      gunMarker.style.display = visible ? 'block' : 'none';
-      if (visible) {
-        gunMarker.style.transform =
-          `translate(${(projected.x * 0.5 + 0.5) * innerWidth}px, ${(-projected.y * 0.5 + 0.5) * innerHeight}px)`;
+      crosshair.style.display = '';
+      // Barrel-aim circle is main-gun only — MG uses the center + alone.
+      // Fade it when it overlaps the center ring so settled aim isn't a double circle.
+      if (useMg) {
+        gunMarker.style.display = 'none';
+        gunMarker.classList.remove('aligned');
+      } else {
+        projected.copy(gunPoint).project(camera);
+        const visible = projected.z < 1;
+        gunMarker.style.display = visible ? 'block' : 'none';
+        if (visible) {
+          const sx = (projected.x * 0.5 + 0.5) * innerWidth;
+          const sy = (-projected.y * 0.5 + 0.5) * innerHeight;
+          gunMarker.style.transform = `translate(${sx}px, ${sy}px)`;
+          const dx = sx - innerWidth * 0.5;
+          const dy = sy - innerHeight * 0.5;
+          gunMarker.classList.toggle('aligned', dx * dx + dy * dy < 14 * 14);
+        } else {
+          gunMarker.classList.remove('aligned');
+        }
       }
     }
+    // Circular reload only while the main gun is equipped and chambering.
+    const reloading = gunId === 'cannon' && tank.alive && tank.reload > 0.05;
+    reloadRing.classList.toggle('hidden', !reloading);
+    if (reloading) {
+      const ready = Math.max(0, Math.min(1, 1 - tank.reload / RELOAD));
+      reloadArc.style.strokeDasharray = `${ready} 1`;
+    }
     hud.setNitro(tank.nitroCharge, tank.nitroActive);
-    hud.setWeapon(MAIN_GUNS[mainGun].label, MAIN_GUNS[mainGun].id);
+    hud.setWeapon(MAIN_GUNS[mainGun].label, gunId);
     hud.setReload(tank.alive ? tank.reload : 0, RELOAD);
     hud.setOverheat(tank.mgHeat, tank.mgLock, MG_HEAT_TIME, tank.mgFiring);
-    const gadgetCd = activeGadget === 'smoke' ? tank.smokeCd
-      : activeGadget === 'air' ? airSupport.cd
-      : activeGadget === 'ship' ? shipSupport.cd
-      : 0;
-    hud.setGadget(activeGadget, gadgetCd, activeGadget === 'repair' ? {
-      repairing: tank.repairing,
-      repairLeft: tank.repairT,
-      charges: tank.repairs,
-    } : null);
+    hud.setTurretYaw(tank.alive && !tank.wrecked ? tank.turret.rotation.y : 0, tank.alive && !tank.wrecked);
     radial.setActive(activeGadget);
     radial.setDetails({
       smoke: { text: tank.smokeCd > 0.05 ? `${tank.smokeCd.toFixed(1)}s` : '', cooling: tank.smokeCd > 0.05 },
@@ -872,7 +902,7 @@ async function main() {
     });
     hud.setRepair(tank.repairT, REPAIR_TIME);
     hud.setPickup(crates.timeToDrop());
-    // HIT% = stress jitter + smoke (−10% when either tank is in a cloud)
+    // HIT% = stress jitter + smoke (−35% when either tank is in a cloud)
     const pPos = tank.position;
     const near = game.solo ? null : nearestLivingFoe();
     const ePos = near ? near.tank.position : enemy.position;
@@ -936,22 +966,35 @@ async function main() {
   function tankFx(t, dt) {
     const mw = t.model.matrixWorld;
     if (!t.alive) {
-      // Wreck burns about a minute, fades, then only the destroyed mesh is left.
+      // Wreck burns ~1 min, sits cold ~30 s, then the destroyed mesh fades out.
       t.wreckBurn = (t.wreckBurn || 0) + dt;
       const k = wreckFireFade(t.wreckBurn);
-      if (k <= 0) {
+      if (k > 0) {
+        const p = t.body.translation();
+        burnPoint.set(p.x - 0.4, p.y + 1.8, p.z);
+        fx.burn(burnPoint, dt, 1.6 * k, true);
+        exhaustPoint.set(p.x, p.y + 2.4, p.z);
+        exhaustUp.set(0, 1, 0);
+        exhaustBack.set(-1, 0, 0).transformDirection(mw);
+        if (exhaustBack.lengthSq() < 1e-6) exhaustBack.set(0, 0, 1);
+        fx.engineSmoke(exhaustPoint, k, exhaustBack, exhaustUp);
+        setTankFire(t, 4, k);
+      } else {
         setTankFire(t, 0);
-        return;
       }
-      const p = t.body.translation();
-      burnPoint.set(p.x - 0.4, p.y + 1.8, p.z);
-      fx.burn(burnPoint, dt, 1.6 * k, true);
-      exhaustPoint.set(p.x, p.y + 2.4, p.z);
-      exhaustUp.set(0, 1, 0);
-      exhaustBack.set(-1, 0, 0).transformDirection(mw);
-      if (exhaustBack.lengthSq() < 1e-6) exhaustBack.set(0, 0, 1);
-      fx.engineSmoke(exhaustPoint, k, exhaustBack, exhaustUp);
-      setTankFire(t, 4, k);
+      if (t.wrecked && !t.wreckGone) {
+        const meshK = wreckMeshFade(t.wreckBurn);
+        if (meshK < 1) {
+          applyWreckMeshFade(t.wreck, meshK);
+          if (t.wreckTurret) applyWreckMeshFade(t.wreckTurret, meshK);
+        }
+        if (meshK <= 0) {
+          t.wreckGone = true;
+          t._clearWreckTurret();
+          if (t.wreck) t.wreck.visible = false;
+          t.body.setEnabled(false);
+        }
+      }
       return;
     }
     t.wreckBurn = 0;
@@ -1195,6 +1238,8 @@ async function main() {
   function ambientTick(dt, paused) {
     updatePathLine();
     debug.update();
+    // Focus / freeflight FOV: treat distance as shorter so scoped distant meshes bump LOD.
+    setLodFov(camera.fov, tankCam.cfg.fovBase);
     grass.updateLod(camera.position);
     vegetation?.updateLod?.(camera.position);
     barrels.updateLod(camera.position);
@@ -1214,6 +1259,7 @@ async function main() {
       grass.update(elapsed);
       vegetation?.update?.(elapsed);
       flag.update(elapsed, vegetation?.getWind?.());
+      ship.update(elapsed);
       {
         const sp = planes.scoutPos?.();
         const orbit = sp
@@ -1222,6 +1268,10 @@ async function main() {
         sfx.setP51Orbit(orbit);
       }
       sfx.setFire(distGain(fx.nearestDamageFireDist(playerPose.position), FIRE_HEAR));
+      {
+        const shore = shoreSigned(playerPose.position.x, playerPose.position.z);
+        sfx.setOcean(shore <= 0 ? 1 : distGain(shore, OCEAN_HEAR));
+      }
       sfx.update(dt, {
         speed: tank.forwardSpeed(),
         throttle: tank.cmd.throttle,
@@ -1231,6 +1281,10 @@ async function main() {
     } else if (!menuPaused) {
       sfx.setP51Orbit(0);
       sfx.setFire(distGain(fx.nearestDamageFireDist(playerPose.position), FIRE_HEAR));
+      {
+        const shore = shoreSigned(playerPose.position.x, playerPose.position.z);
+        sfx.setOcean(shore <= 0 ? 1 : distGain(shore, OCEAN_HEAR));
+      }
       sfx.update(dt, { speed: 0, throttle: 0, maxSpeed: 12.5, turretSlew: 0 });
     }
   }

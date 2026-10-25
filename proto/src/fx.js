@@ -169,6 +169,9 @@ const DAMAGE_FIRE_SPEED = 2.25;
 /** Destroyed tank / truck: full burn, then a short fade, then the wreck is cold. */
 export const WRECK_FIRE_LIFE = 60;
 const WRECK_FIRE_FADE = 8;
+/** Cold wreck stays this long after the fire dies, then the mesh fades out. */
+export const WRECK_MESH_LINGER = 30;
+const WRECK_MESH_FADE = 2.5;
 
 /** 1 while the wreck is fully alight, 0 once the fire is out (~1 min). */
 export function wreckFireFade(age) {
@@ -176,6 +179,30 @@ export function wreckFireFade(age) {
   const hold = WRECK_FIRE_LIFE - WRECK_FIRE_FADE;
   if (age <= hold) return 1;
   return (WRECK_FIRE_LIFE - age) / WRECK_FIRE_FADE;
+}
+
+/** 1 while the cold wreck stays, 0 once faded away (~30 s after fire out). */
+export function wreckMeshFade(age) {
+  const start = WRECK_FIRE_LIFE + WRECK_MESH_LINGER;
+  if (age <= start) return 1;
+  if (age >= start + WRECK_MESH_FADE) return 0;
+  return (start + WRECK_MESH_FADE - age) / WRECK_MESH_FADE;
+}
+
+/** Opacity on a burnt wreck (materials are already cloned per mesh). */
+export function applyWreckMeshFade(root, opacity) {
+  if (!root) return;
+  const o = Math.max(0, Math.min(1, opacity));
+  root.traverse((obj) => {
+    if (!obj.isMesh) return;
+    for (const m of [].concat(obj.material)) {
+      if (!m) continue;
+      m.transparent = o < 1;
+      m.opacity = o;
+      m.depthWrite = o > 0.2;
+    }
+  });
+  if (o <= 0) root.visible = false;
 }
 
 /** Right-hand side of a barrel dir (world +Y up). */
@@ -1258,13 +1285,13 @@ export class Effects {
         this.smokeTex,
         new THREE.Color(0.72, 0.7, 0.66),
         origin,
-        0.5 + Math.random() * 0.3,
+        0.55 + Math.random() * 0.35,
         0.55 + Math.random() * 0.25,
         {
           vel: out.clone().multiplyScalar(11 + Math.random() * 5),
-          grow: 8,
+          grow: 9,
           rise: 0.2,
-          opacity: 0.68,
+          opacity: 0.85,
           drag: 2.8,
         },
       );
@@ -1278,13 +1305,13 @@ export class Effects {
         this.smokeTex,
         new THREE.Color(0.55 + Math.random() * 0.12, 0.53, 0.48),
         land,
-        2.0 + Math.random() * 1.0,
         2.4 + Math.random() * 1.2,
+        2.6 + Math.random() * 1.3,
         {
           vel: new THREE.Vector3((Math.random() - 0.5) * 0.8, 1.2 + Math.random() * 0.8, (Math.random() - 0.5) * 0.8),
-          grow: 4.5,
+          grow: 5.2,
           rise: 0.9,
-          opacity: 0.68,
+          opacity: 0.85,
           drag: 0.7,
         },
       );
@@ -1303,7 +1330,7 @@ export class Effects {
     if (Math.random() < rate - n) n += 1;
     for (let i = 0; i < n; i++) {
       const a = Math.random() * Math.PI * 2;
-      const d = cloud.r * (0.25 + Math.random() * 0.75);
+      const d = cloud.r * (0.2 + Math.random() * 0.8);
       const grey = 0.48 + Math.random() * 0.18;
       this._sprite(
         this.smokeTex,
@@ -1313,17 +1340,17 @@ export class Effects {
           cloud.y + Math.random() * 2.2,
           cloud.z + Math.sin(a) * d,
         ),
-        2.8 + Math.random() * 2.0,
-        1.8 + Math.random() * 1.2,
+        3.2 + Math.random() * 2.2,
+        2.0 + Math.random() * 1.3,
         {
           vel: new THREE.Vector3(
             (Math.random() - 0.5) * 0.55,
             0.5 + Math.random() * 0.65,
             (Math.random() - 0.5) * 0.55,
           ),
-          grow: 2.6 + Math.random() * 1.2,
+          grow: 2.9 + Math.random() * 1.3,
           rise: 0.6,
-          opacity: Math.min(0.85, (0.42 + Math.random() * 0.18) * 1.25),
+          opacity: Math.min(0.95, (0.48 + Math.random() * 0.2) * 1.56),
           drag: 0.55,
         },
       );
@@ -1653,7 +1680,10 @@ export class Effects {
     }
 
     const body = collider?.parent();
-    if (body && body.isDynamic()) body.applyImpulseAtPoint(dir.clone().multiplyScalar(IMPACT_IMPULSE), point, true);
+    // onShellHit may have already despawned the hit body (e.g. wooden crates).
+    try {
+      if (body && body.isDynamic()) body.applyImpulseAtPoint(dir.clone().multiplyScalar(IMPACT_IMPULSE), point, true);
+    } catch (_) { /* freed rigid body */ }
     for (const { body: b } of this.dynamic) {
       const p = b.translation();
       const d = new THREE.Vector3(p.x - point.x, p.y - point.y + 0.5, p.z - point.z);

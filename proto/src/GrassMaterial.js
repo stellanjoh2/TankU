@@ -114,17 +114,17 @@ export class GrassMaterial {
     this.material.opacityNode = this._alphaTex.sample(grassUv).r;
     this.material.alphaTestNode = float(0.15);
 
-    // Static tip height only (no wind sway).
-    const worldPos = modelWorldMatrix.mul(vec4(positionLocal, 1.0)).xyz.toVar();
+    // Static tip height only (no wind sway). Avoid `.assign()` outside Fn() (TSL stack warning).
+    const worldPos = modelWorldMatrix.mul(vec4(positionLocal, 1.0)).xyz;
     const globalUV = vec2(
       this._uTerrainSize.sub(worldPos.x),
       this._uTerrainSize.sub(worldPos.z),
     ).div(this._uTerrainSize);
     const tip = float(1).sub(uv().y);
     const heightNoise = this._noiseTex.sample(globalUV.mul(this._uNoiseScale)).r;
-    worldPos.assign(worldPos.add(vec3(0, exp(heightNoise).mul(this._uHeightAmp).mul(tip), 0)));
+    const displaced = worldPos.add(vec3(0, exp(heightNoise).mul(this._uHeightAmp).mul(tip), 0));
 
-    this.material.positionNode = modelWorldMatrixInverse.mul(vec4(worldPos, 1.0)).xyz;
+    this.material.positionNode = modelWorldMatrixInverse.mul(vec4(displaced, 1.0)).xyz;
 
     this.material.needsUpdate = true;
   }
