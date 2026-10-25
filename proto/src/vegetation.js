@@ -1021,7 +1021,9 @@ export async function buildVegetation(scene, { RAPIER, world }) {
         pts.push(v.x - x, v.y - y, v.z - z);
       }
     }
-    const body = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(x, y, z));
+    const body = world.createRigidBody(
+      RAPIER.RigidBodyDesc.fixed().setTranslation(x, y, z).setUserData({ camBlock: true }),
+    );
     const hull = RAPIER.ColliderDesc.convexHull(new Float32Array(pts));
     if (hull) world.createCollider(hull.setFriction(0.8), body);
 

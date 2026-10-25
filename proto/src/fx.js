@@ -1664,6 +1664,26 @@ export class Effects {
     this.onImpact(point);
   }
 
+  /** HDR sprites and muzzle cards. Smoke and debris stay in the beauty pass. */
+  emissiveHot() {
+    if (this.particles.length > 0) return true;
+    const sprites = this.damageFire?.sprites;
+    if (sprites) {
+      for (const s of sprites) if (s.visible) return true;
+    }
+    const boards = [this._flashBoard, this._streakBoard, this._glowBoard];
+    if (this._burstBoards) boards.push(...this._burstBoards);
+    for (const b of boards) {
+      if (b && b.mesh.count > 0 && b.mesh.visible) return true;
+    }
+    if (this._mgKit) {
+      for (const kit of Object.values(this._mgKit)) {
+        if (kit.star?.visible) return true;
+      }
+    }
+    return false;
+  }
+
   update(dt, heightAt) {
     this._tickDamageFire(dt);
     if (this.camera) {

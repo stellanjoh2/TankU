@@ -1,8 +1,9 @@
 // WebGPU post: scene → motion blur → bloom → fisheye/aberration → grade → grain → ACES Filmic.
-// Bloom is the full beauty image plus the emissive attachment, so HDR sprites
-// (emissiveNode, black albedo) glow with the rest of the frame.
-// Fisheye resamples that frame. The warp is scaled so the screen corner lands
-// on the texture corner — no black edges, and no extra pass when blur is off.
+// Bloom runs at quarter resolution. Its input is the beauty image, plus the emissive
+// attachment while something bright is on screen (HDR sprites, brake lights, muzzle flash).
+// With both off, the sharp image is added to bloom directly. Fisheye or aberration
+// resamples that sum. The warp is scaled so the screen corner lands on the texture
+// corner — no black edges, and no extra pass when blur is off.
 // Aberration is the old finish pass: radial RGB split in UV units (slider 0–0.008).
 // At 0 the extra taps are skipped. Grain is animated and added after the grade.
 // Grade (contrast, saturation, temperature, shadow/mid/highlight tint, vignette)
@@ -15,18 +16,20 @@ import { bloom as bloomNode } from 'three/examples/jsm/tsl/display/BloomNode.js'
 import { motionBlur } from 'three/examples/jsm/tsl/display/MotionBlur.js';
 
 export function createPost(renderer, scene, camera) {
-  const pipeline = new THREE.RenderPipeline(renderer);
-  const scenePass = pass(scene, camera);
   // VelocityNode is NDC; motionBlur samples in UV — same scale as TRAA / velocityToUVOffset.
   const blurAmount = uniform(1);
   // Extra MRT targets default to no blending, which drops transparent sprites.
   const emissiveBlend = new THREE.BlendMode(THREE.NormalBlending);
 
-  let bloomPass = null;
+  const bloomPasses = [];
+  let plainChain = null;
+  let glowChain = null;
   let motionBlurOn = false;
   let bloomStrength = 0.15;
   let bloomRadius = 0.45;
   let bloomThresh = 0.95;
+  // Quarter of the drawing buffer. BloomNode's own default is half.
+  const BLOOM_SCALE = 0.25;
 
   // Same objects the Visuals panel writes (.value / Color.set). White grade colors are neutral.
   const uContrast = uniform(1);
@@ -38,6 +41,7 @@ export function createPost(renderer, scene, camera) {
   const uVignette = uniform(0.35);
   // 0 = rectilinear. Higher bulges the center. Corner scale keeps samples in-frame.
   const uFisheye = uniform(0.5);
+  let fisheyeOn = true;
   // Finish uniforms. Same .value objects the Visuals sliders write.
   const uAberration = uniform(0);
   const uTime = uniform(0);
@@ -110,60 +114,94 @@ export function createPost(renderer, scene, camera) {
     return vec4(rgb, color.a);
   }
 
-  function view() {
-    const targets = {
-      output,
-      emissive: vec4(emissive, output.a),
-    };
+  function view(scenePass, useEmissive) {
+    const targets = { output };
+    if (useEmissive) targets.emissive = vec4(emissive, output.a);
     if (motionBlurOn) targets.velocity = velocity;
-    const mrtNode = mrt(targets);
-    mrtNode.setBlendMode('emissive', emissiveBlend);
-    scenePass.setMRT(mrtNode);
+    if (useEmissive || motionBlurOn) {
+      const mrtNode = mrt(targets);
+      if (useEmissive) mrtNode.setBlendMode('emissive', emissiveBlend);
+      scenePass.setMRT(mrtNode);
+    }
 
     let color = scenePass.getTextureNode('output');
-    let glow = scenePass.getTextureNode('emissive');
+    let glow = useEmissive ? scenePass.getTextureNode('emissive') : null;
     if (motionBlurOn) {
       const vel = scenePass.getTextureNode('velocity').xy.mul(vec2(0.5, -0.5)).mul(blurAmount);
       color = motionBlur(color, vel);
-      glow = motionBlur(glow, vel);
+      if (glow) glow = motionBlur(glow, vel);
     }
     return { color, glow };
   }
 
-  function rebuild() {
-    bloomPass?.dispose();
-    const { color, glow } = view();
+  function dropChain(chain) {
+    if (!chain) return;
+    chain.pipeline.dispose();
+  }
+
+  function makeChain(useEmissive) {
+    const pipeline = new THREE.RenderPipeline(renderer);
+    const scenePass = pass(scene, camera);
+    const { color, glow } = view(scenePass, useEmissive);
     // Beauty is the whole frame. Emissive is added only into the bloom extract
     // so sprites that store their glow there still bloom; the sharp image stays beauty.
-    bloomPass = bloomNode(color.add(vec4(glow.rgb, 0)), bloomStrength, bloomRadius, bloomThresh);
-    const uv = lensUv();
-    // Beauty is already a pass texture (free resample). Motion blur is a
-    // computed node, so it is copied to a texture only while that effect is on.
-    const sceneTex = convertToTexture(color);
-    const bloomTex = bloomPass.getTextureNode();
-    const sampleAt = (sampleUv) => sceneTex.sample(sampleUv).add(bloomTex.sample(sampleUv));
-    let frame = sampleAt(uv);
-    if (aberrationOn) {
-      // shift = normalize(dir) * aberration * length(dir) * 2, from the old finish pass.
-      const dir = uv.sub(0.5);
-      const shift = normalize(dir.add(vec2(1e-6, 1e-6))).mul(uAberration.mul(length(dir)).mul(2));
-      frame = vec4(sampleAt(uv.add(shift)).r, frame.g, sampleAt(uv.sub(shift)).b, frame.a);
+    const bloomInput = glow ? color.add(vec4(glow.rgb, 0)) : color;
+    const bloomPass = bloomNode(bloomInput, bloomStrength, bloomRadius, bloomThresh);
+    bloomPass.setResolutionScale(BLOOM_SCALE);
+    bloomPasses.push(bloomPass);
+
+    let frame;
+    if (fisheyeOn || aberrationOn) {
+      const uv = lensUv();
+      // Beauty is already a pass texture (free resample). Motion blur is a
+      // computed node, so it is copied to a texture only while that effect is on.
+      const sceneTex = convertToTexture(color);
+      const bloomTex = bloomPass.getTextureNode();
+      const sampleAt = (sampleUv) => sceneTex.sample(sampleUv).add(bloomTex.sample(sampleUv));
+      frame = sampleAt(uv);
+      if (aberrationOn) {
+        // shift = normalize(dir) * aberration * length(dir) * 2, from the old finish pass.
+        const dir = uv.sub(0.5);
+        const shift = normalize(dir.add(vec2(1e-6, 1e-6))).mul(uAberration.mul(length(dir)).mul(2));
+        frame = vec4(sampleAt(uv.add(shift)).r, frame.g, sampleAt(uv.sub(shift)).b, frame.a);
+      }
+    } else {
+      frame = color.add(bloomPass);
     }
     pipeline.outputNode = applyGrain(gradeFrame(frame));
     // RenderPipeline keeps the previous output shader until this is set.
     pipeline.needsUpdate = true;
+    return { pipeline, bloomPass };
+  }
+
+  function rebuild() {
+    for (const p of bloomPasses) p.dispose();
+    bloomPasses.length = 0;
+    dropChain(plainChain);
+    dropChain(glowChain);
+    plainChain = makeChain(false);
+    glowChain = makeChain(true);
   }
 
   rebuild();
 
   // visuals.js assigns bloom.strength / .radius / .threshold as plain numbers
   const bloom = {
-    get strength() { return bloomPass.strength.value; },
-    set strength(v) { bloomStrength = +v; bloomPass.strength.value = bloomStrength; },
-    get radius() { return bloomPass.radius.value; },
-    set radius(v) { bloomRadius = v; bloomPass.radius.value = v; },
-    get threshold() { return bloomPass.threshold.value; },
-    set threshold(v) { bloomThresh = v; bloomPass.threshold.value = v; },
+    get strength() { return bloomStrength; },
+    set strength(v) {
+      bloomStrength = +v;
+      for (const p of bloomPasses) p.strength.value = bloomStrength;
+    },
+    get radius() { return bloomRadius; },
+    set radius(v) {
+      bloomRadius = v;
+      for (const p of bloomPasses) p.radius.value = bloomRadius;
+    },
+    get threshold() { return bloomThresh; },
+    set threshold(v) {
+      bloomThresh = v;
+      for (const p of bloomPasses) p.threshold.value = bloomThresh;
+    },
   };
 
   const motionBlurCtrl = {
@@ -195,7 +233,16 @@ export function createPost(renderer, scene, camera) {
       highlights: uHighlights,
       vignetteIntensity: uVignette,
       vignetteColor: { value: new THREE.Color(0.03, 0.03, 0.03) },
-      fisheye: uFisheye,
+      fisheye: {
+        get value() { return uFisheye.value; },
+        set value(v) {
+          uFisheye.value = +v;
+          const on = Math.abs(uFisheye.value) > 1e-4;
+          if (on === fisheyeOn) return;
+          fisheyeOn = on;
+          rebuild();
+        },
+      },
     },
   };
 
@@ -223,11 +270,10 @@ export function createPost(renderer, scene, camera) {
     motionBlur: motionBlurCtrl,
     grade,
     finish,
-    pipeline,
     setSize() {},
-    render(dt) {
+    render(dt, bright) {
       finish.uniforms.time.value += dt * 60;
-      pipeline.render();
+      (bright ? glowChain : plainChain).pipeline.render();
     },
   };
 }

@@ -139,8 +139,10 @@ export function createMatch({
     fx.wreck(origin);
     victim.obliterate();
     tankCam.addShake(victim === tank ? 1 : 0.4);
-    if (victim === tank) endRound(true, victim);
-    else if (!hostilesRemain()) endRound(false, victim);
+    if (victim === tank) {
+      input.rumble(1, 1, 700);
+      endRound(true, victim);
+    } else if (!hostilesRemain()) endRound(false, victim);
     else announceRemaining();
   }
 
@@ -202,6 +204,7 @@ export function createMatch({
       if (miss > MG_FLYBY_MAX) return;
       const intensity = 1 - miss / MG_FLYBY_MAX;
       sfx.flyby(intensity, along / MG_TRACER_SPEED);
+      if (intensity > 0.45) input.rumble(0.04, 0.2 * intensity, 60);
     };
 
     fx.onShellHit = ({ collider, owner, point, dir, naval }) => {

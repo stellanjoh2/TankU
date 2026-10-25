@@ -1,9 +1,26 @@
-// Keyboard + mouse (pointer lock) + gamepad. Gamepads use the browser's "standard" mapping, which is
-// what Chrome/Edge/Safari give a DualSense (PS5) or Xbox pad:
-//   axes 0/1 left stick, 2/3 right stick; buttons 4 L1, 5 R1, 6 L2, 7 R2, 9 Options, 10 L3, 11 R3.
+// Keyboard + mouse (pointer lock) + gamepad.
+// Standard mapping (Chrome / Edge / Safari: Xbox, DualSense, Switch Pro):
+//   LS drive · RS aim
+//   R2/RT fires the selected gun · Triangle/Y switches gun
+//   R1/RB hold: gadget wheel (RS picks; stick centered = no pick, release exits)
+//   LT focus · LB nitro
+//   A unflip (freefly up) · B freefly down
+//   D-pad up/right/down/left = smoke / air / repair / ship
+//   Menu pause · View reset tank
+// Mouse: LMB fires the selected gun, RMB or the wheel switches it, hold R opens the wheel.
+// getGamepads() is only called while a pad index is known. No pad → no poll.
+
 const DEADZONE = 0.14;
 const PAD_AIM_SPEED = 2.6;        // rad/s at full right-stick deflection
 const MOUSE_SENS = 0.0022;        // rad per pixel
+
+export const PAD = Object.freeze({
+  A: 0, B: 1, X: 2, Y: 3,
+  LB: 4, RB: 5, LT: 6, RT: 7,
+  VIEW: 8, MENU: 9,
+  L3: 10, R3: 11,
+  UP: 12, DOWN: 13, LEFT: 14, RIGHT: 15,
+});
 
 function stick(x, y) {
   const m = Math.hypot(x, y);
@@ -14,9 +31,10 @@ function stick(x, y) {
 
 const NEUTRAL = Object.freeze({
   throttle: 0, turn: 0, boost: false, ascend: 0,
-  aimX: 0, aimY: 0, fire: false, mgFire: false, zoom: 0, zoomHold: false,
-  mouseX: 0, mouseY: 0, mouseMg: false,
-  padPressed: Object.freeze([]), pad: null,
+  aimX: 0, aimY: 0, fire: false, switchGun: false, zoom: 0, zoomHold: false,
+  mouseX: 0, mouseY: 0,
+  stickRX: 0, stickRY: 0,
+  padPressed: Object.freeze([]), padReleased: Object.freeze([]), pad: null,
 });
 
 export class Input {
@@ -27,11 +45,15 @@ export class Input {
     this.mouseDY = 0;
     this.wheel = 0;
     this.mouseFire = false;
-    this.mouseMg = false;
+    this._switchEdge = false;
     this.locked = false;
     this.enabled = true; // false while Visuals editor (V) owns the cursor
-    this.pad = null;
+    this.pad = null; // index from gamepadconnected, or null when nothing is plugged in
     this._padButtons = [];
+    this._padBlock = []; // holds that were already down when gameplay input turned back on
+    this._armPad = false;
+    this._rumbleUntil = 0;
+    this._rumbleMag = 0;
     this.onPress = () => {};
     this.onRelease = () => {};
 
@@ -45,16 +67,15 @@ export class Input {
       this.keys.delete(e.code);
       this.onRelease(e.code);
     });
-    addEventListener('blur', () => { this.keys.clear(); this.mouseFire = false; this.mouseMg = false; });
+    addEventListener('blur', () => { this.keys.clear(); this.mouseFire = false; this._switchEdge = false; });
     canvas.addEventListener('mousedown', (e) => {
       if (!this.enabled) return;
       if (!this.locked) { canvas.requestPointerLock(); return; }
       if (e.button === 0) this.mouseFire = true;
-      if (e.button === 2) this.mouseMg = true;
+      if (e.button === 2) this._switchEdge = true;
     });
     addEventListener('mouseup', (e) => {
       if (e.button === 0) this.mouseFire = false;
-      if (e.button === 2) this.mouseMg = false;
     });
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     addEventListener('mousemove', (e) => {
@@ -69,10 +90,25 @@ export class Input {
     }, { passive: false });
     document.addEventListener('pointerlockchange', () => {
       this.locked = document.pointerLockElement === canvas;
-      if (!this.locked) { this.mouseFire = false; this.mouseMg = false; }
+      if (!this.locked) this.mouseFire = false;
     });
     addEventListener('gamepadconnected', (e) => { this.pad = e.gamepad.index; });
-    addEventListener('gamepaddisconnected', (e) => { if (this.pad === e.gamepad.index) this.pad = null; });
+    addEventListener('gamepaddisconnected', (e) => {
+      if (this.pad !== e.gamepad.index) return;
+      this.pad = null;
+      // One-shot handoff if another pad is still plugged in. Not a per-frame poll.
+      const pads = typeof navigator.getGamepads === 'function' ? navigator.getGamepads() : null;
+      if (!pads) return;
+      const dropped = e.gamepad.index;
+      for (let i = 0; i < pads.length; i++) {
+        const p = pads[i];
+        if (p?.connected && p.index !== dropped) {
+          this.pad = p.index;
+          this._padButtons.length = 0;
+          break;
+        }
+      }
+    });
   }
 
   /** Disconnect turret / drive / fire so UI (e.g. Visuals) can use the mouse. */
@@ -82,44 +118,102 @@ export class Input {
     this.enabled = on;
     this.keys.clear();
     this.mouseFire = false;
-    this.mouseMg = false;
+    this._switchEdge = false;
     this.mouseDX = this.mouseDY = this.wheel = 0;
+    // Buttons still held as the pause menu closes must not fire, boost, or zoom.
+    if (on) this._armPad = true;
     if (!on && document.pointerLockElement) document.exitPointerLock();
   }
 
+  /** Live pad, or null. Does not call getGamepads() unless a pad has connected. */
   gamepad() {
-    const pads = navigator.getGamepads ? navigator.getGamepads() : [];
-    if (this.pad != null && pads[this.pad]) return pads[this.pad];
-    for (const p of pads) if (p && p.connected) { this.pad = p.index; return p; }
-    return null;
+    if (this.pad == null || typeof navigator.getGamepads !== 'function') return null;
+    const p = navigator.getGamepads()[this.pad];
+    return p?.connected ? p : null;
   }
 
+  /**
+   * Dual-rumble. `strong` is the low-frequency motor, `weak` the high-frequency one (0..1).
+   * No pad connected → no haptic call. A lighter effect does not cut off a heavier one.
+   */
   rumble(strong, weak, ms) {
+    if (this.pad == null) return;
+    strong = Math.max(0, Math.min(1, strong));
+    weak = Math.max(0, Math.min(1, weak));
+    const duration = Math.max(0, ms | 0);
+    if (!duration) return;
+    const now = performance.now();
+    const mag = Math.max(strong, weak);
+    if (now < this._rumbleUntil && mag < this._rumbleMag - 0.04) return;
     const p = this.gamepad();
-    p?.vibrationActuator?.playEffect?.('dual-rumble', {
-      duration: ms, strongMagnitude: strong, weakMagnitude: weak,
-    }).catch?.(() => {});
+    const act = p?.vibrationActuator || p?.hapticActuators?.[0];
+    if (!act) return;
+    const params = { startDelay: 0, duration, strongMagnitude: strong, weakMagnitude: weak };
+    const pulse = () => act.pulse?.(mag, duration);
+    if (typeof act.playEffect === 'function') {
+      try {
+        const pending = act.playEffect('dual-rumble', params);
+        pending?.catch?.((err) => {
+          if (err?.name === 'NotSupportedError' || /not supported/i.test(err?.message || '')) pulse();
+        });
+      } catch {
+        pulse();
+      }
+    } else {
+      pulse();
+    }
+    this._rumbleUntil = now + duration;
+    this._rumbleMag = mag;
   }
 
-  /** Pad button edges only — used while input is disabled (pause menu) so a pad can resume. */
+  _pollButtons(pad) {
+    const pressed = [];
+    const released = [];
+    if (!pad) {
+      for (let i = 0; i < this._padButtons.length; i++) {
+        if (this._padButtons[i]) released.push(i);
+      }
+      this._padButtons.length = 0;
+      this._padBlock.length = 0;
+      this._armPad = false;
+      return { pressed, released };
+    }
+    if (this._armPad) {
+      this._armPad = false;
+      for (let i = 0; i < pad.buttons.length; i++) {
+        const down = pad.buttons[i]?.pressed === true;
+        this._padButtons[i] = down;
+        this._padBlock[i] = down;
+      }
+    }
+    const n = pad.buttons.length;
+    for (let i = 0; i < n; i++) {
+      const down = pad.buttons[i]?.pressed === true;
+      if (this._padBlock[i]) {
+        if (!down) this._padBlock[i] = false;
+        this._padButtons[i] = down;
+        continue;
+      }
+      if (down && !this._padButtons[i]) pressed.push(i);
+      else if (!down && this._padButtons[i]) released.push(i);
+      this._padButtons[i] = down;
+    }
+    return { pressed, released };
+  }
+
+  /** Button edges plus left-stick Y. Used while gameplay input is off so the pause menu can move. */
   readPadPresses() {
     const pad = this.gamepad();
-    const pressed = [];
-    if (pad) {
-      pad.buttons.forEach((btn, i) => {
-        if (btn.pressed && !this._padButtons[i]) pressed.push(i);
-        this._padButtons[i] = btn.pressed;
-      });
-    } else {
-      this._padButtons.length = 0;
-    }
-    return { padPressed: pressed, pad };
+    const { pressed, released } = this._pollButtons(pad);
+    const stickLY = pad ? stick(pad.axes[0] ?? 0, pad.axes[1] ?? 0)[1] : 0;
+    return { padPressed: pressed, padReleased: released, pad, stickLY };
   }
 
   /** Sample everything once per frame. Aim deltas are in radians (yaw right = positive). */
   read(dt) {
     if (!this.enabled) {
       this.mouseDX = this.mouseDY = this.wheel = 0;
+      this._switchEdge = false;
       return { ...NEUTRAL, ...this.readPadPresses() };
     }
     const k = (c) => this.keys.has(c);
@@ -132,33 +226,37 @@ export class Input {
     const mouseX = this.mouseDX;
     const mouseY = this.mouseDY;
     let fire = this.mouseFire;
-    let mgFire = this.mouseMg;
+    const switchGun = this._switchEdge;
+    this._switchEdge = false;
     let zoom = this.wheel;
     let zoomHold = k('KeyF'); // Focus: hold to zoom. Drive and fire stay live.
     this.mouseDX = this.mouseDY = this.wheel = 0;
 
     const pad = this.gamepad();
-    const pressed = [];
+    const { pressed, released } = this._pollButtons(pad);
+    let stickRX = 0;
+    let stickRY = 0;
     if (pad) {
       const [lx, ly] = stick(pad.axes[0] ?? 0, pad.axes[1] ?? 0);
       const [rx, ry] = stick(pad.axes[2] ?? 0, pad.axes[3] ?? 0);
-      const b = (i) => pad.buttons[i] ? pad.buttons[i].value : 0;
+      stickRX = rx;
+      stickRY = ry;
+      const b = (i) => (this._padBlock[i] || !pad.buttons[i]) ? 0 : pad.buttons[i].value;
       if (Math.abs(ly) > Math.abs(throttle)) throttle = -ly;
       if (Math.abs(lx) > Math.abs(turn)) turn = lx;
-      // face buttons: X/□ up, A/✕ down (indices 3 / 0 on standard mapping)
-      const padUp = b(3) - b(0);
+      // A up, B down — freefly only (tank ignores ascend).
+      const padUp = b(PAD.A) - b(PAD.B);
       if (Math.abs(padUp) > Math.abs(ascend)) ascend = padUp;
       aimX += rx * PAD_AIM_SPEED * dt;
       aimY += ry * PAD_AIM_SPEED * dt;
-      boost ||= b(4) > 0.5 || b(10) > 0.5;
-      fire ||= b(7) > 0.5;
-      mgFire ||= b(5) > 0.5; // R1
-      zoomHold = zoomHold || b(6) > 0.5; // L2, same zoom as F
-      pad.buttons.forEach((btn, i) => {
-        if (btn.pressed && !this._padButtons[i]) pressed.push(i);
-        this._padButtons[i] = btn.pressed;
-      });
+      boost ||= b(PAD.LB) > 0.5;
+      fire ||= b(PAD.RT) > 0.5;
+      zoomHold = zoomHold || b(PAD.LT) > 0.5;
     }
-    return { throttle, turn, ascend, boost, aimX, aimY, fire, mgFire, zoom, zoomHold, mouseX, mouseY, mouseMg: this.mouseMg, padPressed: pressed, pad };
+    return {
+      throttle, turn, ascend, boost, aimX, aimY, fire, switchGun, zoom, zoomHold,
+      mouseX, mouseY, stickRX, stickRY,
+      padPressed: pressed, padReleased: released, pad,
+    };
   }
 }

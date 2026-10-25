@@ -187,7 +187,7 @@ export function createRadialMenu(list, opts = {}) {
     } else if (hover >= 0) {
       const item = items[hover];
       title = item.label;
-      sub = item.detail ? `${item.detail}  ·  RELEASE R` : 'RELEASE R';
+      sub = item.detail ? `${item.detail}  ·  RELEASE` : 'RELEASE';
       cooling = !!item.cooling;
     } else {
       const cur = items.find((it) => it.id === activeId);
@@ -283,7 +283,22 @@ export function createRadialMenu(list, opts = {}) {
       }
       if (changed && isOpen) paint();
     },
-    /** Pixel deltas from the locked pointer. Highlight follows; R releases the pick. */
+    /** Stick, −1..1, y-down. Absolute, so a held direction stays on that slice. */
+    pointAt(x, y) {
+      if (!isOpen || blinking) return;
+      const mag = Math.hypot(x, y);
+      const reach = R_OUT - 16;
+      if (mag < 1e-4) {
+        cx = cy = 0;
+      } else {
+        cx = (x / mag) * reach;
+        cy = (y / mag) * reach;
+      }
+      hover = sliceAt(cx, cy, items.length, R_IN);
+      placeCursor();
+      paint();
+    },
+    /** Pixel deltas from the locked pointer. Highlight follows; release confirms. */
     pointer(dx, dy) {
       if (!isOpen || blinking) return;
       const rect = wheel.getBoundingClientRect();

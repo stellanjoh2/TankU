@@ -530,7 +530,7 @@ export const DEFAULT_GROUND_PALETTE = {
   water: '#2a6a88',
 };
 
-/** Drop faces that sit entirely out at sea so the wireframe/collider aren't a dense ocean grid. */
+/** Drop faces that sit entirely out at sea so the visible mesh isn't a dense ocean grid. */
 function pruneSeaFaces(geo) {
   const pos = geo.attributes.position;
   const src = geo.index.array;
@@ -644,10 +644,21 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   water.name = 'Ocean';
   scene.add(water);
 
-  const body = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
-  const verts = new Float32Array(pos.array);
-  const idx = new Uint32Array(geo.index.array);
-  world.createCollider(RAPIER.ColliderDesc.trimesh(verts, idx).setFriction(0.9), body);
+  // Heightfield instead of the 264×264 trimesh. Same vertex heights as the mesh.
+  // nrows/ncols are quad counts. Column j is X, row i is Z, column-major.
+  const n = SEGS + 1;
+  const heights = new Float32Array(n * n);
+  for (let iy = 0; iy < n; iy++) {
+    for (let ix = 0; ix < n; ix++) heights[ix * n + iy] = pos.getY(ix + n * iy);
+  }
+  const body = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setUserData({ camBlock: true }));
+  world.createCollider(
+    RAPIER.ColliderDesc.heightfield(
+      SEGS, SEGS, heights, { x: SIZE, y: 1, z: SIZE },
+      RAPIER.HeightFieldFlags.FIX_INTERNAL_EDGES,
+    ).setFriction(0.9),
+    body,
+  );
 
   const floorBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
   world.createCollider(

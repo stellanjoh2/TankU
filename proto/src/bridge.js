@@ -47,7 +47,8 @@ export async function buildBridge(scene, { RAPIER, world }) {
   const deckBody = world.createRigidBody(
     RAPIER.RigidBodyDesc.fixed()
       .setTranslation(BRIDGE.x, BRIDGE.deckY, BRIDGE.z)
-      .setRotation(rot),
+      .setRotation(rot)
+      .setUserData({ camBlock: true }),
   );
   world.createCollider(
     RAPIER.ColliderDesc.cuboid(SPAN * 0.5, DECK_T * 0.5, DECK_W * 0.5)
@@ -83,7 +84,7 @@ export async function buildBridge(scene, { RAPIER, world }) {
     RAPIER.RigidBodyDesc.fixed()
       .setTranslation(BRIDGE.x, BRIDGE.deckY, BRIDGE.z)
       .setRotation(rot)
-      .setUserData({ mat: 'metal' }),
+      .setUserData({ mat: 'metal', camBlock: true }),
   );
   const yPost = CLEAR_W * 0.5 + POST_W * 0.5;
   for (const s of [-1, 1]) {

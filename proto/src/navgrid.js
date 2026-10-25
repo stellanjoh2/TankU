@@ -2,8 +2,8 @@
 //  * Static cost field over the island: water, steep ground and solid obstacles (cover rocks, palm
 //    trunks) are blocked. A chamfer distance transform inflates them by the hull radius and adds a
 //    soft "keep clear" band so routes don't scrape along rocks or the waterline.
-//  * A* (8-connected, octile) takes an optional per-cell extra cost. The AI feeds it a lazily
-//    ray-cast exposure map ("can the enemy see this cell?") plus a proximity term, so one search
+//  * A* (8-connected, octile) takes an optional per-cell extra cost. The AI feeds it an
+//    exposure map ("can the enemy see this cell?") plus a proximity term, so one search
 //    gives sneaky covered routes when outgunned and direct ones when it has the edge.
 //  * String-pulling smooths the grid path but never cuts through blocked or more-exposed cells.
 import { SIZE, WATER_Y, BRIDGE, heightAt, shoreSigned, bridgeLocal } from './terrain.js';

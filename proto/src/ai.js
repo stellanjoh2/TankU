@@ -21,9 +21,11 @@ const HULL_H = 1.3;         // aim at hull centre
 const TURRET_H = 2.3;       // …or at the turret when the hull is behind a crest
 const SPOT_EYE_H = 2.3;     // height that must be hidden for a spot to count as cover
 const THINK_EVERY = 0.2;
-// Fresh exposure rays allowed on one replan. Cells past the budget count as
-// exposed so a cautious route keeps avoiding ground it hasn't checked.
-const EXPOSURE_RAYS = 192;
+// Rays spent filling the exposure grid each frame, and a few more on a replan.
+// Unknown cells count as exposed, so a route keeps avoiding ground that has not
+// been checked yet. The grid is cleared when the last-known enemy position moves.
+const EXPOSURE_BAKE = 16;
+const EXPOSURE_PLAN = 48;
 const REPLAN_EVERY = 2.0;
 const LOOKAHEAD = 7;
 const ARRIVE_R = 3.5;
@@ -157,6 +159,7 @@ export class TankAI {
     this.jitterT = 0;
     this.leadK = 1;
     this.exposureFrom.x = Infinity;
+    this._expKey = '';
     this.side = Math.random() < 0.5 ? 1 : -1;
     this.spotBasis = null;
     this.closeIn = 1;
@@ -239,6 +242,7 @@ export class TankAI {
     this.modeT += dt;
     this.pathAge += dt;
     this._perceive(dt);
+    if (this.alerted) this._refreshExposure();
     this.thinkT -= dt;
     if (this.thinkT <= 0) {
       this.thinkT = THINK_EVERY;
@@ -314,17 +318,78 @@ export class TankAI {
 
   // ------------------------------------------------------------------ threat-aware planning
   _exposed(k) {
-    let v = this.exposure[k];
-    if (v < 0) {
-      if (this._rayBudget <= 0) return 1;
-      this._rayBudget--;
-      const { nav, known } = this;
-      const x = nav.xOf(k), z = nav.zOf(k);
-      v = Math.hypot(x - known.x, z - known.z) < SIGHT_RANGE
-        && this._clear(known.x, known.eyeY, known.z, x, nav.height[k] + SPOT_EYE_H, z) ? 1 : 0;
-      this.exposure[k] = v;
+    const v = this.exposure[k];
+    return v < 0 ? 1 : v;
+  }
+
+  /** Corridor from the hull to the goal, padded so a flank a few cells off the line is checked. */
+  _exposureBounds() {
+    const nav = this.nav;
+    const farX = this.goal?.x ?? this.known.x;
+    const farZ = this.goal?.z ?? this.known.z;
+    const pad = 16;
+    return {
+      i0: nav.ci(Math.min(this.pos.x, farX) - pad),
+      i1: nav.ci(Math.max(this.pos.x, farX) + pad),
+      j0: nav.ci(Math.min(this.pos.z, farZ) - pad),
+      j1: nav.ci(Math.max(this.pos.z, farZ) + pad),
+    };
+  }
+
+  /**
+   * Fill exposure from the last-known enemy eye. Cleared when that point moves.
+   * Rays run here, a few per frame, never inside A*.
+   */
+  _refreshExposure() {
+    const k = this.known;
+    if (Math.hypot(k.x - this.exposureFrom.x, k.z - this.exposureFrom.z) > 4) {
+      this.exposure.fill(-1);
+      this.exposureFrom.x = k.x;
+      this.exposureFrom.z = k.z;
+      this._expKey = '';
     }
-    return v;
+    this._bakeExposure(EXPOSURE_BAKE);
+  }
+
+  _bakeExposure(budget) {
+    const nav = this.nav;
+    const b = this._exposureBounds();
+    const key = `${b.i0},${b.i1},${b.j0},${b.j1}`;
+    if (key !== this._expKey) {
+      this._expKey = key;
+      this._ring = 0;
+    }
+    const ci = nav.ci(this.pos.x);
+    const cj = nav.ci(this.pos.z);
+    const maxRing = Math.max(ci - b.i0, b.i1 - ci, cj - b.j0, b.j1 - cj, 0);
+    const known = this.known;
+    let rays = 0;
+    for (let r = this._ring; r <= maxRing; r++) {
+      let hitBudget = false;
+      for (let j = cj - r; j <= cj + r; j++) {
+        for (let i = ci - r; i <= ci + r; i++) {
+          if (r > 0 && Math.max(Math.abs(i - ci), Math.abs(j - cj)) !== r) continue;
+          if (i < b.i0 || i > b.i1 || j < b.j0 || j > b.j1) continue;
+          const idx = j * nav.n + i;
+          if (this.exposure[idx] >= 0) continue;
+          if (!Number.isFinite(nav.cost[idx])) {
+            this.exposure[idx] = 0;
+            continue;
+          }
+          if (rays >= budget) { hitBudget = true; break; }
+          const x = nav.xOf(idx);
+          const z = nav.zOf(idx);
+          const seen = Math.hypot(x - known.x, z - known.z) < SIGHT_RANGE
+            && this._clear(known.x, known.eyeY, known.z, x, nav.height[idx] + SPOT_EYE_H, z);
+          this.exposure[idx] = seen ? 1 : 0;
+          rays++;
+        }
+        if (hitBudget) break;
+      }
+      if (hitBudget) break;
+      this._ring = r + 1;
+      if (rays >= budget) break;
+    }
   }
 
   _extraCost() {
@@ -348,13 +413,7 @@ export class TankAI {
   }
 
   _plan() {
-    this._rayBudget = EXPOSURE_RAYS;
-    const k = this.known;
-    if (Math.hypot(k.x - this.exposureFrom.x, k.z - this.exposureFrom.z) > 4) {
-      this.exposure.fill(-1);
-      this.exposureFrom.x = k.x;
-      this.exposureFrom.z = k.z;
-    }
+    this._bakeExposure(EXPOSURE_PLAN);
     const res = this.nav.findPath(this.pos.x, this.pos.z, this.goal.x, this.goal.z, { extra: this._extraCost() });
     this.path = res.points;
     this.wp = 0;

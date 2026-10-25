@@ -24,8 +24,12 @@ canvas { display: block; }
   color: #e8e4d8; background: rgba(0, 0, 0, 0.55); border: 1px solid rgba(232, 228, 216, 0.35);
   border-radius: 4px; padding: 10px 16px; width: 100%; max-width: 220px;
 }
-#reset-cam:hover, #restart-game:hover, #pause-resume:hover {
+#reset-cam:hover, #restart-game:hover, #pause-resume:hover,
+#reset-cam.pad-focus, #restart-game.pad-focus, #pause-resume.pad-focus {
   background: rgba(0, 0, 0, 0.75); border-color: rgba(232, 228, 216, 0.55);
+}
+#reset-cam.pad-focus, #restart-game.pad-focus, #pause-resume.pad-focus {
+  border-color: #ffd278; color: #ffd278;
 }
 .hidden { display: none !important; }
 
@@ -51,9 +55,11 @@ canvas { display: block; }
 #hud .repair,
 #hud .hit,
 #hud .gadget,
+#hud .weapon,
 #hud .pickup { display: grid; grid-template-columns: 56px 160px 44px; align-items: center; gap: 8px; }
 #hud .repair { grid-template-columns: 120px 120px 48px; }
-#hud .gadget { grid-template-columns: 56px 1fr; }
+#hud .gadget,
+#hud .weapon { grid-template-columns: 56px 1fr; }
 #hud .pickup { grid-template-columns: 96px 1fr; }
 #hud .hp span,
 #hud .nitro span,
@@ -62,6 +68,7 @@ canvas { display: block; }
 #hud .repair span,
 #hud .hit span,
 #hud .gadget span,
+#hud .weapon span,
 #hud .pickup span {
   font-family: "Bebas Neue", sans-serif; font-size: 16px; font-weight: 400;
   line-height: 1; letter-spacing: 0.06em; opacity: 0.85; text-shadow: 0 1px 3px #000;
@@ -74,11 +81,16 @@ canvas { display: block; }
 #hud .repair b,
 #hud .hit b,
 #hud .gadget b,
+#hud .weapon b,
 #hud .pickup b { font-weight: 600; font-size: 12px; text-align: right; text-shadow: 0 1px 3px #000; }
 #hud .gadget span,
+#hud .weapon span,
 #hud .pickup span { color: #d8c898; opacity: 1; }
 #hud .gadget b,
+#hud .weapon b,
 #hud .pickup b { text-align: left; color: #ffd278; letter-spacing: 0.04em; }
+#hud .weapon b { font-size: 14px; letter-spacing: 0.12em; }
+#hud .weapon.mg b { color: #ffb060; }
 #hud .gadget.cooling b { color: #a09880; }
 #hud .gadget.repairing b {
   color: #c8ff7a; font-size: 14px; letter-spacing: 0.14em;

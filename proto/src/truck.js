@@ -217,7 +217,7 @@ export async function buildTrucks(scene, { RAPIER, world }) {
       RAPIER.RigidBodyDesc.fixed()
         .setTranslation(spot.x, y0, spot.z)
         .setRotation(q)
-        .setUserData({ mat: 'metal' }),
+        .setUserData({ mat: 'metal', camBlock: true }),
     );
     const collider = world.createCollider(
       RAPIER.ColliderDesc.cuboid(HX, HY, HZ)

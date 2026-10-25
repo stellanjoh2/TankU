@@ -19,6 +19,7 @@
 // + victory fanfare (Sounds/161984__robinhood76__03599-majestic-foreboding-fanfare.wav).
 // + C-47 supply pass (Sounds/515293__breviceps__propeller-plane.wav, +5 dB).
 // + ship horn (Sounds/371535__robinhood76__06934-distant-ship-horn.wav).
+// + weapon switch (Sounds/414439__inspectorj__light-pulley-switch-on-b.wav).
 const SHOT_URLS = [
   './sounds/tank_shot_1.wav',
   './sounds/tank_shot_2.wav',
@@ -44,6 +45,7 @@ const REPAIR_URL = './sounds/repair_wrench.wav';
 const REPAIR_DONE_URL = './sounds/repair_done.wav';
 const FANFARE_URL = './sounds/161984__robinhood76__03599-majestic-foreboding-fanfare.wav';
 const SHIP_HORN_URL = './sounds/371535__robinhood76__06934-distant-ship-horn.wav';
+const WEAPON_SWITCH_URL = './sounds/414439__inspectorj__light-pulley-switch-on-b.wav';
 // Source peaks at ~0 dBFS; leave headroom so it sits over a ducked music bed.
 const FANFARE_GAIN = 0.72;
 const FANFARE_MUSIC_DUCK = 0.32;
@@ -147,6 +149,7 @@ export class Sfx {
     this.repairDoneBuf = null;
     this.fanfareBuf = null;
     this.shipHornBuf = null;
+    this.weaponSwitchBuf = null;
     this.ready = false;
     this._last = -1;
     this._ricoLast = -1;
@@ -217,7 +220,7 @@ export class Sfx {
       const res = await fetch(url);
       return this.ctx.decodeAudioData(await res.arrayBuffer());
     };
-    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, p51Pass, p51Mg, p51Orbit, c47, dirtThump, mgBass, smokeBomb, flyby, repair, repairDone, fanfare, shipHorn] = await Promise.all([
+    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, p51Pass, p51Mg, p51Orbit, c47, dirtThump, mgBass, smokeBomb, flyby, repair, repairDone, fanfare, shipHorn, weaponSwitch] = await Promise.all([
       Promise.all(SHOT_URLS.map(decode)),
       decode(ENGINE_URL),
       decode(MG50_URL),
@@ -240,6 +243,7 @@ export class Sfx {
       decode(REPAIR_DONE_URL),
       decode(FANFARE_URL),
       decode(SHIP_HORN_URL),
+      decode(WEAPON_SWITCH_URL),
     ]);
     this.shots = shots;
     this.engineBuf = engine;
@@ -263,6 +267,7 @@ export class Sfx {
     this.repairDoneBuf = repairDone;
     this.fanfareBuf = fanfare;
     this.shipHornBuf = shipHorn;
+    this.weaponSwitchBuf = weaponSwitch;
     this.ready = true;
   }
 
@@ -341,6 +346,20 @@ export class Sfx {
     const src = this.ctx.createBufferSource();
     src.buffer = this.nitroBuf;
     src.playbackRate.value = 0.98 + Math.random() * 0.04;
+    const g = this.ctx.createGain();
+    g.gain.value = volume;
+    src.connect(g).connect(this.ctx.destination);
+    this._active.add(src);
+    src.onended = () => this._active.delete(src);
+    src.start();
+  }
+
+  /** Pulley click when the player swaps main gun and .50. */
+  weaponSwitch(volume = 0.75) {
+    if (!this.ready || !this.weaponSwitchBuf) return;
+    this.unlock();
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.weaponSwitchBuf;
     const g = this.ctx.createGain();
     g.gain.value = volume;
     src.connect(g).connect(this.ctx.destination);

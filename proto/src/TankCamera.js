@@ -116,7 +116,17 @@ const lerp = (a, b, t) => a + (b - a) * t;
 const deg = (d) => (d * Math.PI) / 180;
 const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
 const dampAngle = (a, b, lambda, dt) => a + wrapAngle(b - a) * (1 - Math.exp(-lambda * dt));
-const lerpAngle = (a, b, t) => a + wrapAngle(b - a) * t;
+// A partial blend flips at 180°: both arcs are equal, so the short-arc pick
+// chatters between two poses. Past this offset, ease the weight to 1 so both
+// sides land on the same angle (boom fully orbits with the turret).
+const OPPOSE_BLEND_START = deg(100);
+const blendYaw = (delta, weight) => {
+  const abs = Math.abs(delta);
+  if (abs <= OPPOSE_BLEND_START) return delta * weight;
+  const s = (abs - OPPOSE_BLEND_START) / (Math.PI - OPPOSE_BLEND_START);
+  const t = s * s * (3 - 2 * s);
+  return delta * (weight + (1 - weight) * t);
+};
 
 // Convention: yaw 0 faces +X (Sherman / this project), forward = (cos yaw, 0, -sin yaw)
 const fwd = (yaw, out) => out.set(Math.cos(yaw), 0, -Math.sin(yaw));
@@ -145,8 +155,7 @@ export class TankCamera {
   constructor(camera, overrides = {}) {
     this.camera = camera;
     this.cfg = Object.assign({}, CAMERA_CONFIG, overrides);
-    this.colliders = [];                 // THREE.Object3D[] to raycast against
-    this.raycaster = new THREE.Raycaster();
+    this._collisionCast = null;         // (origin, dir, maxDist) => hit distance or null
 
     // smoothed state
     this.yaw = 0;
@@ -193,7 +202,8 @@ export class TankCamera {
     this._pivotWorld = new THREE.Vector3();
   }
 
-  setColliders(objects) { this.colliders = objects; }
+  /** Rapier (or any) segment test. `dir` is unit length. Return the hit distance, or null. */
+  setCollisionCast(fn) { this._collisionCast = fn; }
 
   /**
    * Ease into peak shove, then ease-out return landing at `returnDuration` (reload).
@@ -309,14 +319,15 @@ export class TankCamera {
     let baseYaw = s.heading;
     if (reversing && c.reverseFlip) baseYaw += Math.PI;
     const turretYaw = s.turretYaw ?? s.heading;
-    let desiredYaw = lerpAngle(baseYaw, turretYaw, c.turretFollowWeight);
+    const turretDelta = wrapAngle(turretYaw - baseYaw);
+    let desiredYaw = baseYaw + blendYaw(turretDelta, c.turretFollowWeight);
     desiredYaw += -steer * deg(c.steerYawOffsetDeg) * speedT; // swing to outside of turn
     const yawLambda = lerp(c.yawLambda, c.yawLambdaFast, speedT);
     this.yaw = dampAngle(this.yaw, desiredYaw, yawLambda, dt);
     const yawErr = wrapAngle(desiredYaw - this.yaw);
     const maxYawLag = deg(c.maxYawLagDeg);
     if (Math.abs(yawErr) > maxYawLag) this.yaw = wrapAngle(desiredYaw - Math.sign(yawErr) * maxYawLag);
-    const desiredAim = lerpAngle(baseYaw, turretYaw, c.turretLookWeight);
+    const desiredAim = baseYaw + blendYaw(turretDelta, c.turretLookWeight);
     this.aimYaw = dampAngle(this.aimYaw, desiredAim, c.turretYawLambda, dt);
     const aimErr = wrapAngle(desiredAim - this.aimYaw);
     const maxAimLag = deg(c.maxAimLagDeg);
@@ -397,14 +408,15 @@ export class TankCamera {
       this._desired.addScaledVector(this.kickPush, kickAmt);
     }
 
-    if (c.collisionEnabled && this.colliders.length) {
+    if (c.collisionEnabled && this._collisionCast) {
       this._dir.subVectors(this._desired, pivotCopy);
       const full = this._dir.length();
-      this._dir.normalize();
-      this.raycaster.set(pivotCopy, this._dir);
-      this.raycaster.far = full;
-      const hits = this.raycaster.intersectObjects(this.colliders, true);
-      const allowed = hits.length ? Math.max(c.minDistance, hits[0].distance - c.collisionMargin) : Infinity;
+      let allowed = Infinity;
+      if (full > 1e-5) {
+        this._dir.multiplyScalar(1 / full);
+        const toi = this._collisionCast(pivotCopy, this._dir, full);
+        if (toi != null) allowed = Math.max(c.minDistance, toi - c.collisionMargin);
+      }
       const lam = allowed < this.collisionDist ? c.collisionPullInLambda : c.collisionReleaseLambda;
       this.collisionDist = Number.isFinite(allowed) || Number.isFinite(this.collisionDist)
         ? damp(Number.isFinite(this.collisionDist) ? this.collisionDist : full, Number.isFinite(allowed) ? allowed : full + 1, lam, dt)

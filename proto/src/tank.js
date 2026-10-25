@@ -760,6 +760,13 @@ export class Tank {
     if (this._repairU) this._sweep = 0;
   }
 
+  /** Brake lights, hit flash, repair sweep, or a hot .50 barrel. */
+  emissiveHot() {
+    if (this.hitFlashFrames > 0 || this.repairT > 0 || this.mgHeat > 0.5) return true;
+    for (const m of this.tailMats) if (m.emissiveIntensity > 1.2) return true;
+    return false;
+  }
+
   /** Two-frame red emissive flash (same red as taillights / bloom). */
   flashHit() {
     this.hitFlashFrames = 2;

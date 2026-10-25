@@ -14,6 +14,7 @@ export function createHud() {
     <div class="repair hidden" data-who="repair"><span>REPAIRING</span><div class="repair-bar"><i></i></div><b>5.0s</b></div>
     <div class="hit hidden" data-who="player-hit"><span>HIT</span><div class="hit-bar"><i></i></div><b>100%</b></div>
     <div class="nitro" data-who="nitro"><span>NITRO</span><div class="nitro-bar"><i></i></div><b>100%</b></div>
+    <div class="weapon" data-who="weapon"><span>GUN</span><b>MAIN GUN</b></div>
     <div class="reload hidden" data-who="reload"><span>RELOAD</span><div class="reload-bar"><i></i></div><b>0.0s</b></div>
     <div class="overheat hidden" data-who="overheat"><span>HEAT</span><div class="overheat-bar"><i></i></div><b>0.0s</b></div>
     <div class="gadget" data-who="gadget"><span>GADGET</span><b>1 SMOKE</b></div>
@@ -48,6 +49,7 @@ export function createHud() {
     player: root.querySelector('[data-who="player"]'),
     enemies: [...root.querySelectorAll('.hp.enemy')],
     nitro: root.querySelector('[data-who="nitro"]'),
+    weapon: root.querySelector('[data-who="weapon"]'),
     reload: root.querySelector('[data-who="reload"]'),
     overheat: root.querySelector('[data-who="overheat"]'),
     gadget: root.querySelector('[data-who="gadget"]'),
@@ -124,6 +126,11 @@ export function createHud() {
       const ready = 1 - remaining / total;
       rows.reload.querySelector('i').style.width = `${Math.round(Math.max(0, ready) * 100)}%`;
       rows.reload.querySelector('b').textContent = `${remaining.toFixed(1)}s`;
+    },
+    /** Selected main gun, written out. `id` is `cannon` or `mg`. */
+    setWeapon(label, id) {
+      rows.weapon.querySelector('b').textContent = label;
+      rows.weapon.classList.toggle('mg', id === 'mg');
     },
     setNitro(frac, active = false) {
       const pct = Math.round(Math.max(0, Math.min(1, frac)) * 100);

@@ -16,7 +16,7 @@ import { buildVegetation } from './vegetation.js';
 import { createVisualsEditor } from './visuals.js';
 import { shadowTint, patchShadowTint } from './shadowTint.js';
 import { createCloudShadows } from './cloudShadows.js';
-import { Input } from './input.js';
+import { Input, PAD } from './input.js';
 import { Tank, RELOAD, REPAIR_TIME, MG_HEAT_TIME } from './tank.js';
 import { tankPose, boatPose } from './combatPose.js';
 import { installTankLods, updateTankLod } from './tankLod.js';
@@ -249,7 +249,17 @@ async function main() {
   const hud = createHud();
 
   const tankCam = new TankCamera(camera);
-  tankCam.setColliders([terrain.mesh, vegetation.coverRoot, bridge.root, trucks.root]);
+  const camRay = new RAPIER.Ray({ x: 0, y: 0, z: 0 }, { x: 1, y: 0, z: 0 });
+  tankCam.setCollisionCast((origin, dir, maxDist) => {
+    camRay.origin.x = origin.x; camRay.origin.y = origin.y; camRay.origin.z = origin.z;
+    camRay.dir.x = dir.x; camRay.dir.y = dir.y; camRay.dir.z = dir.z;
+    const hit = world.castRay(
+      camRay, maxDist, true,
+      undefined, undefined, undefined, undefined,
+      (col) => col.parent()?.userData?.camBlock === true,
+    );
+    return hit ? hit.timeOfImpact : null;
+  });
   const sfx = new Sfx();
   await Promise.all([
     sfx.load(),
@@ -282,7 +292,11 @@ async function main() {
     scene, RAPIER, world, fx,
     getPlayer: () => tank,
     getTanks: () => [tank, ...foes.map((f) => f.tank)],
-    tryPickup: (kind) => kind === 'health' && match.healFull(tank),
+    tryPickup: (kind) => {
+      if (kind !== 'health' || !match.healFull(tank)) return false;
+      input.rumble(0.22, 0.48, 110);
+      return true;
+    },
     transport,
     onIncoming: () => {
       sfx.c47Pass();
@@ -415,6 +429,8 @@ async function main() {
   const TURRET_CAM_LEAD = THREE.MathUtils.degToRad(55);
   // v1 Focus: chase cam sits near 62°. 28° is about 2× magnification.
   const FOCUS_FOV = 28;
+  // Full zoom: half stick/mouse aim rate so the tighter view stays placeable.
+  const FOCUS_AIM_SCALE = 0.5;
   let focusBlend = 0;
   let lookYaw = spawn.yaw;
   let lookPitch = -0.08;
@@ -488,6 +504,15 @@ async function main() {
   // Wheel entries. Add or remove objects — slices, icons, and hit areas rebuild.
   // svg is a Phosphor fill icon (solid).
   let activeGadget = 'smoke';
+  const MAIN_GUNS = [
+    { id: 'cannon', label: 'MAIN GUN' },
+    { id: 'mg', label: '.50 CAL' },
+  ];
+  let mainGun = 0;
+  function switchMainGun() {
+    mainGun = (mainGun + 1) % MAIN_GUNS.length;
+    sfx.weaponSwitch();
+  }
   const radial = createRadialMenu([
     { id: 'smoke', label: 'SMOKE', svg: cloudIcon },
     { id: 'air', label: 'AIR SUPPORT', svg: planeIcon },
@@ -520,6 +545,8 @@ async function main() {
     overlayEl.classList.toggle('hidden', !on || visuals.open);
     sfx.setPaused(on);
     if (on) {
+      focusPause(0);
+      pauseStick = null;
       if (document.pointerLockElement) document.exitPointerLock();
     }
   }
@@ -528,6 +555,21 @@ async function main() {
     setMenuPaused(false);
     canvasEl.requestPointerLock();
   }
+
+  const pauseItems = ['pause-resume', 'restart-game', 'reset-cam'];
+  let pauseIndex = 0;
+  let pauseStick = null; // latched stick direction; null until the menu has seen the stick
+
+  function focusPause(i) {
+    const n = pauseItems.length;
+    pauseIndex = ((i % n) + n) % n;
+    for (let k = 0; k < n; k++) $(pauseItems[k]).classList.toggle('pad-focus', k === pauseIndex);
+  }
+
+  function movePause(dir) {
+    if (dir) focusPause(pauseIndex + dir);
+  }
+  focusPause(0);
 
   addEventListener('keydown', (e) => {
     if (e.code !== 'Escape') return;
@@ -643,7 +685,7 @@ async function main() {
     if (code === 'KeyT' && !fly.enabled) { tank.reset(heightAt); snapCam(); }
     if (code === 'KeyC') toggleFly();
     // Space: hop upright only when flipped (ignored while upright / in freefly)
-    if (code === 'Space' && !fly.enabled) tank.unflipJump(heightAt);
+    if (code === 'Space' && !fly.enabled && tank.unflipJump(heightAt)) input.rumble(0.55, 0.35, 160);
     if (code === 'KeyV') visuals.toggle();
     if (code === 'F3' || code === 'Backquote') setDebug(!game.debug);
     if (code === 'Digit1' || code === 'Numpad1') useSmoke();
@@ -651,6 +693,66 @@ async function main() {
     if (code === 'Digit3' || code === 'Numpad3') useRepair();
     if (code === 'Digit4' || code === 'Numpad4') useShip();
   };
+
+  // True while R1 is held open. The right stick owns the cursor, including center = no slice.
+  let padRadial = false;
+
+  // Pad edges. Holds (drive, aim, fire, nitro, focus) are sampled in Input.read.
+  function applyGamepad(inp) {
+    if (visuals.open) return;
+    const pressed = inp.padPressed;
+    const released = inp.padReleased;
+    if (!radial.isOpen) padRadial = false;
+    if (menuPaused) {
+      if (pressed.includes(PAD.A)) { // × confirms the highlighted row
+        $(pauseItems[pauseIndex]).click();
+        return;
+      }
+      if (pressed.includes(PAD.B)) { // ○ back / exit
+        resumeFromMenu();
+        return;
+      }
+      if (pressed.includes(PAD.DOWN)) movePause(1);
+      else if (pressed.includes(PAD.UP)) movePause(-1);
+      const ly = inp.stickLY || 0;
+      const stickDir = ly > 0.55 ? 1 : ly < -0.55 ? -1 : 0;
+      if (pauseStick === null) pauseStick = stickDir;
+      else if (stickDir !== pauseStick) {
+        pauseStick = stickDir;
+        movePause(stickDir);
+      }
+      return;
+    }
+    if (pressed.includes(PAD.MENU)) {
+      if (radial.isOpen) { radial.close(); padRadial = false; }
+      else setMenuPaused(true);
+      return;
+    }
+    if (pressed.includes(PAD.RB)) {
+      radial.open();
+      padRadial = true;
+    }
+    if (radial.isOpen && padRadial) {
+      const releasing = released.includes(PAD.RB);
+      const centered = !inp.stickRX && !inp.stickRY;
+      // Letting go of R1 often flicks the right stick into the deadzone on that
+      // same frame. Keep the slice already highlighted; a stick that was already
+      // centered still releases with nothing selected.
+      if (!(releasing && centered)) radial.pointAt(inp.stickRX || 0, inp.stickRY || 0);
+      if (releasing) {
+        radial.release();
+        padRadial = false;
+      }
+    }
+    if (radial.isOpen) return;
+    if (!fly.enabled && (pressed.includes(PAD.Y) || inp.switchGun || inp.zoom)) switchMainGun();
+    if (!fly.enabled && pressed.includes(PAD.A) && tank.unflipJump(heightAt)) input.rumble(0.55, 0.35, 160);
+    if (!fly.enabled && pressed.includes(PAD.VIEW)) { tank.reset(heightAt); snapCam(); }
+    if (pressed.includes(PAD.UP)) useSmoke();
+    if (pressed.includes(PAD.RIGHT)) useAir();
+    if (pressed.includes(PAD.DOWN)) useRepair();
+    if (pressed.includes(PAD.LEFT)) useShip();
+  }
 
   /** Crosshair on the sea, or the first solid hit when that is closer. */
   function reticlePoint() {
@@ -683,10 +785,16 @@ async function main() {
       return;
     }
 
+    // Focus (hold F, or gamepad LT): zoom the chase cam. Aim rate eases down
+    // with the zoom — full zoom is half stick/mouse speed. Drive and guns
+    // still read the same input; the turret follows the slower reticle.
+    focusBlend = THREE.MathUtils.damp(focusBlend, inp.zoomHold ? 1 : 0, 8, dt);
+    const aimScale = THREE.MathUtils.lerp(1, FOCUS_AIM_SCALE, focusBlend);
+
     // Soft lead: free within ±LEAD of the barrel; held turn slides the window
     // at traverse speed as the gun chases the reticle.
-    lookYaw = wrapYaw(lookYaw - THREE.MathUtils.clamp(inp.aimX, -Math.PI, Math.PI));
-    lookPitch = THREE.MathUtils.clamp(lookPitch - inp.aimY, -0.75, THREE.MathUtils.degToRad(45));
+    lookYaw = wrapYaw(lookYaw - THREE.MathUtils.clamp(inp.aimX * aimScale, -Math.PI, Math.PI));
+    lookPitch = THREE.MathUtils.clamp(lookPitch - inp.aimY * aimScale, -0.75, THREE.MathUtils.degToRad(45));
     const gunYaw = turretAimYaw();
     if (gunYaw != null) {
       lookYaw = gunYaw + THREE.MathUtils.clamp(wrapYaw(lookYaw - gunYaw), -TURRET_CAM_LEAD, TURRET_CAM_LEAD);
@@ -697,9 +805,6 @@ async function main() {
 
     tankCam.update(dt, camState(turretTurn));
 
-    // Focus (hold F, or gamepad L2): zoom the chase cam. Does not take over
-    // drive, turret, or guns — those still read the same input.
-    focusBlend = THREE.MathUtils.damp(focusBlend, inp.zoomHold ? 1 : 0, 8, dt);
     if (focusBlend > 0.001) {
       camera.fov = THREE.MathUtils.lerp(camera.fov, FOCUS_FOV, focusBlend);
       camera.updateProjectionMatrix();
@@ -743,6 +848,7 @@ async function main() {
       }
     }
     hud.setNitro(tank.nitroCharge, tank.nitroActive);
+    hud.setWeapon(MAIN_GUNS[mainGun].label, MAIN_GUNS[mainGun].id);
     hud.setReload(tank.alive ? tank.reload : 0, RELOAD);
     hud.setOverheat(tank.mgHeat, tank.mgLock, MG_HEAT_TIME, tank.mgFiring);
     const gadgetCd = activeGadget === 'smoke' ? tank.smokeCd
@@ -975,6 +1081,8 @@ async function main() {
     }
   }
 
+  let playerMgLocked = false;
+
   function combatTick(dt, inp, paused, versus, flying) {
     if (!menuPaused) updateCamera(dt, inp);
     else camera.getWorldDirection(viewDir);
@@ -984,15 +1092,20 @@ async function main() {
     if (tank.repairDone) {
       sfx.repairStop();
       sfx.repairComplete();
+      input.rumble(0.12, 0.38, 120);
     }
     tank.repairDone = false;
     tank.repairCancelled = false;
-    if (tank.reloadDone && tank.alive) sfx.reload();
+    if (tank.reloadDone && tank.alive) {
+      sfx.reload();
+      input.rumble(0.04, 0.32, 50);
+    }
     tank.reloadDone = false;
     const m = tank.muzzle();
     castFrom(m.pos, m.dir, 1200, gunPoint);
 
-    if (inp.fire && tank.alive && !flying) {
+    const useMg = MAIN_GUNS[mainGun].id === 'mg';
+    if (!useMg && inp.fire && tank.alive && !flying) {
       const aimed = versus ? nearestLivingFoe() : null;
       const tp = aimed ? aimed.tank.position : gunPoint;
       const p = tank.position;
@@ -1002,7 +1115,7 @@ async function main() {
         fx.muzzleFlash(shot.pos, shot.dir);
         tankCam.kick(0.5, RELOAD);
         sfx.fire();
-        input.rumble(1.0, 0.8, 220);
+        input.rumble(1, 0.92, 340);
         if (versus) for (const f of foes) f.ai.hearShot(shot.pos);
       }
     }
@@ -1042,7 +1155,7 @@ async function main() {
       if (hostileMgDist == null || d < hostileMgDist) hostileMgDist = d;
     };
     const mgDt = paused ? 0 : dt;
-    const mgFire = tank.tickMg(mgDt, !paused && inp.mgFire && playerPose.alive && !flying);
+    const mgFire = tank.tickMg(mgDt, !paused && useMg && inp.fire && playerPose.alive && !flying);
     for (const { foe, pose } of foeGunners) {
       const want = versus && !paused && pose.alive && foe.ai.wantsMg;
       const on = foe.tank.tickMg(versus ? mgDt : 0, want);
@@ -1063,9 +1176,12 @@ async function main() {
     }
     sfx.setMgFire(mgFire);
     sfx.setHostileMg(hostileMgDist);
+    const mgLocked = tank.mgLock > 0.05;
+    if (mgLocked && !playerMgLocked) input.rumble(0.72, 0.4, 280);
+    playerMgLocked = mgLocked;
     if (mgFire) {
       fx.setMgFlash(playerPose.mgMuzzle(), playerPose.body, 'player');
-      input.rumble(0.12, 0.35, 50);
+      input.rumble(0.18, 0.53, 50);
     } else {
       fx.setMgFlash(null, null, 'player');
     }
@@ -1124,7 +1240,11 @@ async function main() {
     updateHud(inp);
     const freezeDt = menuPaused ? 0 : dt;
     hud.update(freezeDt, camera);
-    post.render(freezeDt);
+    let bright = fx.emissiveHot() || tank.emissiveHot();
+    if (!bright) {
+      for (const f of foes) if (f.tank.emissiveHot()) { bright = true; break; }
+    }
+    post.render(freezeDt, bright);
   }
 
   function frame(now) {
@@ -1132,19 +1252,14 @@ async function main() {
     last = now;
     input.setEnabled(!visuals.open && !menuPaused);
     const inp = input.read(dt);
+    if (radial.isOpen) radial.pointer(inp.mouseX || 0, inp.mouseY || 0);
+    radial.update(dt);
+    applyGamepad(inp);
     if (radial.isOpen) {
-      radial.pointer(inp.mouseX || 0, inp.mouseY || 0);
       inp.aimX = 0;
       inp.aimY = 0;
       inp.fire = false;
-      inp.mgFire = false;
       inp.zoom = 0;
-    }
-    radial.update(dt);
-    if (menuPaused) {
-      if (inp.padPressed.length) setMenuPaused(false);
-    } else if (inp.padPressed.includes(9) && !fly.enabled) {
-      tank.reset(heightAt); snapCam();
     }
 
     const versus = !game.solo;
