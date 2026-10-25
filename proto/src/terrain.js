@@ -615,8 +615,10 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   const waterNormals = await loader.loadAsync('./textures/waternormals.jpg');
   waterNormals.wrapS = waterNormals.wrapT = THREE.RepeatWrapping;
   waterNormals.anisotropy = 8;
+  // ~14 m quads — enough for the long swell in waves.js without a heavy grid.
+  const WATER_SEGS = 160;
   const water = new WaterMesh(
-    new THREE.PlaneGeometry(SIZE * 6, SIZE * 6),
+    new THREE.PlaneGeometry(SIZE * 6, SIZE * 6, WATER_SEGS, WATER_SEGS),
     {
       waterNormals,
       sunDirection: (sunDir || new THREE.Vector3(0.70707, 0.70707, 0)).clone().normalize(),

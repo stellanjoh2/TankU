@@ -10,11 +10,11 @@ const CONTACT_CAP = 64; // enough for two Shermans' road wheels
 function skipObject(o) {
   if (!o.visible && o.name !== 'FluffyGrass') return true;
   if (o.isLine || o.isLineSegments || o.isPoints || o.isSprite) return true;
-  if (o.isLensflare || o.type === 'Lensflare') return true;
+  if (o.isLensflare || o.type === 'Lensflare' || o.isLensflareMesh) return true;
   // Walk parents for named skips (grass / sky / fx)
   for (let p = o; p; p = p.parent) {
     const n = p.name || '';
-    if (n === 'FluffyGrass' || n === 'SkyDome' || n === 'DebugOverlay') return true;
+    if (n === 'FluffyGrass' || n === 'SkyDome' || n === 'DebugOverlay' || n === 'SunLensFlare') return true;
   }
   return false;
 }

@@ -7,6 +7,7 @@ import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader.js';
 import { LightProbeGenerator } from 'three/examples/jsm/lights/LightProbeGenerator.js';
 import { SkyMesh } from 'three/examples/jsm/objects/SkyMesh.js';
 import { createPost } from './post.js';
+import { createSunLensFlare } from './lensFlare.js';
 import { buildTerrain, heightAt, isGrassable, PLAYER_SPAWN, BRIDGE, ENEMY_SPAWN, ENEMY_SPAWN_BASE, WATER_Y, shoreSigned } from './terrain.js';
 import { buildProps } from './props.js';
 import { buildAirfield } from './airfield.js';
@@ -88,7 +89,6 @@ async function main() {
   await RAPIER.init();
 
   // ---------------------------------------------------------------- renderer / scene
-  // TODO: LensflareMesh once post+shaders are ported.
   const renderer = new WebGPURenderer({ antialias: false, powerPreference: 'high-performance' });
   await renderer.init();
   if (!renderer.backend.isWebGPUBackend) {
@@ -160,11 +160,13 @@ async function main() {
   const clouds = await createCloudShadows([[sun, 1], [hemi, 0.5], [ambient, 0.5]], sky);
 
   const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 2000);
-  const post = createPost(renderer, scene, camera);
+  scene.add(camera); // so camera-parented overlays (lens flare) render
+  const post = await createPost(renderer, scene, camera);
 
   // ---------------------------------------------------------------- world
   const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
   world.timestep = FIXED_DT;
+  const lensFlare = await createSunLensFlare({ camera, RAPIER, world, sunDir });
   const terrain = await buildTerrain(RAPIER, world, scene, { sunDir });
   buildBgIsland(scene, terrain);
   buildProps(RAPIER, world, scene);
@@ -393,7 +395,7 @@ async function main() {
 
   patchShadowTint(scene);
   const visuals = createVisualsEditor({
-    renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe, terrain, grass, vegetation, barrels, trucks, post, shadowTint, fx, clouds,
+    renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe, terrain, grass, vegetation, barrels, trucks, post, shadowTint, fx, clouds, lensFlare,
     getEnvIntensity: () => scene.environmentIntensity,
     setEnvIntensity: (v) => { scene.environmentIntensity = v; },
     tanks: [tank, ...foes.map((f) => f.tank)],
@@ -833,6 +835,7 @@ async function main() {
     sun.target.updateMatrixWorld();
     terrain.water.sunDirection.value.copy(sunDir);
     terrain.water.sunColor.value.copy(sun.color);
+    terrain.water.waveTime.value = elapsed;
   }
 
   // ---------------------------------------------------------------- reticle + start overlay
@@ -885,6 +888,7 @@ async function main() {
       const ready = Math.max(0, Math.min(1, 1 - tank.reload / RELOAD));
       reloadArc.style.strokeDasharray = `${ready} 1`;
     }
+    post.setHurt(tank.alive ? tank.hp / tank.maxHp : 0);
     hud.setNitro(tank.nitroCharge, tank.nitroActive);
     hud.setWeapon(MAIN_GUNS[mainGun].label, gunId);
     hud.setReload(tank.alive ? tank.reload : 0, RELOAD);
@@ -1104,6 +1108,7 @@ async function main() {
       patrolBoat.update(dt, {
         player: tank,
         fx,
+        t: elapsed,
         onContact: versus ? (pos) => {
           for (const f of foes) f.ai.alert(pos.x, pos.z);
         } : null,
@@ -1294,11 +1299,12 @@ async function main() {
     updateHud(inp);
     const freezeDt = menuPaused ? 0 : dt;
     hud.update(freezeDt, camera);
+    lensFlare.update(freezeDt || 1 / 60);
     let bright = fx.emissiveHot() || tank.emissiveHot();
     if (!bright) {
       for (const f of foes) if (f.tank.emissiveHot()) { bright = true; break; }
     }
-    post.render(freezeDt, bright);
+    post.render(freezeDt, bright, sunDir);
   }
 
   function frame(now) {

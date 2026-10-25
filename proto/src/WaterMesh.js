@@ -1,6 +1,7 @@
 // Local copy of three/examples/jsm/objects/WaterMesh.js with a `timeScale` uniform
 // (the stock version drives the ripples off raw `time` with no speed control)
-// plus screen-space depth foam / shallow tint where the surface meets geometry.
+// plus screen-space depth foam / shallow tint where the surface meets geometry,
+// plus subtle vertex swell (same sines as waves.js — drive `waveTime` from game elapsed).
 import {
 	Color,
 	Mesh,
@@ -9,10 +10,13 @@ import {
 } from 'three/webgpu';
 
 import {
-	Fn, add, cameraPosition, div, normalize, positionWorld, positionView, sub, time, texture,
-	vec2, vec3, max, dot, reflect, pow, length, float, uniform, reflector, mul, mix,
+	Fn, add, cameraPosition, div, normalize, positionWorld, positionView, positionLocal, sub, time, texture,
+	vec2, vec3, vec4, max, dot, reflect, pow, length, float, uniform, reflector, mul, mix, sin,
 	viewportDepthTexture, perspectiveDepthToViewZ, cameraNear, cameraFar, smoothstep,
+	modelWorldMatrix, modelWorldMatrixInverse,
 } from 'three/tsl';
+
+import { WAVE } from './waves.js';
 
 class WaterMesh extends Mesh {
 
@@ -30,6 +34,7 @@ class WaterMesh extends Mesh {
 		this.alpha = uniform( options.alpha !== undefined ? options.alpha : 1.0 );
 		this.size = uniform( options.size !== undefined ? options.size : 1.0 );
 		this.timeScale = uniform( options.timeScale !== undefined ? options.timeScale : 1.0 );
+		this.waveTime = uniform( 0.0 );
 		this.sunColor = uniform( new Color( options.sunColor !== undefined ? options.sunColor : 0xffffff ) );
 		this.sunDirection = uniform( options.sunDirection !== undefined ? options.sunDirection : new Vector3( 0.70707, 0.70707, 0.0 ) );
 		this.waterColor = uniform( new Color( options.waterColor !== undefined ? options.waterColor : 0x7f7f7f ) );
@@ -41,6 +46,17 @@ class WaterMesh extends Mesh {
 		this.foamDepth = uniform( options.foamDepth !== undefined ? options.foamDepth : 0.45 );
 		this.foamIntensity = uniform( options.foamIntensity !== undefined ? options.foamIntensity : 0.65 );
 		this.shoreOpacity = uniform( options.shoreOpacity !== undefined ? options.shoreOpacity : 0.55 );
+
+		// Vertex swell from flat local → world Y (must use raw local, not positionWorld).
+		const worldPos = modelWorldMatrix.mul( vec4( positionLocal, 1.0 ) ).xyz;
+		let swell = float( 0 );
+		for ( const c of WAVE ) {
+			swell = swell.add(
+				sin( worldPos.x.mul( c.ax ).add( worldPos.z.mul( c.az ) ).add( this.waveTime.mul( c.w ) ) ).mul( c.amp )
+			);
+		}
+		const displaced = worldPos.add( vec3( 0, swell, 0 ) );
+		material.positionNode = modelWorldMatrixInverse.mul( vec4( displaced, 1.0 ) ).xyz;
 
 		const getNoise = Fn( ( [ uv ] ) => {
 

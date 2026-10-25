@@ -62,6 +62,13 @@ export const VISUAL_DEFAULTS = {
   fisheye: 0.05,
   grain: 0.04,
   aberration: 0,
+  // Lens flare (PlayCanvas-style sun look) — same knobs as their CameraFrame example
+  flareEnabled: true,
+  flareIntensity: 1.0,
+  flareScale: 1,
+  flareEdgeFade: 0.2,
+  flareAllowOffScreen: true,
+  flareOcclusionFade: 0.15,
   shadowIntensity: 0.94,
   shadowColor: '#417676',
 };

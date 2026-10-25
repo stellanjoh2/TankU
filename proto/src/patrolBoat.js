@@ -2,6 +2,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { SIZE, WATER_Y, PORT, shoreSigned, onBridge } from './terrain.js';
+import { waveHeight, wavePose } from './waves.js';
 import { lodDist, pickLod } from './lod.js';
 import { applyBurntMetal } from './burntMetal.js';
 
@@ -317,6 +318,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     burned: false,
     hitFlashFrames: 0,
     thinkT: 0,
+    waveT: 0,
     stuckT: 0,
     lastX: spawn.x,
     lastZ: spawn.z,
@@ -336,12 +338,14 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     }
   }
 
-  function poseBody() {
-    _e.set(0, boat.yaw, 0, 'YXZ');
+  function poseBody(t = 0) {
+    const w = wavePose(boat.x, boat.z, t, boat.yaw, 1.5);
+    const y = WATER_Y + w.h;
+    _e.set(w.eulerX, boat.yaw, w.eulerZ, 'YXZ');
     _q.setFromEuler(_e);
-    body.setNextKinematicTranslation({ x: boat.x, y: WATER_Y, z: boat.z });
+    body.setNextKinematicTranslation({ x: boat.x, y, z: boat.z });
     body.setNextKinematicRotation(_q);
-    root.position.set(boat.x, WATER_Y, boat.z);
+    root.position.set(boat.x, y, boat.z);
     root.quaternion.copy(_q);
   }
 
@@ -416,7 +420,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     const e = player.body.translation();
     const dx = e.x - boat.x, dz = e.z - boat.z;
     if (Math.hypot(dx, dz) > SIGHT) return false;
-    const ax = boat.x, ay = WATER_Y + EYE_H, az = boat.z;
+    const ax = boat.x, ay = WATER_Y + waveHeight(boat.x, boat.z, boat.waveT) + EYE_H, az = boat.z;
     const hull = clear(ax, ay, az, e.x, e.y + TANK_HULL_H, e.z, player);
     return hull || clear(ax, ay, az, e.x, e.y + TANK_EYE_H, e.z, player);
   }
@@ -650,7 +654,8 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
       const u = (boat.sinkT - (SINK_GONE - SINK_SLIDE)) / SINK_SLIDE;
       drop = SINK_DEPTH + (SINK_FLOOR - SINK_DEPTH) * u * u;
     }
-    const y = WATER_Y - drop;
+    const swell = waveHeight(boat.x, boat.z, boat.waveT) * (1 - ease);
+    const y = WATER_Y + swell - drop;
     _e.set(ease * 0.18, boat.yaw, boat.sinkSign * ease * 0.85, 'YXZ');
     _q.setFromEuler(_e);
     body.setNextKinematicTranslation({ x: boat.x, y, z: boat.z });
@@ -752,7 +757,8 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
       const { pos, dir } = mgMuzzle();
       return { pos: pos.clone(), dir: sprayDir(dir).clone() };
     },
-    update(dt, { player, fx } = {}) {
+    update(dt, { player, fx, t = 0 } = {}) {
+      boat.waveT = t;
       tickHitFlash();
       if (!boat.alive) {
         boat.firing = false;
@@ -795,7 +801,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
         boat.lastZ = boat.z;
         boat.stuckT = 0;
       }
-      poseBody();
+      poseBody(t);
       aimTurret(dt, player);
       triggerMg(dt, player);
       updateWake();

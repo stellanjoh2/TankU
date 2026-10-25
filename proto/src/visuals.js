@@ -95,6 +95,12 @@ function hydrate(json) {
     fisheye: json.fisheye ?? VISUAL_DEFAULTS.fisheye,
     grain: json.grain,
     aberration: json.aberration,
+    flareEnabled: json.flareEnabled ?? VISUAL_DEFAULTS.flareEnabled,
+    flareIntensity: json.flareIntensity ?? VISUAL_DEFAULTS.flareIntensity,
+    flareScale: json.flareScale ?? VISUAL_DEFAULTS.flareScale,
+    flareEdgeFade: json.flareEdgeFade ?? VISUAL_DEFAULTS.flareEdgeFade,
+    flareAllowOffScreen: json.flareAllowOffScreen ?? VISUAL_DEFAULTS.flareAllowOffScreen,
+    flareOcclusionFade: json.flareOcclusionFade ?? VISUAL_DEFAULTS.flareOcclusionFade,
     shadowIntensity: json.shadowIntensity ?? 1,
     shadowColor: col(json.shadowColor ?? '#000000'),
   };
@@ -106,7 +112,7 @@ function hydrate(json) {
 export function createVisualsEditor(ctx) {
   const {
     renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe,
-    terrain, grass, vegetation, barrels, trucks, post, shadowTint, fx, clouds,
+    terrain, grass, vegetation, barrels, trucks, post, shadowTint, fx, clouds, lensFlare,
     getEnvIntensity, setEnvIntensity,
     tanks = [],
     initial = VISUAL_DEFAULTS,
@@ -223,6 +229,12 @@ export function createVisualsEditor(ctx) {
       fisheye: grade.fisheye.value,
       grain: finish.grain.value,
       aberration: finish.aberration.value,
+      flareEnabled: lensFlare?.enabled ?? true,
+      flareIntensity: lensFlare?.intensity ?? VISUAL_DEFAULTS.flareIntensity,
+      flareScale: lensFlare?.scale ?? VISUAL_DEFAULTS.flareScale,
+      flareEdgeFade: lensFlare?.edgeFade ?? VISUAL_DEFAULTS.flareEdgeFade,
+      flareAllowOffScreen: lensFlare?.allowOffScreen ?? VISUAL_DEFAULTS.flareAllowOffScreen,
+      flareOcclusionFade: lensFlare?.occlusionFade ?? VISUAL_DEFAULTS.flareOcclusionFade,
       shadowIntensity: sun.shadow.intensity,
       shadowColor: shadowTint.value.clone(),
     };
@@ -275,6 +287,14 @@ export function createVisualsEditor(ctx) {
     grade.fisheye.value = s.fisheye ?? VISUAL_DEFAULTS.fisheye;
     finish.grain.value = s.grain;
     finish.aberration.value = s.aberration;
+    if (lensFlare) {
+      lensFlare.enabled = s.flareEnabled ?? true;
+      lensFlare.intensity = s.flareIntensity ?? VISUAL_DEFAULTS.flareIntensity;
+      lensFlare.scale = s.flareScale ?? VISUAL_DEFAULTS.flareScale;
+      lensFlare.edgeFade = s.flareEdgeFade ?? VISUAL_DEFAULTS.flareEdgeFade;
+      lensFlare.allowOffScreen = s.flareAllowOffScreen ?? VISUAL_DEFAULTS.flareAllowOffScreen;
+      lensFlare.occlusionFade = s.flareOcclusionFade ?? VISUAL_DEFAULTS.flareOcclusionFade;
+    }
     sun.shadow.intensity = s.shadowIntensity ?? 1;
     if (s.shadowColor) shadowTint.value.copy(s.shadowColor);
   }
@@ -344,6 +364,12 @@ export function createVisualsEditor(ctx) {
       fisheye: s.fisheye,
       grain: s.grain,
       aberration: s.aberration,
+      flareEnabled: s.flareEnabled,
+      flareIntensity: s.flareIntensity,
+      flareScale: s.flareScale,
+      flareEdgeFade: s.flareEdgeFade,
+      flareAllowOffScreen: s.flareAllowOffScreen,
+      flareOcclusionFade: s.flareOcclusionFade,
       shadowIntensity: s.shadowIntensity,
       shadowColor: c(s.shadowColor),
     };
@@ -679,6 +705,19 @@ export function createVisualsEditor(ctx) {
     addSlider(s, 'Grain', 0, 0.2, 0.005, () => finish.grain.value, (v) => { finish.grain.value = v; });
     addSlider(s, 'Aberration', 0, 0.008, 0.0001, () => finish.aberration.value, (v) => {
       finish.aberration.value = v;
+    });
+  }
+
+  // Lens flare (sun) — PlayCanvas CameraFrame knobs
+  if (lensFlare) {
+    const s = addSection('Lens flare');
+    addToggle(s, 'Enabled', () => lensFlare.enabled, (v) => { lensFlare.enabled = v; });
+    addSlider(s, 'Intensity', 0, 2, 0.01, () => lensFlare.intensity, (v) => { lensFlare.intensity = v; });
+    addSlider(s, 'Scale', 0.1, 3, 0.05, () => lensFlare.scale, (v) => { lensFlare.scale = v; });
+    addSlider(s, 'Edge fade', 0, 1, 0.01, () => lensFlare.edgeFade, (v) => { lensFlare.edgeFade = v; });
+    addToggle(s, 'Allow off-screen', () => lensFlare.allowOffScreen, (v) => { lensFlare.allowOffScreen = v; });
+    addSlider(s, 'Occlusion fade', 0, 1, 0.01, () => lensFlare.occlusionFade, (v) => {
+      lensFlare.occlusionFade = v;
     });
   }
 

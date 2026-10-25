@@ -2,19 +2,14 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { PORT, WATER_Y } from './terrain.js';
+import { wavePose } from './waves.js';
 
 // Model length ≈ 9.1 m → scale 10 ≈ 91 m battleship silhouette.
 const SCALE = 10;
 // Local Y of the dark hull stripe (top of red BOTTOM / waterline paint).
 const WATERLINE_Y = 0.16;
-
-// Slow swell — barely there at shore distance, reads as mass rather than bobbing.
-const ROLL_AMP = 0.01;    // ~0.6°
-const PITCH_AMP = 0.006;  // ~0.35°
-const BOB_AMP = 0.05;     // 5 cm
-const ROLL_W = 0.42;
-const PITCH_W = 0.55;
-const BOB_W = 0.48;
+// Long baseline so a ~90 m hull follows the swell, not every ripple.
+const WAVE_SAMPLE = 18;
 
 // Length is along model +X; ±π/2 lays the keel north–south (side faces land).
 const PLACEMENTS = [
@@ -85,7 +80,6 @@ export async function buildShip(scene) {
       mesh: ship,
       baseY: y,
       baseYaw: p.yaw,
-      phase: i * 2.7 + 0.8,
       x: p.x,
       z: p.z,
       turrets: collectTurrets(ship),
@@ -107,11 +101,9 @@ export async function buildShip(scene) {
 
   function update(t) {
     for (const s of ships) {
-      const ph = s.phase;
-      s.mesh.rotation.y = s.baseYaw;
-      s.mesh.rotation.x = Math.sin(t * PITCH_W + ph) * PITCH_AMP;
-      s.mesh.rotation.z = Math.sin(t * ROLL_W + ph * 1.7) * ROLL_AMP;
-      s.mesh.position.y = s.baseY + Math.sin(t * BOB_W + ph * 0.9) * BOB_AMP;
+      const w = wavePose(s.x, s.z, t, s.baseYaw, WAVE_SAMPLE);
+      s.mesh.position.y = s.baseY + w.h;
+      s.mesh.rotation.set(w.eulerX, s.baseYaw, w.eulerZ, 'YXZ');
     }
   }
 

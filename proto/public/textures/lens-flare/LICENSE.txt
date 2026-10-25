@@ -1,0 +1,3 @@
+Lens flare shape textures from PlayCanvas engine (MIT License)
+https://github.com/playcanvas/engine/tree/main/examples/assets/textures/lens-flare
+Generated for PlayCanvas PR #9734; released under the engine MIT license.
