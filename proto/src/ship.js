@@ -1,4 +1,4 @@
-// Background warship props: static GLBs offshore, broadside to land.
+// Offshore cruisers. The four main-battery turrets are separate nodes so they can train.
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { PORT, WATER_Y } from './terrain.js';
@@ -11,14 +11,14 @@ const WATERLINE_Y = 0.16;
 // Length is along model +X; ±π/2 lays the keel north–south (side faces land).
 const PLACEMENTS = [
   {
-    // East bay — ~75 m off the quay.
-    x: PORT.x1 + 75,
+    // East bay — ~100 m off the quay.
+    x: PORT.x1 + 100,
     z: (PORT.z0 + PORT.z1) * 0.5,
     yaw: Math.PI / 2,
   },
   {
-    // West coast — ~75 m offshore opposite the bay.
-    x: -187,
+    // West coast — ~100 m offshore opposite the bay.
+    x: -212,
     z: 8,
     yaw: -Math.PI / 2,
   },
@@ -51,7 +51,7 @@ function prepMaterials(root) {
 }
 
 /**
- * @returns {Promise<{ root: THREE.Group }>}
+ * @returns {Promise<{ root: THREE.Group, ships: object[], wakeTurrets: () => void }>}
  */
 export async function buildShip(scene) {
   const gltf = await new GLTFLoader().loadAsync('./models/ship.glb');
@@ -62,6 +62,7 @@ export async function buildShip(scene) {
   root.name = 'Ships';
   const y = WATER_Y - WATERLINE_Y * SCALE;
 
+  const ships = [];
   for (let i = 0; i < PLACEMENTS.length; i++) {
     const p = PLACEMENTS[i];
     const ship = i === 0 ? proto : proto.clone(true);
@@ -70,8 +71,40 @@ export async function buildShip(scene) {
     ship.rotation.y = p.yaw;
     ship.position.set(p.x, y, p.z);
     root.add(ship);
+    ships.push({
+      name: ship.name,
+      x: p.x,
+      z: p.z,
+      turrets: collectTurrets(ship),
+    });
   }
 
   scene.add(root);
-  return { root };
+
+  /** Turrets are scenery until a barrage. Call after freezeStatic so they can yaw. */
+  function wakeTurrets() {
+    for (const s of ships) {
+      for (const t of s.turrets) {
+        t.pivot.matrixAutoUpdate = true;
+        for (const m of t.muzzles) m.matrixAutoUpdate = true;
+      }
+    }
+  }
+
+  return { root, ships, wakeTurrets };
+}
+
+/** Main-battery twins. Local +X is the bore; sign is which way the barrels point at rest.
+ *  Only pivots that own muzzle empties train. Static mounts are named Turret* too. */
+function collectTurrets(ship) {
+  const turrets = [];
+  ship.traverse((o) => {
+    if (!o.name.startsWith('Turret')) return;
+    const muzzles = o.children.filter((c) => c.name.startsWith('Muzzle'));
+    if (!muzzles.length) return;
+    const sign = muzzles[0].position.x >= 0 ? 1 : -1;
+    turrets.push({ pivot: o, muzzles, sign });
+  });
+  turrets.sort((a, b) => a.pivot.position.x - b.pivot.position.x);
+  return turrets;
 }

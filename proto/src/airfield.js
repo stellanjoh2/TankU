@@ -444,6 +444,15 @@ export function buildAirfield(RAPIER, world, scene) {
     }
   }
 
+  // One box over the slab field. Top is the concrete surface, so the tracks
+  // sit on the slabs instead of the terrain buried 6 cm under them.
+  const slabBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+  addCollider(
+    RAPIER, world, slabBody,
+    (x1 - x0) * 0.5, 0.2, (z1 - z0) * 0.5,
+    (x0 + x1) * 0.5, y0 + SLAB_T - 0.2, (z0 + z1) * 0.5,
+  );
+
   /** Wall / shed footprints for AI — door mouth left open. */
   function navObstacles() {
     const hx = HANGAR.x;

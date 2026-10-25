@@ -7,7 +7,7 @@ import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader.js';
 import { LightProbeGenerator } from 'three/examples/jsm/lights/LightProbeGenerator.js';
 import { SkyMesh } from 'three/examples/jsm/objects/SkyMesh.js';
 import { createPost } from './post.js';
-import { buildTerrain, heightAt, isGrassable, PLAYER_SPAWN, BRIDGE, ENEMY_SPAWN, ENEMY_SPAWN_BASE } from './terrain.js';
+import { buildTerrain, heightAt, isGrassable, PLAYER_SPAWN, BRIDGE, ENEMY_SPAWN, ENEMY_SPAWN_BASE, WATER_Y } from './terrain.js';
 import { buildProps } from './props.js';
 import { buildAirfield } from './airfield.js';
 import { buildPort } from './port.js';
@@ -27,8 +27,14 @@ import { NavGrid } from './navgrid.js';
 import { TankAI, pickSpawn } from './ai.js';
 import { createMatch } from './match.js';
 import { createHud } from './hud.js';
+import { createRadialMenu } from './radialMenu.js';
+import cloudIcon from '@phosphor-icons/core/assets/fill/cloud-fill.svg?raw';
+import planeIcon from '@phosphor-icons/core/assets/fill/airplane-tilt-fill.svg?raw';
+import wrenchIcon from '@phosphor-icons/core/assets/fill/wrench-fill.svg?raw';
+import boatIcon from '@phosphor-icons/core/assets/fill/boat-fill.svg?raw';
 import { createSmokeField } from './smoke.js';
 import { createAirSupport } from './airSupport.js';
+import { createShipSupport } from './shipSupport.js';
 import { createDebug } from './debug.js';
 import { FreeFlight } from './freeflight.js';
 import { buildPlanes } from './planes.js';
@@ -178,6 +184,7 @@ async function main() {
     buildPatrolBoat(scene, { RAPIER, world }),
   ]);
   freezeStatic(ship.root);
+  ship.wakeTurrets();
   freezeStatic(bridge.root);
   await buildPebbles(scene, vegetation.pebbleAnchors, terrain.groundSets, terrain.palette.concrete);
 
@@ -301,14 +308,28 @@ async function main() {
     planes,
     fx,
     sfx,
+    getTarget: () => reticlePoint(),
+    getOwner: () => tank.body,
+    scene,
+    heightAt: (x, z) => nav.sampleHeight(x, z),
+  });
+
+  const shipSupport = createShipSupport({
+    ships: ship.ships,
+    fx,
+    sfx,
+    getSpot: () => reticlePoint(),
     getTarget: () => {
       if (game.solo) return null;
       const f = nearestLivingFoe();
       if (!f) return null;
-      const p = f.tank.position;
-      return { x: p.x, z: p.z };
+      const p = f.tank.body.translation();
+      return { x: p.x, y: p.y + 1.1, z: p.z };
     },
-    getOwner: () => tank.body,
+    getListener: () => tank.position,
+    heightAt: (x, z) => nav.sampleHeight(x, z),
+    distGain,
+    scene,
   });
 
   const pathLine = new THREE.Line(
@@ -392,6 +413,9 @@ async function main() {
   // (TankCamera turretFollowWeight). Past the lead, the window slides as the
   // turret catches the reticle — never a hard lock, never free 360 freelook.
   const TURRET_CAM_LEAD = THREE.MathUtils.degToRad(55);
+  // v1 Focus: chase cam sits near 62°. 28° is about 2× magnification.
+  const FOCUS_FOV = 28;
+  let focusBlend = 0;
   let lookYaw = spawn.yaw;
   let lookPitch = -0.08;
   const viewDir = new THREE.Vector3();
@@ -461,6 +485,24 @@ async function main() {
     updatePathLine();
   };
 
+  // Wheel entries. Add or remove objects — slices, icons, and hit areas rebuild.
+  // svg is a Phosphor fill icon (solid).
+  let activeGadget = 'smoke';
+  const radial = createRadialMenu([
+    { id: 'smoke', label: 'SMOKE', svg: cloudIcon },
+    { id: 'air', label: 'AIR SUPPORT', svg: planeIcon },
+    { id: 'repair', label: 'REPAIR', svg: wrenchIcon },
+    { id: 'ship', label: 'SHIP SUPPORT', svg: boatIcon },
+  ], {
+    onSelect(item) {
+      if (item.id === 'smoke') useSmoke();
+      else if (item.id === 'air') useAir();
+      else if (item.id === 'repair') useRepair();
+      else if (item.id === 'ship') useShip();
+    },
+  });
+  radial.setActive(activeGadget);
+
   // ---------------------------------------------------------------- pause (one overlay: Esc / unlock)
   // True pause whenever the menu is up — sim, camera, FX time, and audio all freeze.
   let menuPaused = true;
@@ -472,6 +514,7 @@ async function main() {
 
   function setMenuPaused(on) {
     on = !!on;
+    if (on && radial.isOpen) radial.close();
     if (menuPaused === on) return;
     menuPaused = on;
     overlayEl.classList.toggle('hidden', !on || visuals.open);
@@ -542,8 +585,8 @@ async function main() {
     }
   }
 
-  // Gadget hotkeys: 1 = smoke, 2 = air support, 3 = repair (select + fire)
-  let activeGadget = 'smoke';
+  // Gadget hotkeys: 1 = smoke, 2 = air support, 3 = repair, 4 = ship support.
+  // The radial menu equips one of these; the number keys still fire them.
 
   function useSmoke() {
     activeGadget = 'smoke';
@@ -561,6 +604,12 @@ async function main() {
     if (airSupport.call()) input.rumble(0.15, 0.35, 120);
   }
 
+  function useShip() {
+    activeGadget = 'ship';
+    if (fly.enabled || !tank.alive) return;
+    if (shipSupport.call()) input.rumble(0.2, 0.4, 160);
+  }
+
   function useRepair() {
     activeGadget = 'repair';
     if (fly.enabled || !tank.alive) return;
@@ -569,9 +618,14 @@ async function main() {
     input.rumble(0.16, 0.28, 90);
   }
 
+  input.onRelease = (code) => {
+    if (code === 'KeyR' && radial.isOpen) radial.release();
+  };
+
   input.onPress = (code) => {
     if (code === 'Escape') {
       if (visuals.open) { visuals.setOpen(false); return; }
+      if (radial.isOpen) { radial.close(); return; }
       if (menuPaused) {
         if (!suppressEscResume) resumeFromMenu();
         return;
@@ -581,17 +635,40 @@ async function main() {
       return;
     }
     if (menuPaused) return;
-    if (code === 'KeyR' && !fly.enabled) { tank.reset(heightAt); snapCam(); }
-    if (code === 'KeyC' && !fly.enabled) resetCameraDefaults();
+    if (code === 'KeyR') {
+      if (!visuals.open) radial.open();
+      return;
+    }
+    if (radial.isOpen) return;
+    if (code === 'KeyT' && !fly.enabled) { tank.reset(heightAt); snapCam(); }
+    if (code === 'KeyC') toggleFly();
     // Space: hop upright only when flipped (ignored while upright / in freefly)
     if (code === 'Space' && !fly.enabled) tank.unflipJump(heightAt);
     if (code === 'KeyV') visuals.toggle();
     if (code === 'F3' || code === 'Backquote') setDebug(!game.debug);
-    if (code === 'KeyF') toggleFly();
     if (code === 'Digit1' || code === 'Numpad1') useSmoke();
     if (code === 'Digit2' || code === 'Numpad2') useAir();
     if (code === 'Digit3' || code === 'Numpad3') useRepair();
+    if (code === 'Digit4' || code === 'Numpad4') useShip();
   };
+
+  /** Crosshair on the sea, or the first solid hit when that is closer. */
+  function reticlePoint() {
+    const origin = camera.position;
+    const dy = viewDir.y;
+    const solid = Math.hypot(aimPoint.x - origin.x, aimPoint.y - origin.y, aimPoint.z - origin.z);
+    if (dy < -1e-4) {
+      const t = (WATER_Y - origin.y) / dy;
+      if (t > 0.5 && t < solid - 0.05) {
+        return {
+          x: origin.x + viewDir.x * t,
+          y: WATER_Y,
+          z: origin.z + viewDir.z * t,
+        };
+      }
+    }
+    return { x: aimPoint.x, y: aimPoint.y, z: aimPoint.z };
+  }
 
   function castFrom(origin, dir, maxDist, out) {
     const hit = world.castRay(new RAPIER.Ray(origin, dir), maxDist, true, undefined, undefined, undefined, tank.body);
@@ -602,6 +679,7 @@ async function main() {
     if (fly.enabled) {
       fly.update(dt, inp);
       camera.getWorldDirection(viewDir);
+      focusBlend = 0;
       return;
     }
 
@@ -619,9 +697,11 @@ async function main() {
 
     tankCam.update(dt, camState(turretTurn));
 
-    // ADS: pull FOV in on top of speed zoom
-    if (inp.zoomHold) {
-      camera.fov = THREE.MathUtils.damp(camera.fov, 28, 8, dt);
+    // Focus (hold F, or gamepad L2): zoom the chase cam. Does not take over
+    // drive, turret, or guns — those still read the same input.
+    focusBlend = THREE.MathUtils.damp(focusBlend, inp.zoomHold ? 1 : 0, 8, dt);
+    if (focusBlend > 0.001) {
+      camera.fov = THREE.MathUtils.lerp(camera.fov, FOCUS_FOV, focusBlend);
       camera.updateProjectionMatrix();
     }
 
@@ -649,6 +729,9 @@ async function main() {
     if (fly.enabled) {
       gunMarker.style.display = 'none';
       $('crosshair').style.display = 'none';
+    } else if (radial.isOpen) {
+      gunMarker.style.display = 'none';
+      $('crosshair').style.display = '';
     } else {
       $('crosshair').style.display = '';
       projected.copy(gunPoint).project(camera);
@@ -662,12 +745,25 @@ async function main() {
     hud.setNitro(tank.nitroCharge, tank.nitroActive);
     hud.setReload(tank.alive ? tank.reload : 0, RELOAD);
     hud.setOverheat(tank.mgHeat, tank.mgLock, MG_HEAT_TIME, tank.mgFiring);
-    const gadgetCd = activeGadget === 'smoke' ? tank.smokeCd : activeGadget === 'air' ? airSupport.cd : 0;
+    const gadgetCd = activeGadget === 'smoke' ? tank.smokeCd
+      : activeGadget === 'air' ? airSupport.cd
+      : activeGadget === 'ship' ? shipSupport.cd
+      : 0;
     hud.setGadget(activeGadget, gadgetCd, activeGadget === 'repair' ? {
       repairing: tank.repairing,
       repairLeft: tank.repairT,
       charges: tank.repairs,
     } : null);
+    radial.setActive(activeGadget);
+    radial.setDetails({
+      smoke: { text: tank.smokeCd > 0.05 ? `${tank.smokeCd.toFixed(1)}s` : '', cooling: tank.smokeCd > 0.05 },
+      air: { text: airSupport.cd > 0.05 ? `${airSupport.cd.toFixed(1)}s` : '', cooling: airSupport.cd > 0.05 },
+      ship: { text: shipSupport.cd > 0.05 ? `${shipSupport.cd.toFixed(1)}s` : '', cooling: shipSupport.cd > 0.05 },
+      repair: {
+        text: tank.repairing ? `${tank.repairT.toFixed(1)}s` : `×${tank.repairs}`,
+        cooling: !tank.repairing && tank.repairs <= 0,
+      },
+    });
     hud.setRepair(tank.repairT, REPAIR_TIME);
     hud.setPickup(crates.timeToDrop());
     // HIT% = stress jitter + smoke (−10% when either tank is in a cloud)
@@ -992,6 +1088,7 @@ async function main() {
     if (!paused) {
       smoke.update(dt);
       airSupport.update(dt);
+      shipSupport.update(dt);
       fx.update(dt, (x, z) => nav.sampleHeight(x, z));
       barrels.update(dt, fx);
       crates.update(dt);
@@ -1035,6 +1132,15 @@ async function main() {
     last = now;
     input.setEnabled(!visuals.open && !menuPaused);
     const inp = input.read(dt);
+    if (radial.isOpen) {
+      radial.pointer(inp.mouseX || 0, inp.mouseY || 0);
+      inp.aimX = 0;
+      inp.aimY = 0;
+      inp.fire = false;
+      inp.mgFire = false;
+      inp.zoom = 0;
+    }
+    radial.update(dt);
     if (menuPaused) {
       if (inp.padPressed.length) setMenuPaused(false);
     } else if (inp.padPressed.includes(9) && !fly.enabled) {
@@ -1054,7 +1160,7 @@ async function main() {
   }
   requestAnimationFrame(frame);
   $('loading').remove();
-  window.__sherman = { renderer, tank, enemy, foes, ai, nav, game, match, input, fx, smoke, airSupport, tankCam, sfx, world, grass, vegetation, terrain, visuals, debug, fly, lightProbe, sky, planes, flag, barrels, crates, clouds, patrolBoat };
+  window.__sherman = { renderer, tank, enemy, foes, ai, nav, game, match, input, fx, smoke, airSupport, shipSupport, radial, tankCam, sfx, world, grass, vegetation, terrain, visuals, debug, fly, lightProbe, sky, planes, flag, barrels, crates, clouds, patrolBoat };
 }
 
 main().catch((e) => {

@@ -111,7 +111,7 @@ function orientAlong(mesh, tanX, tanY, tanZ, bank) {
  * @returns {Promise<{
  *   root: THREE.Group,
  *   update: (dt: number) => void,
- *   beginRaid: (tx: number, tz: number) => boolean,
+ *   beginRaid: (tx: number, tz: number, ty?: number) => boolean,
  *   isRaiding: boolean,
  *   firing: boolean,
  *   gunPose: (side: number) => { pos: THREE.Vector3, dir: THREE.Vector3 } | null,
@@ -208,7 +208,7 @@ export async function buildPlanes(scene) {
    * Bake a level circular pass. Closest point is over the aim; heading there
    * matches scout→target. Path never changes after this.
    */
-  function beginRaid(tx, tz) {
+  function beginRaid(tx, tz, ty) {
     if (raid) return false;
 
     const scout = planes[0];
@@ -256,7 +256,7 @@ export async function buildPlanes(scene) {
       omega,
       a0,
       aimX: tx,
-      aimY: 1.4,
+      aimY: Number.isFinite(ty) ? ty : 1.4,
       aimZ: tz,
       bank: BANK * dir,
     };

@@ -3,6 +3,7 @@ export const GADGETS = [
   { id: 'smoke', key: '1', label: 'SMOKE' },
   { id: 'air', key: '2', label: 'AIR SUPPORT' },
   { id: 'repair', key: '3', label: 'REPAIR' },
+  { id: 'ship', key: '4', label: 'SHIP SUPPORT' },
 ];
 
 export function createHud() {
@@ -139,9 +140,9 @@ export function createHud() {
       rows.pickup.querySelector('b').textContent = `${m}:${String(r).padStart(2, '0')}`;
     },
     /**
-     * Active gadget slot (1 smoke / 2 air / 3 repair).
+     * Active gadget slot (1 smoke / 2 air / 3 repair / 4 ship).
      * Repair shows charges left, or REPAIRING plus the channel timer.
-     * @param {'smoke'|'air'|'repair'} id
+     * @param {'smoke'|'air'|'repair'|'ship'} id
      * @param {number} [cd=0]
      * @param {{ repairing?: boolean, repairLeft?: number, charges?: number }|null} [info]
      */

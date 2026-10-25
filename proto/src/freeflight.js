@@ -1,4 +1,4 @@
-// Noclip freefly / photomode camera: WASD + mouse, Space/E up, Ctrl/Q/C down,
+// Noclip freefly / photomode camera: WASD + mouse, Space/E up, Ctrl/Q down,
 // Shift boost, wheel = speed. FOV + tilt (dutch roll) via the Game (V) menu.
 import * as THREE from 'three';
 

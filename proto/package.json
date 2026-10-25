@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.21.0",
+    "@phosphor-icons/core": "^2.1.1",
     "three": "^0.186.1"
   },
   "devDependencies": {

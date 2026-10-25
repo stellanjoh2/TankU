@@ -2,7 +2,7 @@
 // Glow sprites keep HDR in emissiveNode. Post blooms the whole frame plus that emissive buffer.
 import * as THREE from 'three/webgpu';
 import { float, smoothstep, texture, uniform, uv, vec4 } from 'three/tsl';
-import { heightAt as terrainHeightAt } from './terrain.js';
+import { heightAt as terrainHeightAt, WATER_Y } from './terrain.js';
 import { VISUAL_DEFAULTS } from './visualDefaults.js';
 import { decodeGif } from './gif.js';
 import {
@@ -94,6 +94,7 @@ function cardEdgeFade(margin) {
 }
 
 const GRAVITY = 9.81;
+const _waterUp = new THREE.Vector3(0, 1, 0);
 const IMPACT_IMPULSE = 2500;
 const BLAST_RADIUS = 7;
 const BLAST_IMPULSE = 9000;
@@ -696,6 +697,17 @@ export class Effects {
     d.x = dir.x; d.y = dir.y; d.z = dir.z;
     const ray = this._mgRay;
     const hit = this.world.castRayAndGetNormal(ray, 450, true, undefined, undefined, undefined, owner);
+    // Air rounds stop on the sea. Otherwise they pass through and hit the far shore.
+    if (opts.air && d.y < -1e-4) {
+      const tWater = (WATER_Y - o.y) / d.y;
+      const solid = hit ? hit.timeOfImpact : Infinity;
+      if (tWater > 0.5 && tWater < solid) {
+        const point = pos.clone().addScaledVector(dir, tWater);
+        this.waterSplash(point);
+        this.onMgDirtHit({ point, dir: dir.clone(), normal: _waterUp, air: true });
+        return { reach: tWater, body: null };
+      }
+    }
     if (!hit) return null;
     const point = pos.clone().addScaledVector(dir, hit.timeOfImpact);
     const normal = new THREE.Vector3(hit.normal.x, hit.normal.y, hit.normal.z);
@@ -748,6 +760,27 @@ export class Effects {
       air: true,
     });
     this._spawnMgTracer(pose.pos, dir, hit?.reach ?? null);
+  }
+
+  /** Short white burst where an air-raid round meets the sea. */
+  waterSplash(point) {
+    const foam = new THREE.Color(0.85, 0.92, 0.95);
+    const n = 4;
+    for (let i = 0; i < n; i++) {
+      this._sprite(
+        this.smokeTex,
+        foam,
+        point.clone().add(new THREE.Vector3((Math.random() - 0.5) * 0.35, 0.05, (Math.random() - 0.5) * 0.35)),
+        0.35 + Math.random() * 0.25,
+        0.28 + Math.random() * 0.16,
+        {
+          vel: new THREE.Vector3((Math.random() - 0.5) * 1.4, 2.2 + Math.random() * 2.4, (Math.random() - 0.5) * 1.4),
+          grow: 3.5,
+          opacity: 0.55,
+          drag: 2.2,
+        },
+      );
+    }
   }
 
   /**
@@ -1130,14 +1163,52 @@ export class Effects {
     this._flashLight(pos.clone().addScaledVector(d, 0.8), 45, { color: 0xffcc33, distance: 4 });
   }
 
-  /** `owner` is the firing tank's rigid body (its own hull is ignored by the shell). */
-  fire({ pos, vel, owner = this.exclude }) {
+  /** Cruiser broadside: a tank muzzle scaled up, plus a thick smoke plume downrange. */
+  navalMuzzle(pos, dir) {
+    const d = dir.clone();
+    if (d.lengthSq() < 1e-8) d.set(1, 0, 0);
+    else d.normalize();
+    const scale = 5.5;
+    this._spawnMainMuzzle(this.mainMuzzleFront, pos, d, false, scale);
+    this._spawnMainMuzzle(this.mainMuzzleSide, pos, d, true, scale);
+    this._flashLight(pos.clone().addScaledVector(d, 8), 220, { color: 0xffcc66, distance: 70 });
+    for (let i = 0; i < 12; i++) {
+      const along = 1.5 + Math.random() * 10;
+      const grey = 0.42 + Math.random() * 0.22;
+      const puff = pos.clone().addScaledVector(d, along);
+      puff.y += Math.random() * 2;
+      this._sprite(
+        this.smokeTex,
+        new THREE.Color(grey, grey * 0.94, grey * 0.86),
+        puff,
+        4 + Math.random() * 4,
+        2.4 + Math.random() * 1.6,
+        {
+          vel: d.clone().multiplyScalar(8 + Math.random() * 10).add(new THREE.Vector3(
+            (Math.random() - 0.5) * 4,
+            5 + Math.random() * 7,
+            (Math.random() - 0.5) * 4,
+          )),
+          grow: 12,
+          rise: 1.6,
+          opacity: 0.62,
+          drag: 0.55,
+        },
+      );
+    }
+  }
+
+  /** `owner` is the firing tank's rigid body (its own hull is ignored by the shell).
+   *  `aim` (naval) is where this shell is supposed to arrive: hits far from it are ignored. */
+  fire({ pos, vel, owner = this.exclude, naval = false, aim = null }) {
     const s = takeMesh(this._shellPool);
     const listed = this.shells.indexOf(s);
     if (listed >= 0) this.shells.splice(listed, 1);
     s.pos.copy(pos);
     s.vel.copy(vel);
-    s.owner = owner;
+    s.owner = owner || undefined;
+    s.naval = naval;
+    s.aim = aim;
     s.age = 0;
     const dir = this._shellDir.copy(vel);
     if (dir.lengthSq() > 1e-8) dir.normalize();
@@ -1611,13 +1682,28 @@ export class Effects {
       const d = this._shellDirN;
       o.x = s.pos.x; o.y = s.pos.y; o.z = s.pos.z;
       d.x = dir.x; d.y = dir.y; d.z = dir.z;
-      const hit = this.world.castRayAndGetNormal(this._shellRay, len, true, undefined, undefined, undefined, s.owner);
-      if (hit || s.age > 6) {
+      let hit = this.world.castRayAndGetNormal(this._shellRay, len, true, undefined, undefined, undefined, s.owner || undefined);
+      // A cruiser shell is aimed at one point. A ridge or the sea floor along the way
+      // used to detonate it early, so the marked circle never got a burst. Hits that
+      // start inside a mesh (toi ≈ 0) are the same case: the tracer is still crossing
+      // a hill it already entered, not the ground at the aim point.
+      if (hit && s.aim) {
+        const hx = s.pos.x + dir.x * hit.timeOfImpact;
+        const hz = s.pos.z + dir.z * hit.timeOfImpact;
+        const far = Math.hypot(hx - s.aim.x, hz - s.aim.z) > s.aim.r;
+        if (far || hit.timeOfImpact < 0.05) hit = null;
+      }
+      const due = s.aim && s.age > s.aim.fuse;
+      if (hit || due || s.age > 6) {
         if (hit) {
           this._shellHit.copy(s.pos).addScaledVector(dir, hit.timeOfImpact);
           this._boomN.set(hit.normal.x, hit.normal.y, hit.normal.z);
-          this.onShellHit({ point: this._shellHit, collider: hit.collider, owner: s.owner, dir });
+          this.onShellHit({ point: this._shellHit, collider: hit.collider, owner: s.owner, dir, naval: !!s.naval });
           this._explode(this._shellHit, this._boomN, dir, hit.collider, { muzzle: true });
+        } else if (due) {
+          this._shellHit.set(s.aim.x, s.aim.y, s.aim.z);
+          this._boomN.set(0, 1, 0);
+          this._explode(this._shellHit, this._boomN, dir, null, { muzzle: true });
         }
         releaseSlot(this._shellPool, s);
         this.shells.splice(i, 1);

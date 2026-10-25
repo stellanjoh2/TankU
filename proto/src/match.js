@@ -204,7 +204,7 @@ export function createMatch({
       sfx.flyby(intensity, along / MG_TRACER_SPEED);
     };
 
-    fx.onShellHit = ({ collider, owner, point, dir }) => {
+    fx.onShellHit = ({ collider, owner, point, dir, naval }) => {
       const body = collider?.parent();
       if (!body || game.overT > 0) return;
       if (airfield.shellHit?.(body, dir, point, collider)) return;
@@ -221,11 +221,13 @@ export function createMatch({
       }
       if (vegetation.shellHit?.(body, dir, point)) return;
       const victim = combatants.find((t) => t.body.handle === body.handle);
-      if (!victim || victim.body === owner || !victim.alive) return;
+      if (!victim || !victim.alive) return;
+      // Naval shells are not "yours" — staying in the beaten zone kills you too.
+      if (!naval && victim.body === owner) return;
       const ownerFoe = foeOf(owner);
       const victimFoe = victim === tank ? null : foeOf(victim.body);
-      if (ownerFoe && victimFoe) return;
-      const dmg = shellDamage(victim, point);
+      if (!naval && ownerFoe && victimFoe) return;
+      const dmg = naval ? victim.hp : shellDamage(victim, point);
       victim.hp = Math.max(0, victim.hp - dmg);
       // Main-gun only — MG path never calls addStress. Rear hits spike harder.
       if (victim.alive) victim.addStress(STRESS_PER_SHELL * dmg);
@@ -251,11 +253,18 @@ export function createMatch({
 
     // Traced .50 hits: metal ricochet SFX (body.userData.mat === 'metal') + chip damage on tanks.
     // `damage` overrides chip amount (Air Support strafe uses a heavier per-round).
-    fx.onMgHit = ({ collider, owner, point, dir, damage }) => {
+    fx.onMgHit = ({ collider, owner, point, dir, damage, air }) => {
       const body = collider?.parent();
       if (!body || game.overT > 0) return;
       if (vegetation.mgHit?.(body, dir, point)) return;
-      if (patrolBoat?.isBody(body) && body !== owner) patrolBoat.flashHit(body);
+      if (patrolBoat?.isBody(body) && body !== owner) {
+        const sunk = air ? patrolBoat.airHit(body) : false;
+        if (!air) patrolBoat.flashHit(body);
+        if (sunk && tank.alive) {
+          if (!hostilesRemain()) endRound(false);
+          else announceRemaining();
+        }
+      }
       const victim = combatants.find((t) => t.body.handle === body.handle);
       const isTank = !!victim && victim.body !== owner && victim.alive;
       const isMetal = body.userData?.mat === 'metal';

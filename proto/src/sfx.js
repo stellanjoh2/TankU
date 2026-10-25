@@ -18,6 +18,7 @@
 // + repair complete (Sounds/242501__gabrielaraujo__powerupsuccess.wav).
 // + victory fanfare (Sounds/161984__robinhood76__03599-majestic-foreboding-fanfare.wav).
 // + C-47 supply pass (Sounds/515293__breviceps__propeller-plane.wav, +5 dB).
+// + ship horn (Sounds/371535__robinhood76__06934-distant-ship-horn.wav).
 const SHOT_URLS = [
   './sounds/tank_shot_1.wav',
   './sounds/tank_shot_2.wav',
@@ -42,6 +43,7 @@ const FLYBY_URL = './sounds/bullet_flyby.wav';
 const REPAIR_URL = './sounds/repair_wrench.wav';
 const REPAIR_DONE_URL = './sounds/repair_done.wav';
 const FANFARE_URL = './sounds/161984__robinhood76__03599-majestic-foreboding-fanfare.wav';
+const SHIP_HORN_URL = './sounds/371535__robinhood76__06934-distant-ship-horn.wav';
 // Source peaks at ~0 dBFS; leave headroom so it sits over a ducked music bed.
 const FANFARE_GAIN = 0.72;
 const FANFARE_MUSIC_DUCK = 0.32;
@@ -144,6 +146,7 @@ export class Sfx {
     this.repairBuf = null;
     this.repairDoneBuf = null;
     this.fanfareBuf = null;
+    this.shipHornBuf = null;
     this.ready = false;
     this._last = -1;
     this._ricoLast = -1;
@@ -214,7 +217,7 @@ export class Sfx {
       const res = await fetch(url);
       return this.ctx.decodeAudioData(await res.arrayBuffer());
     };
-    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, p51Pass, p51Mg, p51Orbit, c47, dirtThump, mgBass, smokeBomb, flyby, repair, repairDone, fanfare] = await Promise.all([
+    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, p51Pass, p51Mg, p51Orbit, c47, dirtThump, mgBass, smokeBomb, flyby, repair, repairDone, fanfare, shipHorn] = await Promise.all([
       Promise.all(SHOT_URLS.map(decode)),
       decode(ENGINE_URL),
       decode(MG50_URL),
@@ -236,6 +239,7 @@ export class Sfx {
       decode(REPAIR_URL),
       decode(REPAIR_DONE_URL),
       decode(FANFARE_URL),
+      decode(SHIP_HORN_URL),
     ]);
     this.shots = shots;
     this.engineBuf = engine;
@@ -258,6 +262,7 @@ export class Sfx {
     this.repairBuf = repair;
     this.repairDoneBuf = repairDone;
     this.fanfareBuf = fanfare;
+    this.shipHornBuf = shipHorn;
     this.ready = true;
   }
 
@@ -362,7 +367,7 @@ export class Sfx {
    * Play a random main-gun shot (avoids repeating the same clip twice in a row).
    * `dist` (metres) lowpasses a hostile shot; omit it for the player's own gun.
    */
-  fire(volume = 0.9, dist = null) {
+  fire(volume = 0.9, dist = null, rate = null) {
     if (!this.ready || !this.shots.length) return;
     if (volume < 0.03) return;
     this.unlock();
@@ -372,7 +377,7 @@ export class Sfx {
 
     const src = this.ctx.createBufferSource();
     src.buffer = this.shots[i];
-    src.playbackRate.value = 0.97 + Math.random() * 0.06;
+    src.playbackRate.value = rate ?? (0.97 + Math.random() * 0.06);
     const g = this.ctx.createGain();
     g.gain.value = volume;
     this._connectShot(src, g, dist, CANNON_HEAR, CANNON_FLOOR_HZ);
@@ -611,6 +616,20 @@ export class Sfx {
     this._c47 = null;
     try { src.stop(); } catch (_) { /* already ended */ }
     this._active.delete(src);
+  }
+
+  /** Warning blast before a cruiser broadside. The clip is the whole horn. */
+  shipHorn(volume = 0.95) {
+    if (!this.ready || !this.shipHornBuf) return;
+    this.unlock();
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.shipHornBuf;
+    const g = this.ctx.createGain();
+    g.gain.value = volume;
+    src.connect(g).connect(this.ctx.destination);
+    this._active.add(src);
+    src.onended = () => this._active.delete(src);
+    src.start();
   }
 
   /** One-shot P-51 overhead pass — length drives the air-raid timeline. */

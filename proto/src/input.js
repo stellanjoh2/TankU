@@ -15,6 +15,7 @@ function stick(x, y) {
 const NEUTRAL = Object.freeze({
   throttle: 0, turn: 0, boost: false, ascend: 0,
   aimX: 0, aimY: 0, fire: false, mgFire: false, zoom: 0, zoomHold: false,
+  mouseX: 0, mouseY: 0, mouseMg: false,
   padPressed: Object.freeze([]), pad: null,
 });
 
@@ -32,6 +33,7 @@ export class Input {
     this.pad = null;
     this._padButtons = [];
     this.onPress = () => {};
+    this.onRelease = () => {};
 
     addEventListener('keydown', (e) => {
       if (!e.repeat) this.onPress(e.code);
@@ -39,7 +41,10 @@ export class Input {
       if (e.code === 'F3') e.preventDefault();
       if (this.enabled) this.keys.add(e.code);
     });
-    addEventListener('keyup', (e) => this.keys.delete(e.code));
+    addEventListener('keyup', (e) => {
+      this.keys.delete(e.code);
+      this.onRelease(e.code);
+    });
     addEventListener('blur', () => { this.keys.clear(); this.mouseFire = false; this.mouseMg = false; });
     canvas.addEventListener('mousedown', (e) => {
       if (!this.enabled) return;
@@ -120,14 +125,16 @@ export class Input {
     const k = (c) => this.keys.has(c);
     let throttle = (k('KeyW') || k('ArrowUp') ? 1 : 0) - (k('KeyS') || k('ArrowDown') ? 1 : 0);
     let turn = (k('KeyD') || k('ArrowRight') ? 1 : 0) - (k('KeyA') || k('ArrowLeft') ? 1 : 0);
-    let ascend = (k('Space') || k('KeyE') ? 1 : 0) - (k('ControlLeft') || k('ControlRight') || k('KeyQ') || k('KeyC') ? 1 : 0);
+    let ascend = (k('Space') || k('KeyE') ? 1 : 0) - (k('ControlLeft') || k('ControlRight') || k('KeyQ') ? 1 : 0);
     let boost = k('ShiftLeft') || k('ShiftRight');
     let aimX = this.mouseDX * MOUSE_SENS;
     let aimY = this.mouseDY * MOUSE_SENS;
+    const mouseX = this.mouseDX;
+    const mouseY = this.mouseDY;
     let fire = this.mouseFire;
     let mgFire = this.mouseMg;
     let zoom = this.wheel;
-    let zoomHold = false;
+    let zoomHold = k('KeyF'); // Focus: hold to zoom. Drive and fire stay live.
     this.mouseDX = this.mouseDY = this.wheel = 0;
 
     const pad = this.gamepad();
@@ -146,12 +153,12 @@ export class Input {
       boost ||= b(4) > 0.5 || b(10) > 0.5;
       fire ||= b(7) > 0.5;
       mgFire ||= b(5) > 0.5; // R1
-      zoomHold = b(6) > 0.5;
+      zoomHold = zoomHold || b(6) > 0.5; // L2, same zoom as F
       pad.buttons.forEach((btn, i) => {
         if (btn.pressed && !this._padButtons[i]) pressed.push(i);
         this._padButtons[i] = btn.pressed;
       });
     }
-    return { throttle, turn, ascend, boost, aimX, aimY, fire, mgFire, zoom, zoomHold, padPressed: pressed, pad };
+    return { throttle, turn, ascend, boost, aimX, aimY, fire, mgFire, zoom, zoomHold, mouseX, mouseY, mouseMg: this.mouseMg, padPressed: pressed, pad };
   }
 }

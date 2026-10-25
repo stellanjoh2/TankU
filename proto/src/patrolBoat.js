@@ -36,6 +36,7 @@ const FIRE_SLOT0 = 4;
 const SINK_T = 7.5;
 const SINK_DEPTH = 4.4 * SCALE;
 const SINK_GONE = 60;         // a minute after the kill the wreck is gone
+const AIR_SINK_HITS = 12;     // centered strafe sinks a boat; a graze does not
 const SINK_SLIDE = 8;         // final drop through the sea floor
 // Terrain sea floor sits 5.5 m under the waterline. Bury the cabin with it.
 const SINK_FLOOR = 5.5 + 3.4;
@@ -294,6 +295,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     body,
     firing: false,
     alive: true,
+    airHp: AIR_SINK_HITS,
     x: spawn.x,
     z: spawn.z,
     yaw: spawn.yaw,
@@ -680,6 +682,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
   function reset(fx) {
     const s = findSpawn(spawnHint);
     boat.alive = true;
+    boat.airHp = AIR_SINK_HITS;
     boat.firing = false;
     boat.x = s.x;
     boat.z = s.z;
@@ -735,6 +738,15 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
       if (!boat.alive) return;
       boat.hitFlashFrames = 2;
       applyHitFlash(true);
+    },
+    airHit() {
+      if (!boat.alive) return false;
+      boat.hitFlashFrames = 2;
+      applyHitFlash(true);
+      boat.airHp -= 1;
+      if (boat.airHp > 0) return false;
+      kill();
+      return true;
     },
     mgMuzzle() {
       const { pos, dir } = mgMuzzle();
@@ -867,6 +879,9 @@ export async function buildPatrolBoat(scene, { RAPIER, world }) {
     isBody: (body) => boats.some((b) => b.body.handle === body?.handle),
     flashHit(body) {
       boats.find((b) => b.body.handle === body?.handle)?.flashHit();
+    },
+    airHit(body) {
+      return boats.find((b) => b.body.handle === body?.handle)?.airHit() ?? false;
     },
     mgMuzzle() {
       const b = shooter() ?? boats[0];
