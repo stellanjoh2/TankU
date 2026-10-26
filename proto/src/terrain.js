@@ -163,8 +163,8 @@ function hillStrength(x, z) {
   return s;
 }
 
-/** 0 on the flanks, 1 on the crown. Measured against each hill's own radius. */
-function hillCrown(x, z) {
+/** 0 on the flanks, 1 on the crown. Measured against each hill's own radius. Hill-grass splat + palm scatter. */
+export function hillCrown(x, z) {
   let best = 0;
   for (const [cx, cz, , rad] of HILLS) {
     const t = Math.exp(-((x - cx) ** 2 + (z - cz) ** 2) / (rad * rad));
@@ -434,8 +434,9 @@ export function isGrassable(x, z) {
 export const GROUND_TILE_M = 4;
 
 /**
- * Same splat the terrain mesh bakes per vertex: mud / rock / sand / concrete, plus shade and wet.
- * `slope` is 0 on flat ground (1 − normal.y).
+ * Same splat the terrain mesh bakes per vertex: mud / rock / sand / hillGrass / concrete,
+ * plus shade and wet. `slope` is 0 on flat ground (1 − normal.y).
+ * Hill crowns use a grass placeholder (not beach sand). mud+rock+sand+hillGrass ≈ 1.
  */
 export function groundSurfaceAt(x, z, y = heightAt(x, z), slope = slopeAt(x, z)) {
   const signed = shoreSigned(x, z);
@@ -448,8 +449,9 @@ export function groundSurfaceAt(x, z, y = heightAt(x, z), slope = slopeAt(x, z))
   const cap = apron < 0.35 ? hillCrown(x, z) : 0;
   const rocky = clamp01(slope * 2.8 + hills * 0.12 + ridge * 0.05 - 0.2);
   const rock = clamp01((rocky - 0.15) / 0.5) * (1 - beach) * (1 - cap);
-  const sand = beach + cap * (1 - beach);
-  const mud = 1 - sand - rock;
+  const sand = beach;
+  const hillGrass = cap * (1 - beach);
+  const mud = 1 - sand - rock - hillGrass;
   const concrete = apron > 0.02 ? apron : 0;
 
   let wet = 0;
@@ -460,7 +462,7 @@ export function groundSurfaceAt(x, z, y = heightAt(x, z), slope = slopeAt(x, z))
   if (road > 0.02) shade *= 1 - road * 0.35;
   if (y < WATER_Y) shade *= 0.65;
 
-  return { mud, rock, sand, concrete, shade, wet };
+  return { mud, rock, sand, hillGrass, concrete, shade, wet };
 }
 
 function prepGroundMap(tex, colorSpace) {
@@ -487,8 +489,9 @@ async function loadGroundSet(loader, name) {
 
 function makeGroundMaterial(sets, concreteColor) {
   const mapUv = uv().mul(SIZE / GROUND_TILE_M);
-  // xyz = mud, rock, sand (sum to 1). w = concrete apron overlay.
+  // xyz = mud, rock, sand. w = concrete apron. hillGrass is a separate weight (crowns).
   const biome = attribute('biome', 'vec4');
+  const hillGrass = attribute('hillGrass', 'float');
   const shade = attribute('shade', 'float');
   const wet = attribute('wet', 'float');
   const rgb = (tex) => texture(tex).sample(mapUv).rgb;
@@ -496,15 +499,17 @@ function makeGroundMaterial(sets, concreteColor) {
 
   const albedo = rgb(sets.mud.color).mul(biome.x)
     .add(rgb(sets.rock.color).mul(biome.y))
-    .add(rgb(sets.sand.color).mul(biome.z));
-  const packedN = rgb(sets.mud.normal).mul(biome.x)
+    .add(rgb(sets.sand.color).mul(biome.z))
+    .add(rgb(sets.hillGrass.color).mul(hillGrass));
+  // Placeholder hill grass has colour only — borrow mud normal / rough-AO.
+  const packedN = rgb(sets.mud.normal).mul(biome.x.add(hillGrass))
     .add(rgb(sets.rock.normal).mul(biome.y))
     .add(rgb(sets.sand.normal).mul(biome.z));
   const mudS = surface(sets.mud.roughAo);
   const rockS = surface(sets.rock.roughAo);
   const sandS = surface(sets.sand.roughAo);
-  const rough = mudS.r.mul(biome.x).add(rockS.r.mul(biome.y)).add(sandS.r.mul(biome.z));
-  const ao = mudS.g.mul(biome.x).add(rockS.g.mul(biome.y)).add(sandS.g.mul(biome.z));
+  const rough = mudS.r.mul(biome.x.add(hillGrass)).add(rockS.r.mul(biome.y)).add(sandS.r.mul(biome.z));
+  const ao = mudS.g.mul(biome.x.add(hillGrass)).add(rockS.g.mul(biome.y)).add(sandS.g.mul(biome.z));
 
   const mat = new MeshStandardNodeMaterial({ metalness: 0, roughness: 1 });
   mat.colorNode = mix(albedo.mul(shade), uniform(concreteColor), biome.w);
@@ -556,9 +561,11 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
 
   const nrm = geo.attributes.normal;
   const biomeArr = new Float32Array(pos.count * 4);
+  const hillGrassArr = new Float32Array(pos.count);
   const shadeArr = new Float32Array(pos.count);
   const wetArr = new Float32Array(pos.count);
   geo.setAttribute('biome', new THREE.BufferAttribute(biomeArr, 4));
+  geo.setAttribute('hillGrass', new THREE.BufferAttribute(hillGrassArr, 1));
   geo.setAttribute('shade', new THREE.BufferAttribute(shadeArr, 1));
   geo.setAttribute('wet', new THREE.BufferAttribute(wetArr, 1));
 
@@ -579,22 +586,29 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
       const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
       const s = groundSurfaceAt(x, z, y, 1 - nrm.getY(i));
       biomeArr.set([s.mud, s.rock, s.sand, s.concrete], i * 4);
+      hillGrassArr[i] = s.hillGrass;
       shadeArr[i] = s.shade;
       wetArr[i] = s.wet;
     }
     geo.attributes.biome.needsUpdate = true;
+    geo.attributes.hillGrass.needsUpdate = true;
     geo.attributes.shade.needsUpdate = true;
     geo.attributes.wet.needsUpdate = true;
   }
   applyPalette();
 
   const loader = new THREE.TextureLoader();
-  const [mudMaps, rockMaps, sandMaps] = await Promise.all([
+  const [mudMaps, rockMaps, sandMaps, hillGrassColor] = await Promise.all([
     loadGroundSet(loader, 'mud'),
     loadGroundSet(loader, 'rock'),
     loadGroundSet(loader, 'sand'),
+    loader.loadAsync('./textures/ground/hill_grass_color.png'),
   ]);
-  const mat = makeGroundMaterial({ mud: mudMaps, rock: rockMaps, sand: sandMaps }, palette.concrete);
+  const hillGrassMaps = { color: prepGroundMap(hillGrassColor, THREE.SRGBColorSpace) };
+  const mat = makeGroundMaterial(
+    { mud: mudMaps, rock: rockMaps, sand: sandMaps, hillGrass: hillGrassMaps },
+    palette.concrete,
+  );
   const mesh = new THREE.Mesh(geo, mat);
   mesh.receiveShadow = true;
   mesh.name = 'IslandTerrain';

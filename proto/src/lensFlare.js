@@ -76,8 +76,8 @@ export async function createSunLensFlare({ camera, RAPIER, world, sunDir }) {
   camera.add(root);
 
   const uVisibility = uniform(0);
-  const uIntensity = uniform(1.0);
-  const uScale = uniform(1);
+  const uIntensity = uniform(1.74);
+  const uScale = uniform(1.5);
   const items = [];
 
   for (const el of elements) {

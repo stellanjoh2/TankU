@@ -6,7 +6,7 @@ import * as THREE from 'three';
 import { PropertyBinding } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
-import { SIZE, WATER_Y, heightAt, shoreSigned, isOnRoad, isAirfield, isPort, ISLAND2, PLAYER_SPAWN } from './terrain.js';
+import { SIZE, WATER_Y, heightAt, shoreSigned, hillCrown, isOnRoad, isAirfield, isPort, ISLAND2, PLAYER_SPAWN } from './terrain.js';
 import { pickLod } from './lod.js';
 
 const PREFABS = {
@@ -116,6 +116,28 @@ function slopeAt(x, z, e = 0.8) {
   const dz = heightAt(x, z + e) - heightAt(x, z - e);
   const ny = (2 * e) / Math.hypot(dx, 2 * e, dz);
   return 1 - ny;
+}
+
+const _palmUp = new THREE.Vector3(0, 1, 0);
+const _palmNrm = new THREE.Vector3();
+const _palmAlign = new THREE.Quaternion();
+const _palmSpin = new THREE.Quaternion();
+const _palmEul = new THREE.Euler();
+
+/** Align local +Y to the heightfield normal, then spin yaw around that axis. */
+function palmQuatOnGround(x, z, yaw, out = new THREE.Quaternion()) {
+  const e = 0.8;
+  _palmNrm
+    .set(
+      heightAt(x - e, z) - heightAt(x + e, z),
+      2 * e,
+      heightAt(x, z - e) - heightAt(x, z + e),
+    )
+    .normalize();
+  _palmAlign.setFromUnitVectors(_palmUp, _palmNrm);
+  _palmEul.set(0, yaw, 0);
+  _palmSpin.setFromEuler(_palmEul);
+  return out.copy(_palmAlign).multiply(_palmSpin);
 }
 
 function pickWeighted(list, rand) {
@@ -349,9 +371,14 @@ function nearSpawn(x, z) {
 
 function canPlaceTree(x, z) {
   const shore = shoreSigned(x, z);
-  if (shore < 6 || shore > 22) return false;
+  if (shore < 6) return false;
+  // Beach belt, or the sandy hill crowns (inland peaks that beach clusters never reach).
+  const onBeach = shore <= 22;
+  const onHillSand = hillCrown(x, z) > 0.3;
+  if (!onBeach && !onHillSand) return false;
   if (heightAt(x, z) < WATER_Y + 0.4) return false;
-  if (slopeAt(x, z) > 0.12) return false;
+  // Crowns are flatter than flanks; still allow a touch more slope than the beach belt.
+  if (slopeAt(x, z) > (onHillSand ? 0.18 : 0.12)) return false;
   if (nearSpawn(x, z)) return false;
   if (isAirfield(x, z) || isPort(x, z)) return false;
   if (isOnRoad(x, z, 1.5)) return false;
@@ -545,11 +572,13 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     initLod(inst);
 
     inst.position.set(x, y, z);
-    inst.rotation.y = yaw;
+    palmQuatOnGround(x, z, yaw, _palmAlign);
+    inst.quaternion.copy(_palmAlign);
     inst.scale.setScalar(scale);
     inst.userData.kind = kind;
     inst.userData.windPhase = rand() * Math.PI * 2;
     inst.userData.yaw = yaw;
+    inst.userData.spawnQuat = _palmAlign.clone();
     inst.userData.palmBones = collectPalmBones(inst);
     root.add(inst);
     placed.push({ x, z, r });
@@ -767,9 +796,8 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     for (const p of palms) {
       if (!p.visible || p.userData.fallen) continue;
       const ph = p.userData.windPhase ?? 0;
-      p.rotation.y = p.userData.yaw ?? p.rotation.y;
-      p.rotation.x = 0;
-      p.rotation.z = 0;
+      // Keep the ground-aligned base; wind lives on bones, not Euler x/z.
+      if (p.userData.spawnQuat) p.quaternion.copy(p.userData.spawnQuat);
       const bones = p.userData.palmBones;
       if (!bones?.length) continue;
       const leanX = Math.sin(time * 0.95 + ph) * palmLean;
@@ -923,6 +951,20 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     }
   }
 
+  // Hill-crown sand: beach radial clusters never sample inland peaks.
+  let hillPalmTries = 0;
+  let hillPalms = 0;
+  const HILL_PALM_TARGET = 10;
+  while (hillPalms < HILL_PALM_TARGET && palms.length < MAX_PALM_TARGET && hillPalmTries < HILL_PALM_TARGET * 100) {
+    hillPalmTries++;
+    const x = (rand() * 2 - 1) * (HALF - 8);
+    const z = (rand() * 2 - 1) * (HALF - 8);
+    if (hillCrown(x, z) < 0.35) continue;
+    if (!canPlaceTree(x, z)) continue;
+    if (palms.some((p) => Math.hypot(p.position.x - x, p.position.z - z) < 7)) continue;
+    if (placeOne(pickWeighted(catalog.tree, rand), x, z, 0.85 + rand() * 0.3)) hillPalms++;
+  }
+
   // Extra palms for the amount slider headroom (up to 2× default).
   let palmTries = 0;
   while (palms.length < MAX_PALM_TARGET && palmTries < MAX_PALM_TARGET * 60) {
@@ -1068,16 +1110,16 @@ export async function buildVegetation(scene, { RAPIER, world }) {
   // Fixed cylinder colliders so shells / .50 can hit; knockPalm turns them dynamic.
   const palmByHandle = new Map();
   const _palmQ = new THREE.Quaternion();
-  const _palmYaw = new THREE.Vector3(0, 1, 0);
   for (const p of palms) {
     const item = catalog.tree.find((t) => t.name === p.name);
     const b = item?.base ?? new THREE.Vector2();
-    const yaw = p.userData.yaw ?? p.rotation.y;
+    const yaw = p.userData.yaw ?? 0;
+    const q = p.userData.spawnQuat ?? palmQuatOnGround(p.position.x, p.position.z, yaw, _palmQ);
     const c = Math.cos(yaw), s = Math.sin(yaw), k = p.scale.x;
     p.userData.trunk = { x: p.position.x + (b.x * c + b.y * s) * k, z: p.position.z + (-b.x * s + b.y * c) * k };
     const h = Math.max(2, (item?.height ?? 8) * k);
     const halfH = h * 0.5;
-    _palmQ.setFromAxisAngle(_palmYaw, yaw);
+    _palmQ.copy(q);
     const body = world.createRigidBody(
       RAPIER.RigidBodyDesc.fixed()
         .setTranslation(p.position.x, p.position.y, p.position.z)
@@ -1100,6 +1142,7 @@ export async function buildVegetation(scene, { RAPIER, world }) {
     p.userData.fallen = false;
     p.userData.spawnPos = p.position.clone();
     p.userData.spawnYaw = yaw;
+    if (!p.userData.spawnQuat) p.userData.spawnQuat = q.clone();
     palmByHandle.set(body.handle, p);
   }
 
@@ -1202,10 +1245,11 @@ export async function buildVegetation(scene, { RAPIER, world }) {
       if (!body) continue;
       const pos = p.userData.spawnPos;
       const yaw = p.userData.spawnYaw ?? 0;
-      _palmQ.setFromAxisAngle(_palmYaw, yaw);
+      const q = p.userData.spawnQuat ?? palmQuatOnGround(pos.x, pos.z, yaw, _palmQ);
+      _palmQ.copy(q);
       p.userData.fallen = false;
       p.position.copy(pos);
-      p.rotation.set(0, yaw, 0);
+      p.quaternion.copy(q);
       p.userData.yaw = yaw;
       zeroPalmBones(p);
       body.setBodyType(RAPIER.RigidBodyType.Fixed, true);

@@ -123,18 +123,11 @@ export async function createPost(renderer, scene, camera) {
     return vec4(rgb, color.a);
   }
 
-  // Lub-dub envelope, ~67 BPM. Two Gaussian peaks per period.
-  function heartbeat(t) {
-    const period = 0.9;
-    const p = (t % period) / period;
-    const beat = (x, s) => Math.exp(-0.5 * (x / s) * (x / s));
-    return Math.min(1, beat(p, 0.045) + 0.7 * beat(p - 0.16, 0.05) + 0.12 * beat(p - 1, 0.045));
-  }
-
   function damageVignetteAmount(hp, t) {
     if (hp >= 0.25) return 0;
     let a = (0.25 - hp) / 0.25;
-    if (hp <= 0.10) a *= 0.5 + 0.85 * heartbeat(t);
+    // 1 Hz sine pulse at ≤10% HP (0.5..1.35 of the red amount).
+    if (hp <= 0.10) a *= 0.5 + 0.85 * (0.5 + 0.5 * Math.sin(t * Math.PI * 2));
     return Math.min(1.25, a);
   }
 
