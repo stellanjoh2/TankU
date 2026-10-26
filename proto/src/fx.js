@@ -114,6 +114,26 @@ const GROUND_EXPLOSION = {
   glowLife: 0.5,
 };
 
+/** MG ground hit — 4-frame soil splash (left → right on the atlas). */
+const MG_SOIL_IMPACT = {
+  url: './textures/vfx/T_mg_soil_impact.png',
+  cols: 4,
+  rows: 1,
+  frames: 4,
+  fps: 12,
+  height: 2,
+};
+
+/** MG water hit — 4-frame splash (left → right on the atlas). */
+const MG_WATER_IMPACT = {
+  url: './textures/vfx/T_mg_water_impact.png',
+  cols: 4,
+  rows: 1,
+  frames: 4,
+  fps: 12,
+  height: 4.2,
+};
+
 /** Main-gun muzzle. Two 4-frame strips, RGB on black. Side sheet's point aims left. */
 const MAIN_MUZZLE = {
   frontUrl: './textures/vfx/T_turret_muzzle_front.png',
@@ -306,8 +326,9 @@ function sparkBurstTexture(seed) {
 function blitFlipbookFrame(fb, frame) {
   if (frame === fb.frame) return;
   fb.frame = frame;
-  const col = frame % fb.cols;
-  const row = Math.floor(frame / fb.cols);
+  const atlasFrame = fb.frameMap ? fb.frameMap[frame] : frame;
+  const col = atlasFrame % fb.cols;
+  const row = Math.floor(atlasFrame / fb.cols);
   const { ctx, cellW, cellH, atlasImg } = fb;
   ctx.clearRect(0, 0, cellW, cellH);
   ctx.drawImage(atlasImg, col * cellW, row * cellH, cellW, cellH, 0, 0, cellW, cellH);
@@ -330,7 +351,11 @@ export class Effects {
     this.onMgHit = () => {};
     /** Dirt / sand MG impact (air raid + optional ground spray). */
     this.onMgDirtHit = () => {};
+    /** Main-gun shell hit terrain/dirt (not metal). Used for near-miss lens splat. */
+    this.onShellDirtHit = () => {};
     this.groundExplosionAtlas = null;
+    this.mgSoilImpactAtlas = null;
+    this.mgWaterImpactAtlas = null;
     this.impactGlowTex = null;
 
     this.flashTex = radialTexture([[0, '#ffffff'], [0.25, '#ffd28a'], [0.6, 'rgba(255,120,30,0.35)'], [1, 'rgba(255,80,0,0)']]);
@@ -448,13 +473,15 @@ export class Effects {
 
   async load() {
     const loader = new THREE.TextureLoader();
-    const [tex, glowMap, starMap, plumeMap, muzzleFront, muzzleSide] = await Promise.all([
+    const [tex, glowMap, starMap, plumeMap, muzzleFront, muzzleSide, soilMap, waterMap] = await Promise.all([
       loader.loadAsync(GROUND_EXPLOSION.url),
       loader.loadAsync(GROUND_EXPLOSION.glowUrl),
       loader.loadAsync(MG_FLASH.starUrl),
       loader.loadAsync(MG_FLASH.plumeUrl),
       loader.loadAsync(MAIN_MUZZLE.frontUrl),
       loader.loadAsync(MAIN_MUZZLE.sideUrl),
+      loader.loadAsync(MG_SOIL_IMPACT.url),
+      loader.loadAsync(MG_WATER_IMPACT.url),
     ]);
     tex.colorSpace = THREE.SRGBColorSpace;
     tex.magFilter = THREE.LinearFilter;
@@ -462,6 +489,16 @@ export class Effects {
     tex.generateMipmaps = false;
     tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
     this.groundExplosionAtlas = tex;
+
+    for (const m of [soilMap, waterMap]) {
+      m.colorSpace = THREE.SRGBColorSpace;
+      m.magFilter = THREE.LinearFilter;
+      m.minFilter = THREE.LinearFilter;
+      m.generateMipmaps = false;
+      m.wrapS = m.wrapT = THREE.ClampToEdgeWrapping;
+    }
+    this.mgSoilImpactAtlas = soilMap;
+    this.mgWaterImpactAtlas = waterMap;
 
     glowMap.colorSpace = THREE.SRGBColorSpace;
     glowMap.magFilter = THREE.LinearFilter;
@@ -724,15 +761,20 @@ export class Effects {
     d.x = dir.x; d.y = dir.y; d.z = dir.z;
     const ray = this._mgRay;
     const hit = this.world.castRayAndGetNormal(ray, 450, true, undefined, undefined, undefined, owner);
-    // Air rounds stop on the sea. Otherwise they pass through and hit the far shore.
-    if (opts.air && d.y < -1e-4) {
+    // Stop on open water (sea surface) before seabed / far shore — tank MG and air rounds.
+    if (d.y < -1e-4) {
       const tWater = (WATER_Y - o.y) / d.y;
       const solid = hit ? hit.timeOfImpact : Infinity;
-      if (tWater > 0.5 && tWater < solid) {
+      const minT = opts.air ? 0.5 : 0.05;
+      if (tWater > minT && tWater < solid) {
         const point = pos.clone().addScaledVector(dir, tWater);
-        this.waterSplash(point);
-        this.onMgDirtHit({ point, dir: dir.clone(), normal: _waterUp, air: true });
-        return { reach: tWater, body: null };
+        if (terrainHeightAt(point.x, point.z) < WATER_Y - 0.05) {
+          this.waterSplash(point);
+          this.onMgDirtHit({
+            point, dir: dir.clone(), normal: _waterUp, air: !!opts.air, water: true,
+          });
+          return { reach: tWater, body: null };
+        }
       }
     }
     if (!hit) return null;
@@ -789,22 +831,23 @@ export class Effects {
     this._spawnMgTracer(pose.pos, dir, hit?.reach ?? null);
   }
 
-  /** Short white burst where an air-raid round meets the sea. */
+  /** Splash where an MG round meets the sea (flipbook + foam). */
   waterSplash(point) {
+    this._mgWaterImpact(point);
     const foam = new THREE.Color(0.85, 0.92, 0.95);
-    const n = 4;
+    const n = 5;
     for (let i = 0; i < n; i++) {
       this._sprite(
         this.smokeTex,
         foam,
-        point.clone().add(new THREE.Vector3((Math.random() - 0.5) * 0.35, 0.05, (Math.random() - 0.5) * 0.35)),
-        0.35 + Math.random() * 0.25,
-        0.28 + Math.random() * 0.16,
+        point.clone().add(new THREE.Vector3((Math.random() - 0.5) * 0.45, 0.05, (Math.random() - 0.5) * 0.45)),
+        0.27 + Math.random() * 0.21,
+        0.35 + Math.random() * 0.2,
         {
-          vel: new THREE.Vector3((Math.random() - 0.5) * 1.4, 2.2 + Math.random() * 2.4, (Math.random() - 0.5) * 1.4),
-          grow: 3.5,
+          vel: new THREE.Vector3((Math.random() - 0.5) * 1.6, 2.5 + Math.random() * 2.8, (Math.random() - 0.5) * 1.6),
+          grow: 3.8,
           opacity: 0.55,
-          drag: 2.2,
+          drag: 2.0,
         },
       );
     }
@@ -815,6 +858,7 @@ export class Effects {
    * @param {THREE.Vector3} point
    */
   dirtPlume(point) {
+    this._mgSoilImpact(point);
     const sand = new THREE.Color(0.82, 0.72, 0.52);
     const sandDark = new THREE.Color(0.55, 0.45, 0.30);
     // Core column — dense, rises fast, grows into a soft cloud (+50% size).
@@ -1079,13 +1123,15 @@ export class Effects {
   }
 
   /** Built once per atlas. Later shots reuse the canvas and the node material. */
-  _ensureCardPool(key, atlasImg, { cols, rows, frames, fps, blast = false }) {
+  _ensureCardPool(key, atlasImg, {
+    cols, rows, frames, fps, blast = false, soil = false, frameMap = null, poolSize = 4,
+  }) {
     if (!this._cardPools) this._cardPools = new Map();
     let pool = this._cardPools.get(key);
     if (pool) return pool;
     const cellW = Math.floor(atlasImg.width / cols);
     const cellH = Math.floor(atlasImg.height / rows);
-    const n = blast ? 4 : 4;
+    const n = poolSize;
     const slots = [];
     for (let i = 0; i < n; i++) {
       const canvas = document.createElement('canvas');
@@ -1100,16 +1146,21 @@ export class Effects {
       map.wrapS = map.wrapT = THREE.ClampToEdgeWrapping;
       const flipbook = {
         map, ctx, cellW, cellH, atlasImg,
-        cols, rows, frames, fps, frame: -1, height: 0,
+        cols, rows, frames, fps, frame: -1, height: 0, frameMap,
       };
       let obj;
-      if (blast) {
+      if (blast || soil) {
         const sample = texture(map);
         const mat = new THREE.SpriteNodeMaterial({
           transparent: true, depthWrite: false, opacity: 1, fog: false,
         });
-        mat.colorNode = vec4(0, 0, 0, sample.a);
-        mat.emissiveNode = sample.rgb.mul(uniform(toEmissiveLevel(new THREE.Color(1.35, 1.2, 0.95))));
+        if (soil) {
+          // Lit soil dust — keep the map's albedo, no fireball emissive.
+          mat.colorNode = vec4(sample.rgb, sample.a);
+        } else {
+          mat.colorNode = vec4(0, 0, 0, sample.a);
+          mat.emissiveNode = sample.rgb.mul(uniform(toEmissiveLevel(new THREE.Color(1.35, 1.2, 0.95))));
+        }
         mat.blending = THREE.CustomBlending;
         mat.blendEquation = THREE.AddEquation;
         mat.blendSrc = THREE.SrcAlphaFactor;
@@ -1135,6 +1186,31 @@ export class Effects {
     for (const s of slots) s.pool = pool;
     this._cardPools.set(key, pool);
     return pool;
+  }
+
+  /** One-shot flipbook splash at a contact point (soil / water), bottom-aligned on the surface. */
+  _spawnMgImpact(key, cfg, atlas, point) {
+    if (!atlas?.image) return;
+    const pool = this._ensureCardPool(key, atlas.image, {
+      cols: cfg.cols, rows: cfg.rows, frames: cfg.frames, fps: cfg.fps,
+      poolSize: 12, soil: true,
+    });
+    const card = this._takeCard(pool);
+    const h = cfg.height;
+    const { cellW, cellH } = card.flipbook;
+    const w = h * (cellW / cellH);
+    card.flipbook.height = h;
+    card.obj.scale.set(w, h, 1);
+    card.obj.position.set(point.x, point.y + h * 0.5, point.z);
+    blitFlipbookFrame(card.flipbook, 0);
+  }
+
+  _mgSoilImpact(point) {
+    this._spawnMgImpact('mg-soil', MG_SOIL_IMPACT, this.mgSoilImpactAtlas, point);
+  }
+
+  _mgWaterImpact(point) {
+    this._spawnMgImpact('mg-water', MG_WATER_IMPACT, this.mgWaterImpactAtlas, point);
   }
 
   _takeCard(pool) {
@@ -1749,6 +1825,15 @@ export class Effects {
           this._shellHit.copy(s.pos).addScaledVector(dir, hit.timeOfImpact);
           this._boomN.set(hit.normal.x, hit.normal.y, hit.normal.z);
           this.onShellHit({ point: this._shellHit, collider: hit.collider, owner: s.owner, dir, naval: !!s.naval });
+          // Ground/dirt: near terrain with an upward face (tank / metal stay onShellHit only).
+          if (
+            Math.abs(this._shellHit.y - terrainHeightAt(this._shellHit.x, this._shellHit.z)) < 1.0
+            && this._boomN.y > 0.35
+          ) {
+            this.onShellDirtHit({
+              point: this._shellHit, owner: s.owner, naval: !!s.naval, normal: this._boomN,
+            });
+          }
           this._explode(this._shellHit, this._boomN, dir, hit.collider, { muzzle: true });
         } else if (due) {
           this._shellHit.set(s.aim.x, s.aim.y, s.aim.z);

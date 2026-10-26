@@ -11,6 +11,7 @@
 // + P-51 MG (Sounds/581771__hz37__machine-gun-hza-01-08-2021.wav).
 // + P-51 orbit loop (Sounds/161117__fight2flyphoto__t-6-texans-p-51-mustangs-b-25-mitchell-runup.wav).
 // + dirt thump (Sounds/48170__hy96__thump.wav) — air-raid ground strikes.
+// + water splash (Sounds/842165__aardsreal__water-splash-free.wav) — air-raid sea hits.
 // + smoke bomb (Sounds/583262__pfranzen__dropping-a-smoke-bomb-on-the-ground.ogg).
 // + MG near-miss flyby (Sounds/394208__saturdaysoundguy__slingshot-flyby.wav, peak-normalized).
 // + MG bass thump (Sounds/630030__el_boss__deep-bass-thump.wav) — layered per .50 round.
@@ -38,6 +39,7 @@ const C47_URL = './sounds/515293__breviceps__propeller-plane.wav';
 const C47_DB = Math.pow(10, 5 / 20); // +5 dB
 const P51_ORBIT_VOL = 0.55 * Math.pow(10, 10 / 20); // +10 dB; peak when overhead / very close
 const DIRT_THUMP_URL = './sounds/dirt_thump.wav';
+const WATER_SPLASH_URL = './sounds/water_splash.wav';
 const MG_BASS_URL = './sounds/mg_bass_thump.wav';
 const MG_BASS_DB = Math.pow(10, 10 / 20); // +10 dB
 const SMOKE_BOMB_URL = './sounds/smoke_bomb.ogg';
@@ -148,6 +150,7 @@ export class Sfx {
     this.p51OrbitBuf = null;
     this.c47Buf = null;
     this.dirtThumpBuf = null;
+    this.waterSplashBuf = null;
     this.mgBassBuf = null;
     this.smokeBombBuf = null;
     this.flybyBuf = null;
@@ -162,6 +165,7 @@ export class Sfx {
     this._hitCool = 0;
     this._ricoCool = 0;
     this._thumpCool = 0;
+    this._splashCool = 0;
     this._flybyCool = 0;
     this._active = new Set(); // retain one-shots until onended (avoids GC cutting tails)
     this._engine = null;
@@ -230,7 +234,7 @@ export class Sfx {
       const res = await fetch(url);
       return this.ctx.decodeAudioData(await res.arrayBuffer());
     };
-    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, ocean, p51Pass, p51Mg, p51Orbit, c47, dirtThump, mgBass, smokeBomb, flyby, repair, repairDone, fanfare, shipHorn, weaponSwitch] = await Promise.all([
+    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, ocean, p51Pass, p51Mg, p51Orbit, c47, dirtThump, waterSplash, mgBass, smokeBomb, flyby, repair, repairDone, fanfare, shipHorn, weaponSwitch] = await Promise.all([
       Promise.all(SHOT_URLS.map(decode)),
       decode(ENGINE_URL),
       decode(MG50_URL),
@@ -247,6 +251,7 @@ export class Sfx {
       decode(P51_ORBIT_URL),
       decode(C47_URL),
       decode(DIRT_THUMP_URL),
+      decode(WATER_SPLASH_URL),
       decode(MG_BASS_URL),
       decode(SMOKE_BOMB_URL),
       decode(FLYBY_URL),
@@ -272,6 +277,7 @@ export class Sfx {
     this.p51OrbitBuf = p51Orbit;
     this.c47Buf = c47;
     this.dirtThumpBuf = dirtThump;
+    this.waterSplashBuf = waterSplash;
     this.mgBassBuf = mgBass;
     this.smokeBombBuf = smokeBomb;
     this.flybyBuf = flyby;
@@ -853,6 +859,25 @@ export class Sfx {
     this._thumpCool = 0.04;
   }
 
+  /** Water splash for air-raid sea hits (same rate limit as dirt thump). */
+  waterSplash(intensity = 1) {
+    if (!this.ready || !this.waterSplashBuf) return;
+    if (this._splashCool > 0) return;
+    const t = Math.max(0, Math.min(1, intensity));
+    if (t < 0.03) return;
+    this.unlock();
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.waterSplashBuf;
+    src.playbackRate.value = 0.92 + Math.random() * 0.16;
+    const g = this.ctx.createGain();
+    g.gain.value = t * 0.55;
+    src.connect(g).connect(this.ctx.destination);
+    this._active.add(src);
+    src.onended = () => this._active.delete(src);
+    src.start();
+    this._splashCool = 0.04;
+  }
+
   /**
    * Enemy .50 near-miss whoosh. `delay` syncs to tracer closest-approach
    * (sample peak-normalized so it cuts through the MG loop).
@@ -956,6 +981,7 @@ export class Sfx {
     if (this._hitCool > 0) this._hitCool = Math.max(0, this._hitCool - dt);
     if (this._ricoCool > 0) this._ricoCool = Math.max(0, this._ricoCool - dt);
     if (this._thumpCool > 0) this._thumpCool = Math.max(0, this._thumpCool - dt);
+    if (this._splashCool > 0) this._splashCool = Math.max(0, this._splashCool - dt);
     if (this._flybyCool > 0) this._flybyCool = Math.max(0, this._flybyCool - dt);
     this._drive.speed = speed;
     this._drive.throttle = throttle;

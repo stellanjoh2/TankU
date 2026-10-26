@@ -5,6 +5,7 @@
 // resamples that sum. The warp is scaled so the screen corner lands on the texture
 // corner — no black edges, and no extra pass when blur is off.
 // Lens dirt: fullscreen additive map, lit by bloom luminance (sun / muzzle / explosions).
+// Impact dirt: near-miss shell splat overlay (opaque mud map), linear fade over 5 s.
 // Aberration is the old finish pass: radial RGB split in UV units (slider 0–0.008).
 // At 0 the extra taps are skipped. Grain is animated and added after the grade.
 // Grade (contrast, saturation, temperature, shadow/mid/highlight tint, vignette)
@@ -17,16 +18,29 @@ import { bloom as bloomNode } from 'three/examples/jsm/tsl/display/BloomNode.js'
 import { motionBlur } from 'three/examples/jsm/tsl/display/MotionBlur.js';
 
 const LENS_DIRT_URL = './textures/vfx/lens_dirt.jpg';
+const IMPACT_DIRT_URL = './textures/vfx/shell_impact_dirt.png';
+const IMPACT_DIRT_FADE = 5; // seconds from full splat → clear
 
 export async function createPost(renderer, scene, camera) {
-  const dirtMap = await new THREE.TextureLoader().loadAsync(LENS_DIRT_URL);
+  const loader = new THREE.TextureLoader();
+  const [dirtMap, impactDirtMap] = await Promise.all([
+    loader.loadAsync(LENS_DIRT_URL),
+    loader.loadAsync(IMPACT_DIRT_URL),
+  ]);
   dirtMap.colorSpace = THREE.NoColorSpace;
   dirtMap.wrapS = dirtMap.wrapT = THREE.ClampToEdgeWrapping;
+  // Artistic mask (black = clear). Keep byte values — sRGB linearize makes mud invisible in HDR.
+  impactDirtMap.colorSpace = THREE.NoColorSpace;
+  impactDirtMap.wrapS = impactDirtMap.wrapT = THREE.ClampToEdgeWrapping;
   const dirtTex = texture(dirtMap);
+  const impactDirtTex = texture(impactDirtMap);
   // Overall dirt opacity when fully lit. 0 = off.
   const uLensDirt = uniform(1.6);
   // 0..1: camera aimed at the sun (CPU). Ordinary sky bloom must not light dirt.
   const uLensDirtView = uniform(0);
+  // Near-miss shell splat on the lens (CPU fades linearly over IMPACT_DIRT_FADE).
+  const uImpactDirt = uniform(0);
+  let impactDirtOpacity = 0;
   const _dirtView = new THREE.Vector3();
   // VelocityNode is NDC; motionBlur samples in UV — same scale as TRAA / velocityToUVOffset.
   const blurAmount = uniform(1);
@@ -151,6 +165,12 @@ export async function createPost(renderer, scene, camera) {
     return frame.add(vec4(dirt.mul(amount), 0));
   }
 
+  // Shell near-miss: mud on the glass. Texture alpha is the mask; uImpactDirt fades 1 → 0.
+  function applyImpactDirt(frame) {
+    const dirt = impactDirtTex.sample(screenUV);
+    return vec4(mix(frame.rgb, dirt.rgb, dirt.a.mul(uImpactDirt)), frame.a);
+  }
+
   // smoothstep(0.62, 0.93, dot(view, sun)) — off until aimed well into the sun.
   function updateLensDirtView(sunDirection) {
     if (!sunDirection) {
@@ -220,8 +240,9 @@ export async function createPost(renderer, scene, camera) {
       bloomColor = bloomPass;
       frame = color.add(bloomPass);
     }
+    // Impact mud sits on the lens after grade so it stays readable over HDR/tonemap.
     frame = applyLensDirt(frame, bloomColor);
-    pipeline.outputNode = applyGrain(gradeFrame(frame));
+    pipeline.outputNode = applyGrain(applyImpactDirt(gradeFrame(frame)));
     // RenderPipeline keeps the previous output shader until this is set.
     pipeline.needsUpdate = true;
     return { pipeline, bloomPass };
@@ -334,10 +355,23 @@ export async function createPost(renderer, scene, camera) {
     setHurt(hpFrac) {
       hurtHp = Math.max(0, Math.min(1, +hpFrac || 0));
     },
+    /** Enemy shell hit dirt within ~4 m — full splat, then linear fade over 5 s. */
+    splatImpactDirt() {
+      impactDirtOpacity = 1;
+      uImpactDirt.value = 1;
+    },
+    clearImpactDirt() {
+      impactDirtOpacity = 0;
+      uImpactDirt.value = 0;
+    },
     render(dt, bright, sunDirection) {
       finish.uniforms.time.value += dt * 60;
       hurtTime += dt;
       uDamageVignette.value = damageVignetteAmount(hurtHp, hurtTime);
+      if (impactDirtOpacity > 0) {
+        impactDirtOpacity = Math.max(0, impactDirtOpacity - dt / IMPACT_DIRT_FADE);
+        uImpactDirt.value = impactDirtOpacity;
+      }
       updateLensDirtView(sunDirection);
       (bright ? glowChain : plainChain).pipeline.render();
     },

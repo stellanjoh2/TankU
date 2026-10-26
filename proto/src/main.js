@@ -294,7 +294,7 @@ async function main() {
   const match = createMatch({
     tank, foes, nav, fx, hud, sfx, tankCam, input,
     vegetation, airfield, port, waterTower, barrels, woodenCrates, trucks, patrolBoat, spawn,
-    smoke,
+    smoke, post,
     onRestart: (opts) => onMatchRestart(opts),
   });
   match.wireFx();

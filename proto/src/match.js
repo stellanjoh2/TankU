@@ -23,6 +23,7 @@ const STRESS_PER_SHELL = 55;           // side hit; scaled by shellDamage (rear 
 const HIT_KICK_RETURN = 2;             // s, camera shove when a shell hits you
 const MG_FLYBY_MAX = 9;               // m miss distance that still whooshes
 const MG_TRACER_SPEED = 220 * 0.75;    // keep in sync with fx.js tracer travel
+const SHELL_DIRT_LENS_R = 10;         // m XZ: ground impact → lens dirt splat
 // Match tank.js hull (offset 1.25, half-h 0.7) and turret (offset 2.4, half-h 0.45).
 const HULL_BOTTOM_Y = 1.25 - 0.7;      // wet: hull in the water → drown timer
 const TANK_TOP_Y = 2.4 + 0.45;         // fully under: instant kill
@@ -67,6 +68,7 @@ export function createMatch({
   tank, foes, nav, fx, hud, sfx, tankCam, input,
   vegetation, airfield, port, waterTower, barrels, woodenCrates, trucks, patrolBoat, spawn,
   smoke = null,
+  post = null,
   onRestart = () => {},
 }) {
   const game = {
@@ -151,6 +153,7 @@ export function createMatch({
     hud.clearHits();
     hud.setHealth(1);
     hud.setNitro(1, false);
+    post?.clearImpactDirt?.();
     onRestart({ resetCam });
   }
 
@@ -331,10 +334,23 @@ export function createMatch({
       }
     };
 
-    // Air-raid dirt impacts — thump synced to the strafe rate of fire.
-    fx.onMgDirtHit = ({ point, air }) => {
-      if (!air || !point) return;
-      sfx.dirtThump(distGain(point.distanceTo(tank.model.position), 110));
+    // MG dirt / water impacts (air-raid + surface hits).
+    fx.onMgDirtHit = ({ point, air, water }) => {
+      if (!point) return;
+      // Dirt thump stays air-raid only; water splash plays for any sea hit.
+      if (!water && !air) return;
+      const g = distGain(point.distanceTo(tank.model.position), 110);
+      if (water) sfx.waterSplash(g);
+      else sfx.dirtThump(g);
+    };
+
+    // Shell into dirt within SHELL_DIRT_LENS_R (XZ) — yours or enemy — → lens mud + light jolt.
+    fx.onShellDirtHit = ({ point, naval }) => {
+      if (naval || !tank.alive || !point) return;
+      const t = tank.model.position;
+      if (Math.hypot(point.x - t.x, point.z - t.z) > SHELL_DIRT_LENS_R) return;
+      post?.splatImpactDirt?.();
+      tankCam.addShake(0.28);
     };
   }
 
