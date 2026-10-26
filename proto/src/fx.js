@@ -414,8 +414,9 @@ export class Effects {
 
     this.lights = [0, 1].map(() => {
       const l = new THREE.PointLight(0xffb060, 0, 40, 2);
+      l.castShadow = false;
       scene.add(l);
-      return { light: l, t: 1, peak: 0 };
+      return { light: l, t: 1, peak: 0, fade: 0.25 };
     });
     this._light = 0;
 
@@ -559,7 +560,9 @@ export class Effects {
         this.scene.add(mesh);
         return mesh;
       });
-      const light = new THREE.PointLight(0xffb060, 0, 18, 2);
+      // Ground pool ahead of the muzzle — short range, no shadows (cheap + soft).
+      const light = new THREE.PointLight(0xffc060, 0, 7.5, 2);
+      light.castShadow = false;
       this.scene.add(light);
       return { star, plumes, light };
     };
@@ -621,13 +624,14 @@ export class Effects {
     this._blitDamageFire(0);
   }
 
-  _flashLight(pos, peak, { color = 0xffb060, distance = 40 } = {}) {
+  _flashLight(pos, peak, { color = 0xffb060, distance = 40, fade = 0.25 } = {}) {
     const L = this.lights[this._light++ % this.lights.length];
     L.light.position.copy(pos);
     L.light.color.set(color);
     L.light.distance = distance;
     L.t = 0;
     L.peak = peak;
+    L.fade = fade;
   }
 
   /** Soft puff. Additive flames share the flash billboard; smoke shares one material. */
@@ -746,7 +750,8 @@ export class Effects {
     fx.plumes[1].scale.set(size, size, 1);
     fx.plumes[1].visible = visible;
 
-    fx.light.position.copy(pos).addScaledVector(dir, 0.3);
+    // ~5 m downrange so the pulse reads on the ground, not just at the muzzle.
+    fx.light.position.copy(pos).addScaledVector(dir, 5);
   }
 
   /**
@@ -1263,7 +1268,12 @@ export class Effects {
     else d.normalize();
     this._spawnMainMuzzle(this.mainMuzzleFront, pos, d, false);
     this._spawnMainMuzzle(this.mainMuzzleSide, pos, d, true);
-    this._flashLight(pos.clone().addScaledVector(d, 0.8), 45, { color: 0xffcc33, distance: 4 });
+    // Ground pool ~8 m downrange, dropped 1 m so it reads on the terrain.
+    const blastLight = pos.clone().addScaledVector(d, 8);
+    blastLight.y -= 1;
+    this._flashLight(blastLight, 619, {
+      color: 0xffc060, distance: 18, fade: 0.25,
+    });
   }
 
   /** Cruiser broadside: a tank muzzle scaled up, plus a thick smoke plume downrange. */
@@ -1918,7 +1928,8 @@ export class Effects {
 
     for (const L of this.lights) {
       L.t += dt;
-      L.light.intensity = L.t < 0.25 ? L.peak * (1 - L.t / 0.25) ** 2 : 0;
+      const fade = L.fade || 0.25;
+      L.light.intensity = L.t < fade ? L.peak * (1 - L.t / fade) ** 2 : 0;
     }
   }
 }
