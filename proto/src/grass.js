@@ -14,9 +14,9 @@ const CHUNK = 16;
  */
 const LOD_EDGES = [20, 40, 65, 90];
 const BAND_DENSITY = [1, 1, 0.75, 0.5, 0.4];
-// Centre spacing ~1.34 m: the old scatter averaged ~1.27 m and stacked some clumps.
+// Centre spacing ~1.55 m (~25% fewer clumps than 1.34 m — fewer shadow receivers).
 // Cluster mask (GRASS_CLUSTER_CUT) drops another ~25% into bare zones between meadows.
-const CELL = 1.34;
+const CELL = 1.55;
 // LOD00 native height ≈ 0.14 m; ~0.5–1.0 m after scale (+15% vs prior 5.4).
 const BASE_SCALE = 6.21;
 const HALF = SIZE * 0.5;

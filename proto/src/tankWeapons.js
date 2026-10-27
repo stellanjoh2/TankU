@@ -5,7 +5,7 @@ export const RELOAD = 4.0;
 export const MG_HEAT_TIME = 6;
 export const MG_COOLDOWN = RELOAD * 2;
 const MG_HEAT_BLEED = 4.5;
-export const SHELL_SPEED = 260 * 0.8;
+export const SHELL_SPEED = 260 * 0.8 * 0.75;
 const RECOIL_IMPULSE = 4500;
 
 const _up = new THREE.Vector3(0, 1, 0);

@@ -85,11 +85,6 @@ function hydrate(json) {
     bloom: json.bloom,
     bloomRadius: json.bloomRadius,
     bloomThresh: json.bloomThresh,
-    ao: json.ao ?? VISUAL_DEFAULTS.ao,
-    aoType: json.aoType ?? VISUAL_DEFAULTS.aoType,
-    aoRadius: json.aoRadius ?? VISUAL_DEFAULTS.aoRadius,
-    aoScale: json.aoScale ?? VISUAL_DEFAULTS.aoScale,
-    aoIntensity: json.aoIntensity ?? VISUAL_DEFAULTS.aoIntensity,
     exposure: json.exposure,
     contrast: json.contrast,
     saturation: json.saturation,
@@ -226,11 +221,6 @@ export function createVisualsEditor(ctx) {
       bloom: bloom.strength,
       bloomRadius: bloom.radius,
       bloomThresh: bloom.threshold,
-      ao: post.ao?.enabled ?? false,
-      aoType: post.ao?.type ?? VISUAL_DEFAULTS.aoType,
-      aoRadius: post.ao?.radius ?? VISUAL_DEFAULTS.aoRadius,
-      aoScale: post.ao?.scale ?? VISUAL_DEFAULTS.aoScale,
-      aoIntensity: post.ao?.intensity ?? VISUAL_DEFAULTS.aoIntensity,
       exposure: grade.exposure.value,
       contrast: grade.contrast.value,
       saturation: grade.saturation.value,
@@ -290,13 +280,6 @@ export function createVisualsEditor(ctx) {
     bloom.strength = s.bloom;
     bloom.radius = s.bloomRadius;
     bloom.threshold = s.bloomThresh;
-    if (post.ao) {
-      post.ao.type = s.aoType ?? VISUAL_DEFAULTS.aoType;
-      post.ao.radius = s.aoRadius ?? VISUAL_DEFAULTS.aoRadius;
-      post.ao.scale = s.aoScale ?? VISUAL_DEFAULTS.aoScale;
-      post.ao.intensity = s.aoIntensity ?? VISUAL_DEFAULTS.aoIntensity;
-      post.ao.enabled = !!s.ao;
-    }
     grade.exposure.value = s.exposure;
     grade.contrast.value = s.contrast;
     grade.saturation.value = s.saturation;
@@ -375,11 +358,6 @@ export function createVisualsEditor(ctx) {
       bloom: s.bloom,
       bloomRadius: s.bloomRadius,
       bloomThresh: s.bloomThresh,
-      ao: s.ao,
-      aoType: s.aoType,
-      aoRadius: s.aoRadius,
-      aoScale: s.aoScale,
-      aoIntensity: s.aoIntensity,
       exposure: s.exposure,
       contrast: s.contrast,
       saturation: s.saturation,
@@ -690,20 +668,6 @@ export function createVisualsEditor(ctx) {
     addSlider(s, 'Bloom', 0, 2.5, 0.05, () => bloom.strength, (v) => { bloom.strength = v; });
     addSlider(s, 'Bloom radius', 0, 1.5, 0.05, () => bloom.radius, (v) => { bloom.radius = v; });
     addSlider(s, 'Bloom thresh', 0, 1.5, 0.05, () => bloom.threshold, (v) => { bloom.threshold = v; });
-    if (post.ao) {
-      addToggle(s, 'Ambient occlusion', () => post.ao.enabled, (v) => { post.ao.enabled = v; });
-      addToggle(s, 'AO use SSAO', () => post.ao.type === 'SSAO', (v) => {
-        post.ao.type = v ? 'SSAO' : 'GTAO';
-      });
-      addSlider(s, 'AO radius', 0.1, 4, 0.05, () => post.ao.radius, (v) => { post.ao.radius = v; });
-      // Intensity = SSAO strength; scale = GTAO strength (the other slider is ignored).
-      addSlider(s, 'AO intensity (SSAO)', 0, 4, 0.05, () => post.ao.intensity, (v) => {
-        post.ao.intensity = v;
-      });
-      addSlider(s, 'AO scale (GTAO)', 0.01, 2, 0.01, () => post.ao.scale, (v) => {
-        post.ao.scale = v;
-      });
-    }
     addSlider(s, 'Grain', 0, 0.2, 0.005, () => finish.grain.value, (v) => { finish.grain.value = v; });
     addSlider(s, 'Aberration', 0, 0.008, 0.0001, () => finish.aberration.value, (v) => {
       finish.aberration.value = v;

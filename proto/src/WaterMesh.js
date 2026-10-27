@@ -11,7 +11,7 @@ import {
 
 import {
 	Fn, add, cameraPosition, div, normalize, positionWorld, positionView, positionLocal, sub, time, texture,
-	vec2, vec3, vec4, max, dot, reflect, pow, length, float, uniform, reflector, mul, mix, sin,
+	vec2, vec3, vec4, max, dot, reflect, pow, length, float, uniform, mul, mix, sin,
 	viewportDepthTexture, perspectiveDepthToViewZ, cameraNear, cameraFar, smoothstep,
 	modelWorldMatrix, modelWorldMatrixInverse,
 } from 'three/tsl';
@@ -27,8 +27,6 @@ class WaterMesh extends Mesh {
 		super( geometry, material );
 
 		this.isWaterMesh = true;
-
-		this.resolutionScale = options.resolutionScale !== undefined ? options.resolutionScale : 0.5;
 
 		this.waterNormals = texture( options.waterNormals );
 		this.alpha = uniform( options.alpha !== undefined ? options.alpha : 1.0 );
@@ -115,22 +113,17 @@ class WaterMesh extends Mesh {
 
 		material.colorNode = Fn( () => {
 
-			const mirrorSampler = reflector( { generateMipmaps: true } );
-			mirrorSampler.uvNode = mirrorSampler.uvNode.add( distortion );
-			mirrorSampler.reflector.resolutionScale = this.resolutionScale;
-			// Sample one mip soft so horizon and prop edges don't crawl while the camera moves.
-			const mirror = mirrorSampler.bias( float( 1.0 ) );
-
-			this.add( mirrorSampler.target );
-
 			const theta = max( dot( eyeDirection, surfaceNormal ), 0.0 );
 			const rf0 = float( 0.02 );
 			const reflectance = mul( pow( float( 1.0 ).sub( theta ), 5.0 ), float( 1.0 ).sub( rf0 ) ).add( rf0 );
 
-			// Turquoise absorption near contact; keep reflections in deep water.
+			// Cheap sky tint instead of a planar reflector (extra full-scene pass).
+			const fakeSky = mix( this.waterColor.mul( 0.4 ), this.sunColor.mul( 0.55 ), max( this.sunDirection.y, 0.0 ).mul( 0.45 ).add( 0.35 ) );
+
+			// Turquoise absorption near contact; keep specular glints in deep water.
 			const tint = mix( this.waterColor, this.shallowColor, shallow.mul( shallow ) );
 			const scatter = max( 0.0, dot( surfaceNormal, eyeDirection ) ).mul( tint );
-			const deepAlbedo = mix( this.sunColor.mul( diffuseLight ).mul( 0.3 ).add( scatter ), mirror.rgb.add( specularLight ), reflectance );
+			const deepAlbedo = mix( this.sunColor.mul( diffuseLight ).mul( 0.3 ).add( scatter ), fakeSky.add( specularLight ), reflectance );
 			const shoreAlbedo = mix( deepAlbedo, tint, shallow.mul( 0.65 ) );
 			const foamColor = vec3( 0.92, 0.96, 0.98 );
 

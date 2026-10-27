@@ -649,7 +649,6 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
       distortionScale: 3.7,
       size: 2.0,
       timeScale: 0.5,
-      resolutionScale: 0.5,
     },
   );
   water.rotation.x = -Math.PI / 2;

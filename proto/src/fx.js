@@ -148,6 +148,22 @@ const MAIN_MUZZLE = {
   emissive: SPRITE_EMISSIVE,
 };
 
+/** Shared by muzzle flash + in-flight shell so both stay in sync while tuning. */
+const MAIN_GUN_LIGHT = {
+  color: 0xffc060,
+  intensity: 1238,
+  distance: 36,
+  decay: 2,
+  fade: 0.25,
+};
+
+/** Damage-fire lights: derived from muzzle, then −25% radius/strength (×2) and warmer hue. */
+const FIRE_LIGHT = {
+  color: 0xff8840, // +25% warmer hue vs prior 0xffa040
+  intensityMul: 0.25 * 0.75 * 0.75,
+  distanceMul: 0.75 * 0.75,
+};
+
 const MG_FLASH = {
   starUrl: './textures/vfx/T_muzzle_star.png',
   plumeUrl: './textures/vfx/T_muzzle_plume.png',
@@ -464,6 +480,14 @@ export class Effects {
     this._burstBoards = this.burstTexs.map((tex) => createBillboard(scene, tex, 8, { emissive: true, renderOrder: 4 }));
     this._glowBoard = null;
     this._shellPool = createMeshPool(scene, this.shellGeo, this.shellMat, 16);
+    for (const s of this._shellPool.slots) {
+      const light = new THREE.PointLight(
+        MAIN_GUN_LIGHT.color, 0, MAIN_GUN_LIGHT.distance, MAIN_GUN_LIGHT.decay,
+      );
+      light.castShadow = false;
+      scene.add(light);
+      s.light = light;
+    }
     this._tracerPool = createMeshPool(scene, this.mgTracerGeo, this.mgTracerMat, 128);
     this._brassPool = createMeshPool(scene, this.brassGeo, this.brassMat, 96);
     this._debrisPool = createMeshPool(scene, this.debrisGeo, this.debrisMat, 48);
@@ -561,7 +585,7 @@ export class Effects {
         return mesh;
       });
       // Ground pool ahead of the muzzle — short range, no shadows (cheap + soft).
-      const light = new THREE.PointLight(0xffc060, 0, 7.5, 2);
+      const light = new THREE.PointLight(0xffc060, 0, 15, 2);
       light.castShadow = false;
       this.scene.add(light);
       return { star, plumes, light };
@@ -617,6 +641,12 @@ export class Effects {
       sprite.frustumCulled = false;
       sprite.renderOrder = 2;
       sprite.userData.fireFade = fadeU;
+      const light = new THREE.PointLight(
+        FIRE_LIGHT.color, 0, MAIN_GUN_LIGHT.distance * FIRE_LIGHT.distanceMul, MAIN_GUN_LIGHT.decay,
+      );
+      light.castShadow = false;
+      this.scene.add(light);
+      sprite.userData.fireLight = light;
       this.scene.add(sprite);
       return sprite;
     });
@@ -1023,7 +1053,7 @@ export class Effects {
     fx.star.scale.setScalar(MG_FLASH.starSize * kick);
     const ps = MG_FLASH.plumeSize * kick;
     for (const p of fx.plumes) p.scale.set(ps, ps, 1);
-    fx.light.intensity = 22 + Math.random() * 14;
+    fx.light.intensity = 44 + Math.random() * 28;
     stream.flashAge = 0;
     this._mgSmoke(pos, dir);
     this._ejectMgBrass(pos, dir);
@@ -1114,10 +1144,10 @@ export class Effects {
 
   /**
    * Side card stands upright along the barrel.
-   * Texture-left is the pointed tip, so local -X aims downrange.
+   * Texture-left is the narrow tip (at the muzzle); local +X aims downrange.
    */
   _aimMuzzleSide(mesh, dir) {
-    const x = this._muzzleX.copy(dir).negate();
+    const x = this._muzzleX.copy(dir);
     const y = this._muzzleY.set(0, 1, 0);
     y.addScaledVector(dir, -y.dot(dir));
     if (y.lengthSq() < 1e-8) y.set(0, 0, 1);
@@ -1250,7 +1280,7 @@ export class Effects {
     const obj = card.obj;
     obj.scale.set(w, h, 1);
     if (side) {
-      // Fat end of the blast sits on the muzzle; the point leads downrange.
+      // Narrow tip sits on the muzzle; the flare leads downrange.
       obj.position.copy(pos).addScaledVector(dir, w * 0.35);
       this._aimMuzzleSide(obj, dir);
       if (!card._dir) card._dir = new THREE.Vector3();
@@ -1271,8 +1301,10 @@ export class Effects {
     // Ground pool ~8 m downrange, dropped 1 m so it reads on the terrain.
     const blastLight = pos.clone().addScaledVector(d, 8);
     blastLight.y -= 1;
-    this._flashLight(blastLight, 619, {
-      color: 0xffc060, distance: 18, fade: 0.25,
+    this._flashLight(blastLight, MAIN_GUN_LIGHT.intensity, {
+      color: MAIN_GUN_LIGHT.color,
+      distance: MAIN_GUN_LIGHT.distance,
+      fade: MAIN_GUN_LIGHT.fade,
     });
   }
 
@@ -1327,11 +1359,20 @@ export class Effects {
     if (dir.lengthSq() > 1e-8) dir.normalize();
     else dir.set(1, 0, 0);
     this._placeTracer(s.mesh, s.pos, dir, SHELL_GEO_LEN, SHELL_GEO_LEN);
+    s.light.color.set(MAIN_GUN_LIGHT.color);
+    s.light.distance = MAIN_GUN_LIGHT.distance;
+    s.light.intensity = MAIN_GUN_LIGHT.intensity;
+    s.light.position.copy(pos);
     this.shells.push(s);
   }
 
+  _releaseShell(s) {
+    s.light.intensity = 0;
+    releaseSlot(this._shellPool, s);
+  }
+
   clearShells() {
-    for (const s of this.shells) releaseSlot(this._shellPool, s);
+    for (const s of this.shells) this._releaseShell(s);
     this.shells.length = 0;
     for (const t of this.mgTracers) releaseSlot(this._tracerPool, t);
     this.mgTracers.length = 0;
@@ -1628,15 +1669,28 @@ export class Effects {
     const k = fade > 0 ? fade : 0;
     const scale = DAMAGE_FIRE_SCALE[stage] ?? 0;
     const u = sprite.userData.fireFade;
+    const light = sprite.userData.fireLight;
     if (scale <= 0 || !pos || k <= 0.02) {
       sprite.visible = false;
       if (u) u.value = 1;
+      if (light) light.intensity = 0;
       return;
     }
     sprite.visible = true;
     sprite.position.copy(pos);
     if (u) u.value = k;
     sprite.scale.set(scale, scale, 1);
+    // Pivot is near the feet (center.y ≈ 0.02); light sits in the middle of the card.
+    // Size tracks damage stage (HP); fade is wreck burn-out. Both scale the light.
+    if (light) {
+      const maxScale = DAMAGE_FIRE_SCALE[DAMAGE_FIRE_SCALE.length - 1];
+      const sizeK = maxScale > 0 ? scale / maxScale : 0;
+      light.color.set(FIRE_LIGHT.color);
+      light.distance = MAIN_GUN_LIGHT.distance * FIRE_LIGHT.distanceMul * (0.45 + 0.55 * sizeK);
+      light.intensity = MAIN_GUN_LIGHT.intensity * FIRE_LIGHT.intensityMul * k * sizeK;
+      light.position.copy(pos);
+      light.position.y += scale * (0.5 - sprite.center.y);
+    }
   }
 
   /** Metres to the nearest visible fire-gif, or Infinity when nothing is burning. */
@@ -1738,7 +1792,16 @@ export class Effects {
       const peak = Math.max(21, 10.5, 2.4);
       glow.color.setRGB(21, 10.5, 2.4).multiplyScalar(SPRITE_EMISSIVE / peak);
     }
-    this._flashLight(this._hitPoint.copy(point).addScaledVector(normal, 1.5), 220);
+    if (muzzle) {
+      // Same peak as the muzzle flash; linger 1 s so the impact pool reads across the ground.
+      this._flashLight(this._hitPoint.copy(point).addScaledVector(normal, 1.5), MAIN_GUN_LIGHT.intensity, {
+        color: FIRE_LIGHT.color,
+        distance: MAIN_GUN_LIGHT.distance,
+        fade: 1,
+      });
+    } else {
+      this._flashLight(this._hitPoint.copy(point).addScaledVector(normal, 1.5), 220);
+    }
 
     // Emissive sparks: fly out from center, bounce, white → red as they die.
     for (let i = 0; emissive && i < 30; i++) {
@@ -1850,12 +1913,13 @@ export class Effects {
           this._boomN.set(0, 1, 0);
           this._explode(this._shellHit, this._boomN, dir, null, { muzzle: true });
         }
-        releaseSlot(this._shellPool, s);
+        this._releaseShell(s);
         this.shells.splice(i, 1);
         continue;
       }
       s.pos.add(step);
       s.vel.y -= GRAVITY * dt;
+      s.light.position.copy(s.pos);
       const visLen = Math.min(SHELL_VIS_MAX, Math.max(SHELL_GEO_LEN, len * 0.38));
       this._placeTracer(s.mesh, s.pos, dir, visLen, SHELL_GEO_LEN);
     }
