@@ -430,7 +430,7 @@ export class Tank {
   get nitroCharge() { return this.nitro.charge; }
   get nitroActive() { return this.nitro.t > 0; }
 
-  /** Rising-edge Shift/L1: spend half a bar if available. Returns true when a burst starts. */
+  /** Rising-edge Shift/L3: spend half a bar if available. Returns true when a burst starts. */
   tryNitro() { return startNitro(this); }
 
   /**

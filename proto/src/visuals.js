@@ -40,6 +40,7 @@ function hydrate(json) {
   const g = json.ground;
   return {
     horizon: col(json.horizon),
+    skyColor: col(json.skyColor ?? '#ffffff'),
     fogNear: json.fogNear,
     fogFar: json.fogFar,
     elev: json.elev,
@@ -84,6 +85,11 @@ function hydrate(json) {
     bloom: json.bloom,
     bloomRadius: json.bloomRadius,
     bloomThresh: json.bloomThresh,
+    ao: json.ao ?? VISUAL_DEFAULTS.ao,
+    aoType: json.aoType ?? VISUAL_DEFAULTS.aoType,
+    aoRadius: json.aoRadius ?? VISUAL_DEFAULTS.aoRadius,
+    aoScale: json.aoScale ?? VISUAL_DEFAULTS.aoScale,
+    aoIntensity: json.aoIntensity ?? VISUAL_DEFAULTS.aoIntensity,
     exposure: json.exposure,
     contrast: json.contrast,
     saturation: json.saturation,
@@ -143,6 +149,7 @@ export function createVisualsEditor(ctx) {
   }
 
   const fogColor = sky.userData.fogColor;
+  const skyTint = sky.userData.skyTint;
   const gU = grass.material.uniforms;
   const bloom = post.bloom;
   const grade = post.grade.uniforms;
@@ -174,6 +181,7 @@ export function createVisualsEditor(ctx) {
   function readState() {
     return {
       horizon: fogColor.clone(),
+      skyColor: skyTint.value.clone(),
       fogNear: scene.fog.near,
       fogFar: scene.fog.far,
       elev,
@@ -218,6 +226,11 @@ export function createVisualsEditor(ctx) {
       bloom: bloom.strength,
       bloomRadius: bloom.radius,
       bloomThresh: bloom.threshold,
+      ao: post.ao?.enabled ?? false,
+      aoType: post.ao?.type ?? VISUAL_DEFAULTS.aoType,
+      aoRadius: post.ao?.radius ?? VISUAL_DEFAULTS.aoRadius,
+      aoScale: post.ao?.scale ?? VISUAL_DEFAULTS.aoScale,
+      aoIntensity: post.ao?.intensity ?? VISUAL_DEFAULTS.aoIntensity,
       exposure: grade.exposure.value,
       contrast: grade.contrast.value,
       saturation: grade.saturation.value,
@@ -246,6 +259,7 @@ export function createVisualsEditor(ctx) {
     scene.fog.near = s.fogNear;
     scene.fog.far = s.fogFar;
     grass.setFog(s.horizon, s.fogNear, s.fogFar);
+    if (s.skyColor) skyTint.value.copy(s.skyColor);
     elev = s.elev;
     az = s.az;
     applySunDir();
@@ -276,6 +290,13 @@ export function createVisualsEditor(ctx) {
     bloom.strength = s.bloom;
     bloom.radius = s.bloomRadius;
     bloom.threshold = s.bloomThresh;
+    if (post.ao) {
+      post.ao.type = s.aoType ?? VISUAL_DEFAULTS.aoType;
+      post.ao.radius = s.aoRadius ?? VISUAL_DEFAULTS.aoRadius;
+      post.ao.scale = s.aoScale ?? VISUAL_DEFAULTS.aoScale;
+      post.ao.intensity = s.aoIntensity ?? VISUAL_DEFAULTS.aoIntensity;
+      post.ao.enabled = !!s.ao;
+    }
     grade.exposure.value = s.exposure;
     grade.contrast.value = s.contrast;
     grade.saturation.value = s.saturation;
@@ -309,6 +330,7 @@ export function createVisualsEditor(ctx) {
     const c = (col) => `#${col.getHexString()}`;
     return {
       horizon: c(s.horizon),
+      skyColor: c(s.skyColor),
       fogNear: s.fogNear,
       fogFar: s.fogFar,
       elev: s.elev,
@@ -353,6 +375,11 @@ export function createVisualsEditor(ctx) {
       bloom: s.bloom,
       bloomRadius: s.bloomRadius,
       bloomThresh: s.bloomThresh,
+      ao: s.ao,
+      aoType: s.aoType,
+      aoRadius: s.aoRadius,
+      aoScale: s.aoScale,
+      aoIntensity: s.aoIntensity,
       exposure: s.exposure,
       contrast: s.contrast,
       saturation: s.saturation,
@@ -385,29 +412,51 @@ export function createVisualsEditor(ctx) {
       <span class="vis-hint">V</span>
       <button type="button" class="vis-close" title="Close">×</button>
     </header>
-    <div class="vis-body"></div>
+    <nav class="vis-tabs" role="tablist">
+      <button type="button" class="vis-tab active" data-tab="lighting" role="tab">Lighting</button>
+      <button type="button" class="vis-tab" data-tab="world" role="tab">World</button>
+    </nav>
+    <div class="vis-body">
+      <div class="vis-pane" data-pane="lighting"></div>
+      <div class="vis-pane hidden" data-pane="world"></div>
+    </div>
     <div class="vis-footer">
       <button type="button" class="vis-copy">Copy settings</button>
       <button type="button" class="vis-reset">Reset</button>
     </div>`;
-  const body = panel.querySelector('.vis-body');
+  const panes = {
+    lighting: panel.querySelector('[data-pane="lighting"]'),
+    world: panel.querySelector('[data-pane="world"]'),
+  };
   document.body.append(panel);
 
   for (const type of ['mousedown', 'pointerdown', 'click', 'wheel', 'dblclick']) {
     panel.addEventListener(type, (e) => e.stopPropagation());
   }
 
+  panel.querySelector('.vis-tabs').addEventListener('click', (e) => {
+    const btn = e.target.closest('.vis-tab');
+    if (!btn) return;
+    const id = btn.dataset.tab;
+    for (const t of panel.querySelectorAll('.vis-tab')) {
+      t.classList.toggle('active', t === btn);
+    }
+    for (const [key, pane] of Object.entries(panes)) {
+      pane.classList.toggle('hidden', key !== id);
+    }
+  });
+
   /** @type {{ sync: () => void }[]} */
   const controls = [];
 
-  function addSection(title) {
+  function addSection(parent, title) {
     const el = document.createElement('details');
     el.open = true;
     el.className = 'vis-section';
     const sum = document.createElement('summary');
     sum.textContent = title;
     el.append(sum);
-    body.append(el);
+    parent.append(el);
     return el;
   }
 
@@ -475,9 +524,12 @@ export function createVisualsEditor(ctx) {
     for (const c of controls) c.sync();
   }
 
+  const lighting = panes.lighting;
+  const world = panes.world;
+
   // Game (dev) — not part of the visual look, so Reset / Copy settings leave these alone
   if (game) {
-    const s = addSection('Game');
+    const s = addSection(lighting, 'Game');
     addToggle(s, 'Solo (no enemy)', game.getSolo, game.setSolo);
     addToggle(s, 'Show AI path', game.getShowPath, game.setShowPath);
     if (game.getMusicMuted && game.setMusicMuted) {
@@ -507,7 +559,8 @@ export function createVisualsEditor(ctx) {
 
   // Sky & fog (SkyMesh / webgpu_sky params)
   {
-    const s = addSection('Sky & fog');
+    const s = addSection(lighting, 'Sky & fog');
+    addColor(s, 'Sky colour', () => hexOf(skyTint.value), (v) => skyTint.value.set(v));
     addColor(s, 'Fog colour', () => hexOf(fogColor), (v) => {
       fogColor.set(v);
       scene.fog.color.copy(fogColor);
@@ -552,7 +605,7 @@ export function createVisualsEditor(ctx) {
 
   // Sun
   {
-    const s = addSection('Sun');
+    const s = addSection(lighting, 'Sun');
     addSlider(s, 'Height', 2, 88, 1, () => elev, (v) => { elev = v; applySunDir(); });
     addSlider(s, 'Azimuth', -180, 180, 1, () => az, (v) => { az = v; applySunDir(); });
     addSlider(s, 'Strength', 0, 8, 0.05, () => sun.intensity, (v) => { sun.intensity = v; });
@@ -575,7 +628,7 @@ export function createVisualsEditor(ctx) {
 
   // Fill
   {
-    const s = addSection('Fill light');
+    const s = addSection(lighting, 'Fill light');
     if (lightProbe) {
       addSlider(s, 'Light probe', 0, 2, 0.02, () => lightProbe.intensity, (v) => {
         lightProbe.intensity = v;
@@ -589,7 +642,7 @@ export function createVisualsEditor(ctx) {
   }
 
   if (tanks.length) {
-    const s = addSection('Tank');
+    const s = addSection(lighting, 'Tank');
     for (const [key, matName, label] of TANK_PBR) {
       addSlider(s, `${label} metallic`, 0, 1, 0.01,
         () => readTankPbr()[key].metal,
@@ -611,9 +664,68 @@ export function createVisualsEditor(ctx) {
     addSlider(s, 'Enemy LOD distance ×', 0.25, 4, 0.05, getTankLodScale, setTankLodScale);
   }
 
+  // Grading — whole-image look
+  {
+    const s = addSection(lighting, 'Grading');
+    addSlider(s, 'Exposure', 0.2, 2.5, 0.05, () => grade.exposure.value, (v) => { grade.exposure.value = v; });
+    addSlider(s, 'Contrast', 0.5, 1.8, 0.02, () => grade.contrast.value, (v) => { grade.contrast.value = v; });
+    addSlider(s, 'Saturation', 0, 2, 0.02, () => grade.saturation.value, (v) => { grade.saturation.value = v; });
+    addSlider(s, 'Temperature', -1, 1, 0.02, () => grade.temperature.value, (v) => {
+      grade.temperature.value = v;
+    });
+    addColor(s, 'Shadows', () => hexOf(grade.shadows.value), (v) => grade.shadows.value.set(v));
+    addColor(s, 'Mids', () => hexOf(grade.midtones.value), (v) => grade.midtones.value.set(v));
+    addColor(s, 'Highlights', () => hexOf(grade.highlights.value), (v) => grade.highlights.value.set(v));
+    addSlider(s, 'Vignette', 0, 1, 0.02, () => grade.vignetteIntensity.value, (v) => {
+      grade.vignetteIntensity.value = v;
+    });
+  }
+
+  // Post
+  {
+    const s = addSection(lighting, 'Post');
+    addSlider(s, 'Fisheye', 0, 2, 0.01, () => grade.fisheye.value, (v) => {
+      grade.fisheye.value = v;
+    });
+    addSlider(s, 'Bloom', 0, 2.5, 0.05, () => bloom.strength, (v) => { bloom.strength = v; });
+    addSlider(s, 'Bloom radius', 0, 1.5, 0.05, () => bloom.radius, (v) => { bloom.radius = v; });
+    addSlider(s, 'Bloom thresh', 0, 1.5, 0.05, () => bloom.threshold, (v) => { bloom.threshold = v; });
+    if (post.ao) {
+      addToggle(s, 'Ambient occlusion', () => post.ao.enabled, (v) => { post.ao.enabled = v; });
+      addToggle(s, 'AO use SSAO', () => post.ao.type === 'SSAO', (v) => {
+        post.ao.type = v ? 'SSAO' : 'GTAO';
+      });
+      addSlider(s, 'AO radius', 0.1, 4, 0.05, () => post.ao.radius, (v) => { post.ao.radius = v; });
+      // Intensity = SSAO strength; scale = GTAO strength (the other slider is ignored).
+      addSlider(s, 'AO intensity (SSAO)', 0, 4, 0.05, () => post.ao.intensity, (v) => {
+        post.ao.intensity = v;
+      });
+      addSlider(s, 'AO scale (GTAO)', 0.01, 2, 0.01, () => post.ao.scale, (v) => {
+        post.ao.scale = v;
+      });
+    }
+    addSlider(s, 'Grain', 0, 0.2, 0.005, () => finish.grain.value, (v) => { finish.grain.value = v; });
+    addSlider(s, 'Aberration', 0, 0.008, 0.0001, () => finish.aberration.value, (v) => {
+      finish.aberration.value = v;
+    });
+  }
+
+  // Lens flare (sun) — PlayCanvas CameraFrame knobs
+  if (lensFlare) {
+    const s = addSection(lighting, 'Lens flare');
+    addToggle(s, 'Enabled', () => lensFlare.enabled, (v) => { lensFlare.enabled = v; });
+    addSlider(s, 'Intensity', 0, 2, 0.01, () => lensFlare.intensity, (v) => { lensFlare.intensity = v; });
+    addSlider(s, 'Scale', 0.1, 3, 0.05, () => lensFlare.scale, (v) => { lensFlare.scale = v; });
+    addSlider(s, 'Edge fade', 0, 1, 0.01, () => lensFlare.edgeFade, (v) => { lensFlare.edgeFade = v; });
+    addToggle(s, 'Allow off-screen', () => lensFlare.allowOffScreen, (v) => { lensFlare.allowOffScreen = v; });
+    addSlider(s, 'Occlusion fade', 0, 1, 0.01, () => lensFlare.occlusionFade, (v) => {
+      lensFlare.occlusionFade = v;
+    });
+  }
+
   // Ground
   {
-    const s = addSection('Ground');
+    const s = addSection(world, 'Ground');
     // Soil, rock and beach are photo maps. Concrete and water stay flat colours.
     for (const [key, label] of [
       ['concrete', 'Concrete'],
@@ -625,7 +737,7 @@ export function createVisualsEditor(ctx) {
 
   // Grass
   {
-    const s = addSection('Grass');
+    const s = addSection(world, 'Grass');
     addColor(s, 'Base', () => hexOf(gU.uBaseColor.value), (v) => {
       grass.setColors({ base: v });
       fx?.setGrassColors?.({ base: v });
@@ -649,7 +761,7 @@ export function createVisualsEditor(ctx) {
 
   // Vegetation (palms / tropical pack)
   if (vegetation) {
-    const s = addSection('Vegetation');
+    const s = addSection(world, 'Vegetation');
     addSlider(s, 'Palm trees', 0, 2, 0.05, () => vegetation.getPalmAmount(), (v) => {
       vegetation.setPalmAmount(v);
     });
@@ -667,58 +779,13 @@ export function createVisualsEditor(ctx) {
   }
 
   if (barrels || trucks) {
-    const s = addSection('Props');
+    const s = addSection(world, 'Props');
     if (barrels) {
       addSlider(s, 'Barrel LOD distance ×', 0.25, 4, 0.05, () => barrels.getLodScale(), (v) => barrels.setLodScale(v));
     }
     if (trucks) {
       addSlider(s, 'Truck LOD distance ×', 0.25, 4, 0.05, () => trucks.getLodScale(), (v) => trucks.setLodScale(v));
     }
-  }
-
-  // Grading — whole-image look
-  {
-    const s = addSection('Grading');
-    addSlider(s, 'Exposure', 0.2, 2.5, 0.05, () => grade.exposure.value, (v) => { grade.exposure.value = v; });
-    addSlider(s, 'Contrast', 0.5, 1.8, 0.02, () => grade.contrast.value, (v) => { grade.contrast.value = v; });
-    addSlider(s, 'Saturation', 0, 2, 0.02, () => grade.saturation.value, (v) => { grade.saturation.value = v; });
-    addSlider(s, 'Temperature', -1, 1, 0.02, () => grade.temperature.value, (v) => {
-      grade.temperature.value = v;
-    });
-    addColor(s, 'Shadows', () => hexOf(grade.shadows.value), (v) => grade.shadows.value.set(v));
-    addColor(s, 'Mids', () => hexOf(grade.midtones.value), (v) => grade.midtones.value.set(v));
-    addColor(s, 'Highlights', () => hexOf(grade.highlights.value), (v) => grade.highlights.value.set(v));
-    addSlider(s, 'Vignette', 0, 1, 0.02, () => grade.vignetteIntensity.value, (v) => {
-      grade.vignetteIntensity.value = v;
-    });
-  }
-
-  // Post
-  {
-    const s = addSection('Post');
-    addSlider(s, 'Fisheye', 0, 2, 0.01, () => grade.fisheye.value, (v) => {
-      grade.fisheye.value = v;
-    });
-    addSlider(s, 'Bloom', 0, 2.5, 0.05, () => bloom.strength, (v) => { bloom.strength = v; });
-    addSlider(s, 'Bloom radius', 0, 1.5, 0.05, () => bloom.radius, (v) => { bloom.radius = v; });
-    addSlider(s, 'Bloom thresh', 0, 1.5, 0.05, () => bloom.threshold, (v) => { bloom.threshold = v; });
-    addSlider(s, 'Grain', 0, 0.2, 0.005, () => finish.grain.value, (v) => { finish.grain.value = v; });
-    addSlider(s, 'Aberration', 0, 0.008, 0.0001, () => finish.aberration.value, (v) => {
-      finish.aberration.value = v;
-    });
-  }
-
-  // Lens flare (sun) — PlayCanvas CameraFrame knobs
-  if (lensFlare) {
-    const s = addSection('Lens flare');
-    addToggle(s, 'Enabled', () => lensFlare.enabled, (v) => { lensFlare.enabled = v; });
-    addSlider(s, 'Intensity', 0, 2, 0.01, () => lensFlare.intensity, (v) => { lensFlare.intensity = v; });
-    addSlider(s, 'Scale', 0.1, 3, 0.05, () => lensFlare.scale, (v) => { lensFlare.scale = v; });
-    addSlider(s, 'Edge fade', 0, 1, 0.01, () => lensFlare.edgeFade, (v) => { lensFlare.edgeFade = v; });
-    addToggle(s, 'Allow off-screen', () => lensFlare.allowOffScreen, (v) => { lensFlare.allowOffScreen = v; });
-    addSlider(s, 'Occlusion fade', 0, 1, 0.01, () => lensFlare.occlusionFade, (v) => {
-      lensFlare.occlusionFade = v;
-    });
   }
 
   let open = false;

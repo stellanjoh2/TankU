@@ -10,12 +10,16 @@
 // At 0 the extra taps are skipped. Grain is animated and added after the grade.
 // Grade (contrast, saturation, temperature, shadow/mid/highlight tint, vignette)
 // runs in linear HDR. Exposure is renderer.toneMappingExposure inside the tone map.
+// AO (GTAO / SSAO): opaque normals pre-pass → half-res AO → multiply onto beauty.
+// (builtinAOContext only darkens ambient/IBL — too subtle under a strong sun.)
 // FXAA still unused.
 // Tone map matches three.js webgpu_tonemapping: renderer.toneMapping + toneMappingExposure.
 import * as THREE from 'three/webgpu';
-import { pass, mrt, output, emissive, velocity, uniform, vec2, vec3, vec4, float, mix, smoothstep, dot, length, normalize, rand, screenUV, screenSize, luminance, saturation, convertToTexture, texture } from 'three/tsl';
+import { pass, mrt, output, emissive, velocity, uniform, vec2, vec3, vec4, float, mix, smoothstep, dot, length, normalize, rand, screenUV, screenSize, luminance, saturation, convertToTexture, texture, sample, normalView, packNormalToRGB, unpackRGBToNormal } from 'three/tsl';
 import { bloom as bloomNode } from 'three/examples/jsm/tsl/display/BloomNode.js';
 import { motionBlur } from 'three/examples/jsm/tsl/display/MotionBlur.js';
+import { ao } from 'three/examples/jsm/tsl/display/GTAONode.js';
+import { ssao } from 'three/examples/jsm/tsl/display/SSAONode.js';
 
 const LENS_DIRT_URL = './textures/vfx/lens_dirt.jpg';
 const IMPACT_DIRT_URL = './textures/vfx/shell_impact_dirt.png';
@@ -56,6 +60,20 @@ export async function createPost(renderer, scene, camera) {
   let bloomThresh = 0.95;
   // Quarter of the drawing buffer. BloomNode's own default is half.
   const BLOOM_SCALE = 0.25;
+
+  // Screen-space AO (webgpu_postprocessing_ao). Off by default — extra opaque pre-pass.
+  let aoOn = false;
+  // SSAO is the game default: self-denoised. GTAO is sharper but noisy without TRAA.
+  let aoType = 'SSAO'; // 'GTAO' | 'SSAO'
+  let aoPrePass = null;
+  let aoPass = null;
+  let aoRadius = 1.2;
+  let aoScale = 0.75;      // GTAO strength
+  let aoThickness = 1;
+  let aoIntensity = 1.5;   // SSAO strength
+  let aoBias = 0.025;
+  let aoSamples = 16;
+  const AO_RES_SCALE = 0.5;
 
   // Same objects the Visuals panel writes (.value / Color.set). White grade colors are neutral.
   const uContrast = uniform(1);
@@ -208,10 +226,61 @@ export async function createPost(renderer, scene, camera) {
     chain.pipeline.dispose();
   }
 
+  function dropAO() {
+    if (aoPass) {
+      aoPass.dispose();
+      aoPass = null;
+    }
+    if (aoPrePass) {
+      aoPrePass.dispose();
+      aoPrePass = null;
+    }
+  }
+
+  // Opaque normals + depth for AO. Packed byte normals match the three.js example.
+  function buildAO() {
+    dropAO();
+    if (!aoOn) return;
+
+    const pre = pass(scene, camera);
+    pre.name = 'AO Pre-Pass';
+    pre.transparent = false;
+    pre.setMRT(mrt({ output: packNormalToRGB(normalView) }));
+    pre.getTexture('output').type = THREE.UnsignedByteType;
+
+    const preNormal = sample((uv) => unpackRGBToNormal(pre.getTextureNode().sample(uv)));
+    const preDepth = pre.getTextureNode('depth');
+
+    const next = aoType === 'SSAO'
+      ? ssao(preDepth, preNormal, camera)
+      : ao(preDepth, preNormal, camera);
+    next.resolutionScale = AO_RES_SCALE;
+    next.samples.value = aoSamples;
+    next.radius.value = aoRadius;
+    if (aoType === 'SSAO') {
+      next.intensity.value = aoIntensity;
+      next.bias.value = aoBias;
+      next.blurEnabled = true;
+    } else {
+      next.scale.value = aoScale;
+      next.thickness.value = aoThickness;
+      // Temporal filtering needs TRAA; leave off so the rest of the post chain stays intact.
+      next.useTemporalFiltering = false;
+    }
+
+    aoPrePass = pre;
+    aoPass = next;
+  }
+
   function makeChain(useEmissive) {
     const pipeline = new THREE.RenderPipeline(renderer);
     const scenePass = pass(scene, camera);
-    const { color, glow } = view(scenePass, useEmissive);
+    let { color, glow } = view(scenePass, useEmissive);
+    // Game-style AO: darken the lit beauty (not ambient-only). Emissive bloom stays unoccluded.
+    if (aoPass) {
+      const occl = aoPass.getTextureNode().sample(screenUV).r;
+      color = color.mul(occl);
+    }
     // Beauty is the whole frame. Emissive is added only into the bloom extract
     // so sprites that store their glow there still bloom; the sharp image stays beauty.
     const bloomInput = glow ? color.add(vec4(glow.rgb, 0)) : color;
@@ -253,6 +322,9 @@ export async function createPost(renderer, scene, camera) {
     bloomPasses.length = 0;
     dropChain(plainChain);
     dropChain(glowChain);
+    // Off → dispose and skip: no normals pre-pass, no AO node, not in the TSL graph.
+    if (aoOn) buildAO();
+    else dropAO();
     plainChain = makeChain(false);
     glowChain = makeChain(true);
   }
@@ -344,9 +416,44 @@ export async function createPost(renderer, scene, camera) {
     set strength(v) { uLensDirt.value = +v; },
   };
 
+  const aoCtrl = {
+    get enabled() { return aoOn; },
+    set enabled(v) {
+      v = !!v;
+      if (v === aoOn) return;
+      aoOn = v;
+      // Turning off must drop GPU resources before the new chains are built.
+      if (!aoOn) dropAO();
+      rebuild();
+    },
+    get type() { return aoType; },
+    set type(v) {
+      v = v === 'SSAO' ? 'SSAO' : 'GTAO';
+      if (v === aoType) return;
+      aoType = v;
+      if (aoOn) rebuild();
+    },
+    get radius() { return aoRadius; },
+    set radius(v) {
+      aoRadius = +v;
+      if (aoPass) aoPass.radius.value = aoRadius;
+    },
+    get scale() { return aoScale; },
+    set scale(v) {
+      aoScale = +v;
+      if (aoPass && aoType === 'GTAO') aoPass.scale.value = aoScale;
+    },
+    get intensity() { return aoIntensity; },
+    set intensity(v) {
+      aoIntensity = +v;
+      if (aoPass && aoType === 'SSAO') aoPass.intensity.value = aoIntensity;
+    },
+  };
+
   return {
     bloom,
     motionBlur: motionBlurCtrl,
+    ao: aoCtrl,
     grade,
     finish,
     lensDirt,

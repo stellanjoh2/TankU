@@ -161,6 +161,7 @@ export function createRadialMenu(list, opts = {}) {
       el.classList.toggle('aim', i === aim);
       el.classList.toggle('blink', i === blinkIndex);
       el.classList.toggle('cooling', cooling);
+      el.classList.toggle('ready', !cooling);
     });
     iconEls.forEach((el, i) => {
       const item = items[i];
@@ -170,6 +171,7 @@ export function createRadialMenu(list, opts = {}) {
       el.classList.toggle('blink', i === blinkIndex);
       el.classList.toggle('is-on', item.id === activeId);
       el.classList.toggle('cooling', cooling);
+      el.classList.toggle('ready', !cooling);
       let badge = el.querySelector('.radial-cd');
       if (cooling && item.detail) {
         if (!badge) {
@@ -188,18 +190,25 @@ export function createRadialMenu(list, opts = {}) {
     if (blinkIndex >= 0) {
       title = items[blinkIndex].label;
       sub = items[blinkIndex].detail;
+      cooling = !!items[blinkIndex].cooling;
     } else if (hover >= 0) {
       const item = items[hover];
       title = item.label;
-      sub = item.detail ? `${item.detail}  ·  RELEASE` : 'RELEASE';
       cooling = !!item.cooling;
+      if (cooling) sub = item.detail || 'UNAVAILABLE';
+      else sub = item.detail ? `${item.detail}  ·  RELEASE` : 'RELEASE';
     } else {
       const cur = items.find((it) => it.id === activeId);
-      if (cur) title = cur.label;
+      if (cur) {
+        title = cur.label;
+        if (cur.detail) sub = cur.detail;
+        cooling = !!cur.cooling;
+      }
     }
     labelEl.textContent = title;
     subEl.textContent = sub;
     subEl.classList.toggle('cooling', cooling);
+    subEl.classList.toggle('ready', !cooling && hover >= 0);
   }
 
   function open() {

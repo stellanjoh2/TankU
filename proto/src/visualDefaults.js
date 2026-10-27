@@ -1,6 +1,7 @@
 /** Saved look from the Visuals editor — applied on boot and used as Reset. */
 export const VISUAL_DEFAULTS = {
-  horizon: '#abcade',
+  horizon: '#9fadb7',
+  skyColor: '#fff2b3',
   fogNear: 10,
   fogFar: 260,
   elev: 42,
@@ -24,10 +25,10 @@ export const VISUAL_DEFAULTS = {
   env: 2,
   // Flat stand-ins for the baked ORM (scripts/sherman_lib.py MAT_DEFS).
   tank: {
-    paint: { metal: 0, rough: 0.44 },
-    metal: { metal: 1, rough: 0 },
-    track: { metal: 0.6, rough: 0.85 },
-    rubber: { metal: 0, rough: 0.91 },
+    paint: { metal: 0, rough: 0.24 },
+    metal: { metal: 0.25, rough: 0 },
+    track: { metal: 0.05, rough: 0.72 },
+    rubber: { metal: 0.06, rough: 0.91 },
   },
   ground: {
     grass: '#b9a67e',
@@ -51,6 +52,11 @@ export const VISUAL_DEFAULTS = {
   bloom: 0.15,
   bloomRadius: 0.2,
   bloomThresh: 1.5,
+  ao: false,
+  aoType: 'SSAO',
+  aoRadius: 1.2,
+  aoScale: 0.75,
+  aoIntensity: 1.5,
   exposure: 0.85,
   contrast: 1.02,
   saturation: 1.2,
@@ -60,7 +66,7 @@ export const VISUAL_DEFAULTS = {
   gradeHighlights: '#fff6bd',
   vignette: 1,
   fisheye: 0.05,
-  grain: 0.04,
+  grain: 0.03,
   aberration: 0,
   // Lens flare (PlayCanvas-style sun look)
   flareEnabled: true,

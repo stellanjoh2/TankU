@@ -6,6 +6,7 @@ import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js
 import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader.js';
 import { LightProbeGenerator } from 'three/examples/jsm/lights/LightProbeGenerator.js';
 import { SkyMesh } from 'three/examples/jsm/objects/SkyMesh.js';
+import { uniform, vec4 } from 'three/tsl';
 import { createPost } from './post.js';
 import { createSunLensFlare } from './lensFlare.js';
 import { buildTerrain, heightAt, isGrassable, PLAYER_SPAWN, BRIDGE, ENEMY_SPAWN, ENEMY_SPAWN_BASE, WATER_Y, shoreSigned } from './terrain.js';
@@ -140,8 +141,12 @@ async function main() {
   sky.cloudElevation.value = 0.46;
   sky.showSunDisc.value = true;
   sky.sunPosition.value.copy(sunDir);
-  // Fog colour lives on the mesh for the visuals editor (sky itself is procedural).
+  // Fog colour + sky tint live on the mesh for the visuals editor (sky itself is procedural).
   sky.userData.fogColor = fogColor;
+  const skyTint = uniform(new THREE.Color(1, 1, 1));
+  sky.userData.skyTint = skyTint;
+  const skyBase = sky.material.colorNode;
+  sky.material.colorNode = vec4(skyBase.rgb.mul(skyTint), skyBase.a);
   scene.add(sky);
 
   const sun = new THREE.DirectionalLight(new THREE.Color(1.0, 0.93, 0.82), 3.2);
@@ -757,10 +762,10 @@ async function main() {
       }
     }
     if (radial.isOpen) return;
-    if (!fly.enabled && (pressed.includes(PAD.Y) || inp.switchGun || inp.zoom)) switchMainGun();
+    if (!fly.enabled && (pressed.includes(PAD.Y) || inp.switchGun)) switchMainGun();
     if (!fly.enabled && pressed.includes(PAD.A) && tank.unflipJump(heightAt)) input.rumble(0.55, 0.35, 160);
     if (!fly.enabled && pressed.includes(PAD.VIEW)) { tank.reset(heightAt); snapCam(); }
-    if (pressed.includes(PAD.UP)) useSmoke();
+    if (pressed.includes(PAD.LB) || pressed.includes(PAD.UP)) useSmoke();
     if (pressed.includes(PAD.RIGHT)) useAir();
     if (pressed.includes(PAD.DOWN)) useRepair();
     if (pressed.includes(PAD.LEFT)) useShip();
@@ -896,11 +901,20 @@ async function main() {
     hud.setTurretYaw(tank.alive && !tank.wrecked ? tank.turret.rotation.y : 0, tank.alive && !tank.wrecked);
     radial.setActive(activeGadget);
     radial.setDetails({
-      smoke: { text: tank.smokeCd > 0.05 ? `${tank.smokeCd.toFixed(1)}s` : '', cooling: tank.smokeCd > 0.05 },
-      air: { text: airSupport.cd > 0.05 ? `${airSupport.cd.toFixed(1)}s` : '', cooling: airSupport.cd > 0.05 },
-      ship: { text: shipSupport.cd > 0.05 ? `${shipSupport.cd.toFixed(1)}s` : '', cooling: shipSupport.cd > 0.05 },
+      smoke: {
+        text: tank.smokeCd > 0.05 ? `${tank.smokeCd.toFixed(1)}s` : 'READY',
+        cooling: tank.smokeCd > 0.05,
+      },
+      air: {
+        text: airSupport.cd > 0.05 ? `${airSupport.cd.toFixed(1)}s` : (airSupport.ready ? 'READY' : 'INBOUND'),
+        cooling: !airSupport.ready,
+      },
+      ship: {
+        text: shipSupport.cd > 0.05 ? `${shipSupport.cd.toFixed(1)}s` : (shipSupport.ready ? 'READY' : 'ACTIVE'),
+        cooling: !shipSupport.ready,
+      },
       repair: {
-        text: tank.repairing ? `${tank.repairT.toFixed(1)}s` : `×${tank.repairs}`,
+        text: tank.repairing ? `${tank.repairT.toFixed(1)}s` : (tank.repairs > 0 ? `×${tank.repairs}` : 'EMPTY'),
         cooling: !tank.repairing && tank.repairs <= 0,
       },
     });
@@ -1229,7 +1243,7 @@ async function main() {
     playerMgLocked = mgLocked;
     if (mgFire) {
       fx.setMgFlash(playerPose.mgMuzzle(), playerPose.body, 'player');
-      input.rumble(0.18, 0.53, 50);
+      input.rumble(0.36, 1, 50);
     } else {
       fx.setMgFlash(null, null, 'player');
     }

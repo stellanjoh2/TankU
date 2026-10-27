@@ -3,11 +3,11 @@
 //   LS drive · RS aim
 //   R2/RT fires the selected gun · Triangle/Y switches gun
 //   R1/RB hold: gadget wheel (RS picks; last slice latches if stick recenters; never aimed = cancel)
-//   LT focus · LB nitro
+//   LT focus · LB smoke · L3 nitro
 //   A unflip (freefly up) · B freefly down
 //   D-pad up/right/down/left = smoke / air / repair / ship
 //   Menu pause · View reset tank
-// Mouse: LMB fires the selected gun, RMB or the wheel switches it, hold R opens the wheel.
+// Mouse: LMB fires the selected gun, RMB switches it, hold R opens the wheel.
 // getGamepads() is only called while a pad index is known. No pad → no poll.
 
 const DEADZONE = 0.14;
@@ -249,7 +249,7 @@ export class Input {
       if (Math.abs(padUp) > Math.abs(ascend)) ascend = padUp;
       aimX += rx * PAD_AIM_SPEED * dt;
       aimY += ry * PAD_AIM_SPEED * dt;
-      boost ||= b(PAD.LB) > 0.5;
+      boost ||= b(PAD.L3) > 0.5;
       fire ||= b(PAD.RT) > 0.5;
       zoomHold = zoomHold || b(PAD.LT) > 0.5;
     }
