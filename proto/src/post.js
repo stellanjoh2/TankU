@@ -1,21 +1,17 @@
-// WebGPU post: scene → motion blur → bloom → lens dirt → fisheye/aberration → grade → grain → ACES Filmic.
+// WebGPU post: scene → bloom → lens dirt → grade → grain → ACES Filmic.
 // Bloom runs at quarter resolution. Its input is the beauty image, plus the emissive
 // attachment while something bright is on screen (HDR sprites, brake lights, muzzle flash).
-// With both off, the sharp image is added to bloom directly. Fisheye or aberration
-// resamples that sum. The warp is scaled so the screen corner lands on the texture
-// corner — no black edges, and no extra pass when blur is off.
+// With both off, the sharp image is added to bloom directly.
 // Lens dirt: fullscreen additive map, lit by bloom luminance (sun / muzzle / explosions).
 // Impact dirt: near-miss shell splat overlay (opaque mud map), linear fade over 5 s.
-// Aberration is the old finish pass: radial RGB split in UV units (slider 0–0.008).
-// At 0 the extra taps are skipped. Grain is animated and added after the grade.
+// Grain is animated and added after the grade.
 // Grade (contrast, saturation, temperature, shadow/mid/highlight tint, vignette)
 // runs in linear HDR. Exposure is renderer.toneMappingExposure inside the tone map.
 // FXAA still unused.
 // Tone map matches three.js webgpu_tonemapping: renderer.toneMapping + toneMappingExposure.
 import * as THREE from 'three/webgpu';
-import { pass, mrt, output, emissive, velocity, uniform, vec2, vec3, vec4, float, mix, smoothstep, dot, length, normalize, rand, screenUV, screenSize, luminance, saturation, convertToTexture, texture } from 'three/tsl';
+import { pass, mrt, output, emissive, uniform, vec3, vec4, float, mix, smoothstep, dot, length, rand, screenUV, luminance, saturation, texture } from 'three/tsl';
 import { bloom as bloomNode } from 'three/examples/jsm/tsl/display/BloomNode.js';
-import { motionBlur } from 'three/examples/jsm/tsl/display/MotionBlur.js';
 
 const LENS_DIRT_URL = './textures/vfx/lens_dirt.jpg';
 const IMPACT_DIRT_URL = './textures/vfx/shell_impact_dirt.png';
@@ -42,15 +38,12 @@ export async function createPost(renderer, scene, camera) {
   const uImpactDirt = uniform(0);
   let impactDirtOpacity = 0;
   const _dirtView = new THREE.Vector3();
-  // VelocityNode is NDC; motionBlur samples in UV — same scale as TRAA / velocityToUVOffset.
-  const blurAmount = uniform(1);
   // Extra MRT targets default to no blending, which drops transparent sprites.
   const emissiveBlend = new THREE.BlendMode(THREE.NormalBlending);
 
   const bloomPasses = [];
   let plainChain = null;
   let glowChain = null;
-  let motionBlurOn = false;
   let bloomStrength = 0.15;
   let bloomRadius = 0.45;
   let bloomThresh = 0.95;
@@ -69,32 +62,11 @@ export async function createPost(renderer, scene, camera) {
   const uDamageVignette = uniform(0);
   let hurtHp = 1;
   let hurtTime = 0;
-  // 0 = rectilinear. Higher bulges the center. Corner scale keeps samples in-frame.
-  const uFisheye = uniform(0);
-  let fisheyeOn = false;
   // Finish uniforms. Same .value objects the Visuals sliders write.
-  const uAberration = uniform(0);
   const uTime = uniform(0);
   const uGrain = uniform(0.035);
   const uGrainScale = uniform(1);
   const uGrainTint = uniform(new THREE.Color(1, 1, 1));
-  // Extra RGB taps only while the slider is above zero.
-  let aberrationOn = false;
-
-  // Circular in pixels. Dividing by the corner factor zooms out just enough
-  // that the screen corner samples the texture corner.
-  function lensUv() {
-    const aspect = screenSize.x.div(screenSize.y.max(1));
-    const ratio = vec2(aspect, 1);
-    const centered = screenUV.sub(0.5).mul(ratio);
-    const r2 = dot(centered, centered);
-    const corner = ratio.mul(0.5);
-    const cornerR2 = dot(corner, corner);
-    const k = uFisheye.max(0);
-    const fit = float(1).add(k.mul(cornerR2));
-    const factor = float(1).add(k.mul(r2)).div(fit);
-    return centered.mul(factor).div(ratio).add(0.5);
-  }
 
   function tintMul(col, weight) {
     const peak = col.r.max(col.g.max(col.b));
@@ -138,11 +110,9 @@ export async function createPost(renderer, scene, camera) {
   }
 
   function damageVignetteAmount(hp, t) {
-    if (hp >= 0.25) return 0;
-    let a = (0.25 - hp) / 0.25;
-    // 1 Hz sine pulse at ≤10% HP (0.5..1.35 of the red amount).
-    if (hp <= 0.10) a *= 0.5 + 0.85 * (0.5 + 0.5 * Math.sin(t * Math.PI * 2));
-    return Math.min(1.25, a);
+    // Red vignette only at critical HP (≤10%), with a 1 Hz heartbeat pulse.
+    if (hp > 0.10) return 0;
+    return Math.min(1.25, 0.5 + 0.85 * (0.5 + 0.5 * Math.sin(t * Math.PI * 2)));
   }
 
   // Old FinishShader: hash noise, stronger on brighter pixels, tinted.
@@ -184,22 +154,17 @@ export async function createPost(renderer, scene, camera) {
   }
 
   function view(scenePass, useEmissive) {
-    const targets = { output };
-    if (useEmissive) targets.emissive = vec4(emissive, output.a);
-    if (motionBlurOn) targets.velocity = velocity;
-    if (useEmissive || motionBlurOn) {
-      const mrtNode = mrt(targets);
-      if (useEmissive) mrtNode.setBlendMode('emissive', emissiveBlend);
+    if (useEmissive) {
+      const mrtNode = mrt({
+        output,
+        emissive: vec4(emissive, output.a),
+      });
+      mrtNode.setBlendMode('emissive', emissiveBlend);
       scenePass.setMRT(mrtNode);
     }
 
-    let color = scenePass.getTextureNode('output');
-    let glow = useEmissive ? scenePass.getTextureNode('emissive') : null;
-    if (motionBlurOn) {
-      const vel = scenePass.getTextureNode('velocity').xy.mul(vec2(0.5, -0.5)).mul(blurAmount);
-      color = motionBlur(color, vel);
-      if (glow) glow = motionBlur(glow, vel);
-    }
+    const color = scenePass.getTextureNode('output');
+    const glow = useEmissive ? scenePass.getTextureNode('emissive') : null;
     return { color, glow };
   }
 
@@ -219,27 +184,8 @@ export async function createPost(renderer, scene, camera) {
     bloomPass.setResolutionScale(BLOOM_SCALE);
     bloomPasses.push(bloomPass);
 
-    let frame;
-    let bloomColor;
-    if (fisheyeOn || aberrationOn) {
-      const uv = lensUv();
-      // Beauty is already a pass texture (free resample). Motion blur is a
-      // computed node, so it is copied to a texture only while that effect is on.
-      const sceneTex = convertToTexture(color);
-      const bloomTex = bloomPass.getTextureNode();
-      const sampleAt = (sampleUv) => sceneTex.sample(sampleUv).add(bloomTex.sample(sampleUv));
-      frame = sampleAt(uv);
-      bloomColor = bloomTex.sample(uv);
-      if (aberrationOn) {
-        // shift = normalize(dir) * aberration * length(dir) * 2, from the old finish pass.
-        const dir = uv.sub(0.5);
-        const shift = normalize(dir.add(vec2(1e-6, 1e-6))).mul(uAberration.mul(length(dir)).mul(2));
-        frame = vec4(sampleAt(uv.add(shift)).r, frame.g, sampleAt(uv.sub(shift)).b, frame.a);
-      }
-    } else {
-      bloomColor = bloomPass;
-      frame = color.add(bloomPass);
-    }
+    const bloomColor = bloomPass;
+    let frame = color.add(bloomPass);
     // Impact mud sits on the lens after grade so it stays readable over HDR/tonemap.
     frame = applyLensDirt(frame, bloomColor);
     pipeline.outputNode = applyGrain(applyImpactDirt(gradeFrame(frame)));
@@ -278,18 +224,6 @@ export async function createPost(renderer, scene, camera) {
     },
   };
 
-  const motionBlurCtrl = {
-    get enabled() { return motionBlurOn; },
-    set enabled(v) {
-      v = !!v;
-      if (v === motionBlurOn) return;
-      motionBlurOn = v;
-      rebuild();
-    },
-    get amount() { return blurAmount.value; },
-    set amount(v) { blurAmount.value = v; },
-  };
-
   // Exposure drives ACES via renderer.toneMappingExposure (same as webgpu_tonemapping GUI).
   const exposure = {
     get value() { return renderer.toneMappingExposure; },
@@ -307,31 +241,11 @@ export async function createPost(renderer, scene, camera) {
       highlights: uHighlights,
       vignetteIntensity: uVignette,
       vignetteColor: { value: new THREE.Color(0.03, 0.03, 0.03) },
-      fisheye: {
-        get value() { return uFisheye.value; },
-        set value(v) {
-          uFisheye.value = +v;
-          const on = Math.abs(uFisheye.value) > 1e-4;
-          if (on === fisheyeOn) return;
-          fisheyeOn = on;
-          rebuild();
-        },
-      },
     },
   };
 
   const finish = {
     uniforms: {
-      aberration: {
-        get value() { return uAberration.value; },
-        set value(v) {
-          uAberration.value = +v;
-          const on = uAberration.value > 1e-6;
-          if (on === aberrationOn) return;
-          aberrationOn = on;
-          rebuild();
-        },
-      },
       time: uTime,
       grain: uGrain,
       grainScale: uGrainScale,
@@ -346,12 +260,11 @@ export async function createPost(renderer, scene, camera) {
 
   return {
     bloom,
-    motionBlur: motionBlurCtrl,
     grade,
     finish,
     lensDirt,
     setSize() {},
-    /** Player HP fraction 0..1. Drives red vignette below 25%, heartbeat pulse at ≤10%. */
+    /** Player HP fraction 0..1. Drives pulsing red vignette at ≤10%. */
     setHurt(hpFrac) {
       hurtHp = Math.max(0, Math.min(1, +hpFrac || 0));
     },

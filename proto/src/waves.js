@@ -2,9 +2,11 @@
 // Long, low waves so a lightly subdivided plane reads as geometry without looking stormy.
 
 export const WAVE = [
-  { ax: 0.085, az: 0.04, w: 0.55, amp: 0.07 },
-  { ax: -0.05, az: 0.09, w: 0.38, amp: 0.045 },
-  { ax: 0.12, az: -0.07, w: 0.72, amp: 0.025 },
+  // Long swell first — coarse WaterMesh can only resolve these.
+  { ax: 0.032, az: 0.018, w: 0.28, amp: 0.33 },
+  { ax: 0.085, az: 0.04, w: 0.55, amp: 0.2953125 },
+  { ax: -0.05, az: 0.09, w: 0.38, amp: 0.18984375 },
+  { ax: 0.12, az: -0.07, w: 0.72, amp: 0.10546875 },
 ];
 
 /** Surface height offset (m) above the mean waterline. */

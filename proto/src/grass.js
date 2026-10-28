@@ -11,9 +11,13 @@ const CHUNK = 16;
 /**
  * Band edges (m) from camera to chunk edge. Bands 0–2 pick LOD00/01/02 geometry;
  * the outer bands keep LOD02 and only thin the clump count (BAND_DENSITY).
+ * Final edge: density 0 → chunk hidden (was drawing ~40% all the way to the map edge).
  */
-const LOD_EDGES = [20, 40, 65, 90];
-const BAND_DENSITY = [1, 1, 0.75, 0.5, 0.4];
+const LOD_EDGES = [20, 40, 60, 85, 120];
+const BAND_DENSITY = [1, 1, 0.65, 0.4, 0.25, 0];
+// Sun shadow frustum is ±38 m (main.js SHADOW_EXTENT). Outside it, receiveShadow
+// still runs PCF with no visible effect — gate by distance and keep near self-shadow.
+const SHADOW_RECEIVE_DIST = 38 + CHUNK;
 // Centre spacing ~1.55 m (~25% fewer clumps than 1.34 m — fewer shadow receivers).
 // Cluster mask (GRASS_CLUSTER_CUT) drops another ~25% into bare zones between meadows.
 const CELL = 1.55;
@@ -69,8 +73,6 @@ export async function buildGrass(scene) {
     baseColor: '#354820',
     tipColor1: '#a8c45c',
     tipColor2: '#5a7838',
-    heightAmp: 0.07,
-    terrainSize: SIZE,
     fogColor: new THREE.Color(0.55, 0.68, 0.74),
     fogNear: 70,
     fogFar: 240,
@@ -128,6 +130,8 @@ export async function buildGrass(scene) {
       mesh.receiveShadow = true;
       mesh.castShadow = false;
       mesh.frustumCulled = true;
+      mesh.matrixAutoUpdate = false;
+      mesh.updateMatrix();
 
       const rand = seededRand((cx * 73856093) ^ (cz * 19349663) ^ 0x9e3779b9);
       const spots = [];
@@ -209,10 +213,18 @@ export async function buildGrass(scene) {
       const dz = Math.max(c.z0 - camPos.z, 0, camPos.z - c.z1);
       const d = Math.hypot(dx, dz, camPos.y - c.y);
       const band = pickLod(d, LOD_EDGES, lodScale, c.band);
+      // World metres — shadow map size is fixed; don't scale with LOD slider / FOV.
+      const recv = d < SHADOW_RECEIVE_DIST;
+      if (c.mesh.receiveShadow !== recv) c.mesh.receiveShadow = recv;
+
       if (band === c.band) continue;
       c.band = band;
+      const density = BAND_DENSITY[band] ?? 0;
+      const show = density > 0;
+      c.mesh.visible = show;
+      if (!show) continue;
       c.mesh.geometry = lodGeos[Math.min(band, lodGeos.length - 1)];
-      c.mesh.count = Math.max(1, Math.round(c.full * BAND_DENSITY[band]));
+      c.mesh.count = Math.max(1, Math.round(c.full * density));
     }
   }
 

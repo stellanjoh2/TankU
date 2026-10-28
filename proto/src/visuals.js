@@ -93,9 +93,7 @@ function hydrate(json) {
     gradeMids: col(json.gradeMids ?? '#ffffff'),
     gradeHighlights: col(json.gradeHighlights ?? '#ffffff'),
     vignette: json.vignette,
-    fisheye: json.fisheye ?? VISUAL_DEFAULTS.fisheye,
     grain: json.grain,
-    aberration: json.aberration,
     flareEnabled: json.flareEnabled ?? VISUAL_DEFAULTS.flareEnabled,
     flareIntensity: json.flareIntensity ?? VISUAL_DEFAULTS.flareIntensity,
     flareScale: json.flareScale ?? VISUAL_DEFAULTS.flareScale,
@@ -229,9 +227,7 @@ export function createVisualsEditor(ctx) {
       gradeMids: grade.midtones.value.clone(),
       gradeHighlights: grade.highlights.value.clone(),
       vignette: grade.vignetteIntensity.value,
-      fisheye: grade.fisheye.value,
       grain: finish.grain.value,
-      aberration: finish.aberration.value,
       flareEnabled: lensFlare?.enabled ?? true,
       flareIntensity: lensFlare?.intensity ?? VISUAL_DEFAULTS.flareIntensity,
       flareScale: lensFlare?.scale ?? VISUAL_DEFAULTS.flareScale,
@@ -288,9 +284,7 @@ export function createVisualsEditor(ctx) {
     if (s.gradeMids) grade.midtones.value.copy(s.gradeMids);
     if (s.gradeHighlights) grade.highlights.value.copy(s.gradeHighlights);
     grade.vignetteIntensity.value = s.vignette;
-    grade.fisheye.value = s.fisheye ?? VISUAL_DEFAULTS.fisheye;
     finish.grain.value = s.grain;
-    finish.aberration.value = s.aberration;
     if (lensFlare) {
       lensFlare.enabled = s.flareEnabled ?? true;
       lensFlare.intensity = s.flareIntensity ?? VISUAL_DEFAULTS.flareIntensity;
@@ -366,9 +360,7 @@ export function createVisualsEditor(ctx) {
       gradeMids: c(s.gradeMids),
       gradeHighlights: c(s.gradeHighlights),
       vignette: s.vignette,
-      fisheye: s.fisheye,
       grain: s.grain,
-      aberration: s.aberration,
       flareEnabled: s.flareEnabled,
       flareIntensity: s.flareIntensity,
       flareScale: s.flareScale,
@@ -528,11 +520,6 @@ export function createVisualsEditor(ctx) {
     if (game.getFlyTilt && game.setFlyTilt) {
       addSlider(s, 'Photomode tilt', -45, 45, 1, game.getFlyTilt, game.setFlyTilt);
     }
-    if (post.motionBlur) {
-      addToggle(s, 'Motion blur',
-        () => post.motionBlur.enabled,
-        (v) => { post.motionBlur.enabled = v; });
-    }
   }
 
   // Sky & fog (SkyMesh / webgpu_sky params)
@@ -662,16 +649,10 @@ export function createVisualsEditor(ctx) {
   // Post
   {
     const s = addSection(lighting, 'Post');
-    addSlider(s, 'Fisheye', 0, 2, 0.01, () => grade.fisheye.value, (v) => {
-      grade.fisheye.value = v;
-    });
     addSlider(s, 'Bloom', 0, 2.5, 0.05, () => bloom.strength, (v) => { bloom.strength = v; });
     addSlider(s, 'Bloom radius', 0, 1.5, 0.05, () => bloom.radius, (v) => { bloom.radius = v; });
     addSlider(s, 'Bloom thresh', 0, 1.5, 0.05, () => bloom.threshold, (v) => { bloom.threshold = v; });
     addSlider(s, 'Grain', 0, 0.2, 0.005, () => finish.grain.value, (v) => { finish.grain.value = v; });
-    addSlider(s, 'Aberration', 0, 0.008, 0.0001, () => finish.aberration.value, (v) => {
-      finish.aberration.value = v;
-    });
   }
 
   // Lens flare (sun) — PlayCanvas CameraFrame knobs

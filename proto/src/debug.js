@@ -11,10 +11,14 @@ function skipObject(o) {
   if (!o.visible && o.name !== 'FluffyGrass') return true;
   if (o.isLine || o.isLineSegments || o.isPoints || o.isSprite) return true;
   if (o.isLensflare || o.type === 'Lensflare' || o.isLensflareMesh) return true;
-  // Walk parents for named skips (grass / sky / fx)
+  // Walk parents for named skips (grass / sky / fx / ocean plane)
   for (let p = o; p; p = p.parent) {
     const n = p.name || '';
-    if (n === 'FluffyGrass' || n === 'SkyDome' || n === 'DebugOverlay' || n === 'SunLensFlare') return true;
+    // Ocean + sea floor are huge flat grids — wireframing them fills the underwater view.
+    if (
+      n === 'FluffyGrass' || n === 'SkyDome' || n === 'DebugOverlay' || n === 'SunLensFlare'
+      || n === 'Ocean' || n === 'SeaFloor'
+    ) return true;
   }
   return false;
 }
@@ -120,7 +124,9 @@ export function createDebug(scene, world, { tanks = [], grass = null } = {}) {
     on = !!on;
     if (enabled === on) return;
     enabled = on;
-    colliders.visible = on;
+    // Rapier debugRender outlines the full terrain heightfield — reads as a megamesh under water.
+    // Suspension rays stay on; mesh wireframes cover the rest.
+    colliders.visible = false;
     contacts.visible = on;
     applyWireframes(on);
     if (grass?.root) {
@@ -135,7 +141,7 @@ export function createDebug(scene, world, { tanks = [], grass = null } = {}) {
 
   function update() {
     if (!enabled) return;
-    colliders.update();
+    if (colliders.visible) colliders.update();
     updateContacts();
   }
 

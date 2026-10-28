@@ -7,10 +7,10 @@ export const SIZE = 380;
 export const WATER_Y = 0.2;
 // Keep ~1.44 m cells after the map grew to fit the satellite island.
 const SEGS = 264;
-/** How far offshore (metres of shore distance) the detailed shore mesh eases down to the floor. */
+/** How far offshore (metres of shore distance) the heightfield eases down to the floor. */
 const SHORE_SHELF = 36;
-/** Keep a triangle if any corner is at least this far from shore (inland +, sea −). */
-const SEA_PRUNE = -SHORE_SHELF;
+/** Visual shelf extent — must cover WaterMesh shallowDepth (~2.8 m water → ~16 m shore). */
+const SEA_PRUNE = -20;
 /** Flat physical sea floor past the shelf. The shelf lands just above this so the two don't z-fight. */
 const SEA_FLOOR_Y = WATER_Y - 5.5;
 const SEA_FLOOR_LIP = 0.15;
@@ -474,19 +474,21 @@ function prepGroundMap(tex, colorSpace) {
   return tex;
 }
 
-async function loadGroundSet(loader, name) {
+async function loadGroundSet(loader, name, { roughAo = true } = {}) {
   const base = `./textures/ground/${name}`;
-  const [color, normal, roughAo] = await Promise.all([
+  const jobs = [
     loader.loadAsync(`${base}_color.jpg`),
     loader.loadAsync(`${base}_normal.jpg`),
-    loader.loadAsync(`${base}_rough_ao.jpg`),
-  ]);
-  return {
+  ];
+  if (roughAo) jobs.push(loader.loadAsync(`${base}_rough_ao.jpg`));
+  const [color, normal, roughAoMap] = await Promise.all(jobs);
+  const set = {
     color: prepGroundMap(color, THREE.SRGBColorSpace),
     normal: prepGroundMap(normal, THREE.NoColorSpace),
-    // R = roughness, G = ambient occlusion. Packed so the splat stays under the sampler limit.
-    roughAo: prepGroundMap(roughAo, THREE.NoColorSpace),
   };
+  // R = roughness, G = ambient occlusion. Packed so the splat stays under the sampler limit.
+  if (roughAoMap) set.roughAo = prepGroundMap(roughAoMap, THREE.NoColorSpace);
+  return set;
 }
 
 function makeGroundMaterial(sets, concreteColor) {
@@ -499,6 +501,8 @@ function makeGroundMaterial(sets, concreteColor) {
   const rgb = (tex) => texture(tex).sample(mapUv).rgb;
   const surface = (tex) => texture(tex).sample(mapUv);
 
+  // 9 samples/pixel (−25% from full color+normal+roughAo on all 4 layers):
+  // albedo×4 + normal×4 + mud roughAo only; rock/sand/grass use fixed rough/ao.
   const albedo = rgb(sets.mud.color).mul(biome.x)
     .add(rgb(sets.rock.color).mul(biome.y))
     .add(rgb(sets.sand.color).mul(biome.z))
@@ -508,11 +512,14 @@ function makeGroundMaterial(sets, concreteColor) {
     .add(rgb(sets.sand.normal).mul(biome.z))
     .add(rgb(sets.hillGrass.normal).mul(hillGrass));
   const mudS = surface(sets.mud.roughAo);
-  const rockS = surface(sets.rock.roughAo);
-  const sandS = surface(sets.sand.roughAo);
-  const grassS = surface(sets.hillGrass.roughAo);
-  const rough = mudS.r.mul(biome.x).add(rockS.r.mul(biome.y)).add(sandS.r.mul(biome.z)).add(grassS.r.mul(hillGrass));
-  const ao = mudS.g.mul(biome.x).add(rockS.g.mul(biome.y)).add(sandS.g.mul(biome.z)).add(grassS.g.mul(hillGrass));
+  const rough = mudS.r.mul(biome.x)
+    .add(float(0.85).mul(biome.y))
+    .add(float(0.92).mul(biome.z))
+    .add(float(0.88).mul(hillGrass));
+  const ao = mudS.g.mul(biome.x)
+    .add(float(0.9).mul(biome.y))
+    .add(float(1).mul(biome.z))
+    .add(float(0.95).mul(hillGrass));
 
   const mat = new MeshStandardNodeMaterial({ metalness: 0, roughness: 1 });
   mat.colorNode = mix(albedo.mul(shade), uniform(concreteColor), biome.w);
@@ -538,7 +545,10 @@ export const DEFAULT_GROUND_PALETTE = {
   water: '#2a6a88',
 };
 
-/** Drop faces that sit entirely out at sea so the visible mesh isn't a dense ocean grid. */
+/**
+ * Drop faces past the visual shelf. Keep a uniform fine grid (no mixed coarse/fine —
+ * that left T-junction cracks in the shallow floor). Past SEA_PRUNE the sea-floor plane takes over.
+ */
 function pruneSeaFaces(geo) {
   const pos = geo.attributes.position;
   const src = geo.index.array;
@@ -603,9 +613,9 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   const loader = new THREE.TextureLoader();
   const [mudMaps, rockMaps, sandMaps, hillGrassMaps] = await Promise.all([
     loadGroundSet(loader, 'mud'),
-    loadGroundSet(loader, 'rock'),
-    loadGroundSet(loader, 'sand'),
-    loadGroundSet(loader, 'hill_grass'),
+    loadGroundSet(loader, 'rock', { roughAo: false }),
+    loadGroundSet(loader, 'sand', { roughAo: false }),
+    loadGroundSet(loader, 'hill_grass', { roughAo: false }),
   ]);
   const mat = makeGroundMaterial(
     { mud: mudMaps, rock: rockMaps, sand: sandMaps, hillGrass: hillGrassMaps },
@@ -631,8 +641,8 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   const waterNormals = await loader.loadAsync('./textures/waternormals.jpg');
   waterNormals.wrapS = waterNormals.wrapT = THREE.RepeatWrapping;
   waterNormals.anisotropy = 8;
-  // ~14 m quads — enough for the long swell in waves.js without a heavy grid.
-  const WATER_SEGS = 160;
+  // Swell amps are centimetres — normals carry the look; keep the plane coarse (~90 m quads).
+  const WATER_SEGS = 24;
   const water = new WaterMesh(
     new THREE.PlaneGeometry(SIZE * 6, SIZE * 6, WATER_SEGS, WATER_SEGS),
     {
@@ -653,7 +663,7 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   );
   water.rotation.x = -Math.PI / 2;
   water.position.y = WATER_Y;
-  water.receiveShadow = true;
+  water.receiveShadow = false;
   // Transparent + depthWrite false: must draw before FX (default order 0). Order 2
   // painted the ocean over muzzle flashes / explosions; distance sort also fails on
   // this huge plane when order ties.

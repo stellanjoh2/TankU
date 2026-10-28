@@ -955,12 +955,13 @@ async function main() {
   const burnPoint = new THREE.Vector3();
   const firePoint = new THREE.Vector3();
 
-  /** 0 off, 1–3 = 25/50/75% damage, 4 = wreck. */
+  /** 0 off; 1 ≤50% HP; 2 ≤25%; 3 ≤10%; 4 = wreck. */
   function damageStage(t) {
     if (!t.alive) return 4;
-    if (t.hp >= t.maxHp) return 0;
-    if (t.hp > t.maxHp * 0.5) return 1;
-    if (t.hp > t.maxHp * 0.25) return 2;
+    const frac = t.hp / t.maxHp;
+    if (frac > 0.5) return 0;
+    if (frac > 0.25) return 1;
+    if (frac > 0.1) return 2;
     return 3;
   }
 
@@ -1016,8 +1017,9 @@ async function main() {
       return;
     }
     t.wreckBurn = 0;
-    if (t.hp < t.maxHp) fx.burn(burnPoint.copy(BURN_LOCAL).applyMatrix4(mw), dt, 1, true);
-    setTankFire(t, damageStage(t));
+    const stage = damageStage(t);
+    if (stage > 0) fx.burn(burnPoint.copy(BURN_LOCAL).applyMatrix4(mw), dt, 1, true);
+    setTankFire(t, stage);
     for (const s of t.sides) {
       const amount = Math.min(1, Math.abs(s.speed) / 8) * 0.5;
       if (t.grounded && amount > 0.05) {

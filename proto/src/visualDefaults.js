@@ -60,9 +60,7 @@ export const VISUAL_DEFAULTS = {
   gradeMids: '#b5afa1',
   gradeHighlights: '#fff6bd',
   vignette: 1,
-  fisheye: 0,
   grain: 0.03,
-  aberration: 0,
   // Lens flare (PlayCanvas-style sun look)
   flareEnabled: true,
   flareIntensity: 1.74,

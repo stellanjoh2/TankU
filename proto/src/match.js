@@ -165,6 +165,9 @@ export function createMatch({
 
   function onTankDestroyed(victim) {
     const origin = new THREE.Vector3().copy(victim.body.translation()).add(new THREE.Vector3(0, 1.2, 0));
+    // Cook-off boom for every kill path (shell, MG, drown) — drowning has no impact SFX.
+    const hearD = origin.distanceTo(tank.model.position);
+    sfx.fire(victim === tank ? 0.95 : 0.9 * distGain(hearD, 160), victim === tank ? null : hearD);
     fx.wreck(origin);
     victim.obliterate();
     tankCam.addShake(victim === tank ? 1 : 0.4);
@@ -360,6 +363,15 @@ export function createMatch({
       if (game.startBannerT <= 0) {
         game.startBannerT = 0;
         if (game.overT <= 0) hud.banner('Eliminate all invaders', '', 'win', START_HOLD);
+      }
+    }
+    if (game.overT <= 0 && tank.alive) {
+      const p = tank.body.translation();
+      // Turret roof under the waterline → sink instantly (player drove too far out).
+      if (p.y + TANK_TOP_Y < WATER_Y) {
+        tank.hp = 0;
+        pushHealth();
+        onTankDestroyed(tank);
       }
     }
     if (game.overT <= 0 && !game.solo) {

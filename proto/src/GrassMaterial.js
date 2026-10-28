@@ -1,9 +1,8 @@
-// TSL grass for WebGPU — UV flip, tip/base colors, alpha discard, tip height, shadow receive.
-// Wind intentionally skipped (CPU/GPU savings); vegetation still sways via visuals Wind.
+// TSL grass for WebGPU — UV flip, tip/base colors, alpha discard, shadow receive.
+// Wind / tip-height displacement skipped (CPU/GPU savings); vegetation still sways via visuals Wind.
 import * as THREE from 'three/webgpu';
 import {
-  uv, texture, vec2, vec3, vec4, float, mix, uniform, exp, Fn,
-  positionLocal, modelWorldMatrix, modelWorldMatrixInverse,
+  uv, texture, vec2, vec3, float, mix, uniform, Fn,
   normalView, diffuseColor, BRDF_Lambert,
 } from 'three/tsl';
 import { shadowTint } from './shadowTint.js';
@@ -32,8 +31,6 @@ export class GrassMaterial {
     baseColor = '#2a3518',
     tipColor1 = '#8aa85a',
     tipColor2 = '#3a4f28',
-    heightAmp = 0.06,
-    terrainSize = 500,
     fogColor = 0x8caebc,
     fogNear = 70,
     fogFar = 240,
@@ -44,10 +41,8 @@ export class GrassMaterial {
     const fogCol = fogColor.isColor ? fogColor : new THREE.Color(fogColor);
 
     this.uniforms = {
-      uHeightAmp: { value: heightAmp },
       // Kept at 0 so visuals/state that still read uWindAmp don't re-enable sway.
       uWindAmp: { value: 0 },
-      uTerrainSize: { value: terrainSize },
       uNoiseScale: { value: 1.2 },
       uGrassLightIntensity: { value: 1.35 },
       uBaseColor: { value: base },
@@ -61,8 +56,6 @@ export class GrassMaterial {
       shadowTint,
     };
 
-    this._uHeightAmp = uniform(heightAmp);
-    this._uTerrainSize = uniform(terrainSize);
     this._uNoiseScale = uniform(1.2);
     this._uIntensity = uniform(1.35);
     this._uBase = uniform(base);
@@ -85,8 +78,6 @@ export class GrassMaterial {
   }
 
   update() {
-    this._uHeightAmp.value = this.uniforms.uHeightAmp.value;
-    this._uTerrainSize.value = this.uniforms.uTerrainSize.value;
     this._uNoiseScale.value = this.uniforms.uNoiseScale.value;
     this._uIntensity.value = this.uniforms.uGrassLightIntensity.value;
   }
@@ -113,18 +104,6 @@ export class GrassMaterial {
     this.material.colorNode = albedo;
     this.material.opacityNode = this._alphaTex.sample(grassUv).r;
     this.material.alphaTestNode = float(0.15);
-
-    // Static tip height only (no wind sway). Avoid `.assign()` outside Fn() (TSL stack warning).
-    const worldPos = modelWorldMatrix.mul(vec4(positionLocal, 1.0)).xyz;
-    const globalUV = vec2(
-      this._uTerrainSize.sub(worldPos.x),
-      this._uTerrainSize.sub(worldPos.z),
-    ).div(this._uTerrainSize);
-    const tip = float(1).sub(uv().y);
-    const heightNoise = this._noiseTex.sample(globalUV.mul(this._uNoiseScale)).r;
-    const displaced = worldPos.add(vec3(0, exp(heightNoise).mul(this._uHeightAmp).mul(tip), 0));
-
-    this.material.positionNode = modelWorldMatrixInverse.mul(vec4(displaced, 1.0)).xyz;
 
     this.material.needsUpdate = true;
   }

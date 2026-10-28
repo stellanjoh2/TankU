@@ -28,13 +28,13 @@ const LINK_T = 0.07;
 const RAY_UP = 0.4;          // ray starts this far above each contact's resting track bottom
 const SAG = 0.10;            // static spring compression (softer = more bounce)
 const MU_LONG = 1.14;        // longitudinal grip; higher = harder launch
-const MU_SIDE = 0.64125;    // lateral grip; lower = more drift in a turn
+const MU_SIDE = 0.6091875;  // lateral grip; lower = more drift in a turn
 // Grip stays full on driveable ground, then fades so a rock shoulder sheds the hull
 // instead of the tracks parking on it. n·up: 0.88 ≈ 28°, 0.55 ≈ 57°.
 const GRIP_FLAT = 0.88;
 const GRIP_STEEP = 0.55;
 const GRIP_FLOOR = 0.15;
-const SPEED = { cruise: 9.5, boost: 15.4, reverse: 4.5, pivot: 4.6875, turn: 3.90625 };   // m/s
+const SPEED = { cruise: 9.975, boost: 16.17, reverse: 4.725, pivot: 4.921875, turn: 4.1015625 };   // m/s
 const DAMP_RATIO = 0.28;     // fraction of critical; lower = bouncier rebound
 const BRAKE_DIVE = 0.75;     // keep this fraction of nose-dive pitch under hard braking
 // Side bumps spin the long axis easily. Stiffen roll inertia, and past a small lean
@@ -66,10 +66,10 @@ const TAIL_BRAKE = 18;       // bloom-heavy red when braking or reversing
 const TAIL_RGB = [1.0, 0.04, 0.02];
 // Hull local (+X fwd, +Y up): build_sherman lamp(-2.62, ±1.46, deck_z+0.1) → Three (x, z, ∓y)
 const TAIL_LIGHT_LOCALS = [
-  new THREE.Vector3(-2.72, 1.92, 1.50),
-  new THREE.Vector3(-2.72, 1.92, -1.50),
+  new THREE.Vector3(-3.72, 1.67, 1.50),
+  new THREE.Vector3(-3.72, 1.67, -1.50),
 ];
-const TAIL_LIGHT_DIST = 1.0;
+const TAIL_LIGHT_DIST = 1.5625;
 const TAIL_LIGHT_IDLE = 0;
 const TAIL_LIGHT_BRAKE = 5;
 // Whip antenna (bones Antenna_0..3, rest pose straight up local +Y): lean = -GAIN * hull accel,
