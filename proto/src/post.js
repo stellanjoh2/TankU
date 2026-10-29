@@ -64,7 +64,7 @@ export async function createPost(renderer, scene, camera) {
   let hurtTime = 0;
   // Finish uniforms. Same .value objects the Visuals sliders write.
   const uTime = uniform(0);
-  const uGrain = uniform(0.035);
+  const uGrain = uniform(0);
   const uGrainScale = uniform(1);
   const uGrainTint = uniform(new THREE.Color(1, 1, 1));
 

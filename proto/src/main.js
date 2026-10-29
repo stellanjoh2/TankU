@@ -115,13 +115,16 @@ async function main() {
   const cubeRT = new THREE.CubeRenderTarget(256, {
     type: THREE.HalfFloatType,
     format: THREE.RGBAFormat,
-    generateMipmaps: false,
+    generateMipmaps: true,
   });
+  cubeRT.texture.minFilter = THREE.LinearMipmapLinearFilter;
+  cubeRT.texture.magFilter = THREE.LinearFilter;
+  cubeRT.texture.generateMipmaps = true;
   cubeRT.fromEquirectangularTexture(renderer, equirect);
   const lightProbe = await LightProbeGenerator.fromCubeRenderTarget(renderer, cubeRT);
   lightProbe.intensity = 1;
   scene.add(lightProbe);
-  cubeRT.dispose();
+  // Kept for the ocean's mipmapped sky reflections.
 
   const pmrem = new THREE.PMREMGenerator(renderer);
   scene.environment = pmrem.fromEquirectangular(equirect).texture;
@@ -172,7 +175,7 @@ async function main() {
   const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
   world.timestep = FIXED_DT;
   const lensFlare = await createSunLensFlare({ camera, RAPIER, world, sunDir });
-  const terrain = await buildTerrain(RAPIER, world, scene, { sunDir });
+  const terrain = await buildTerrain(RAPIER, world, scene, { sunDir, renderer, skyCube: cubeRT.texture });
   buildBgIsland(scene, terrain);
   buildProps(RAPIER, world, scene);
   const airfield = buildAirfield(RAPIER, world, scene);
@@ -839,8 +842,8 @@ async function main() {
     sun.position.copy(sun.target.position).addScaledVector(sunDir, 120);
     sun.target.updateMatrixWorld();
     terrain.water.sunDirection.value.copy(sunDir);
-    terrain.water.sunColor.value.copy(sun.color);
-    terrain.water.waveTime.value = elapsed;
+    terrain.water.sunColor.value.copy(sun.color).multiplyScalar(Math.max(sun.intensity, 0) * 0.08);
+    terrain.water.fogColor.value.copy(scene.fog.color);
   }
 
   // ---------------------------------------------------------------- reticle + start overlay
@@ -1312,6 +1315,7 @@ async function main() {
 
   function presentTick(dt, inp) {
     updateSun();
+    terrain.water.update(menuPaused ? 0 : dt, camera);
     updateHud(inp);
     const freezeDt = menuPaused ? 0 : dt;
     hud.update(freezeDt, camera);

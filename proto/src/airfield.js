@@ -4,6 +4,7 @@
 import * as THREE from 'three';
 import { AIRFIELD, AIRFIELD_Y, heightAt } from './terrain.js';
 import { applyConcreteMaps, prepareSlabGeometry } from './concreteTex.js';
+import { roofCorrugatedMaterial, stampCorrugatedUVs, wallCorrugatedMaterial } from './corrugatedTex.js';
 
 // Sherman hull ≈ 3.24 m track-outer width, turret roof ≈ 2.81 m — leave a few cm.
 export const DOOR_W = 4.0;
@@ -73,23 +74,12 @@ function addCollider(RAPIER, world, body, hx, hy, hz, x, y, z) {
   );
 }
 
-/** Corrugated-looking metal: procedural stripes via canvas map. */
-function corrugatedMap() {
-  const n = 128;
-  const c = document.createElement('canvas');
-  c.width = c.height = n;
-  const g = c.getContext('2d');
-  g.fillStyle = '#c4ccd0';
-  g.fillRect(0, 0, n, n);
-  for (let x = 0; x < n; x += 4) {
-    g.fillStyle = x % 8 === 0 ? 'rgba(90,70,55,0.18)' : 'rgba(255,255,255,0.1)';
-    g.fillRect(x, 0, 2, n);
-  }
-  const tex = new THREE.CanvasTexture(c);
-  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.anisotropy = 4;
-  return tex;
+/** Real-size box (no mesh scale) so corrugated UVs stay in metres. */
+function steelBox(material, x, y, z, sx, sy, sz) {
+  const mesh = new THREE.Mesh(stampCorrugatedUVs(new THREE.BoxGeometry(sx, sy, sz), x, y, z), material);
+  mesh.position.set(x, y, z);
+  mesh.castShadow = mesh.receiveShadow = true;
+  return mesh;
 }
 
 /**
@@ -103,10 +93,8 @@ export function buildAirfield(RAPIER, world, scene) {
   scene.add(root);
 
   const y0 = AIRFIELD_Y;
-  const metalMap = corrugatedMap();
-  metalMap.repeat.set(6, 3);
-  const metal = mat(0xb8c0c4, { metal: 0.55, rough: 0.55 });
-  metal.map = metalMap;
+  const wallMat = wallCorrugatedMaterial();
+  const roofMat = roofCorrugatedMaterial();
   const metalDark = mat(0x6a7074, { metal: 0.65, rough: 0.5 });
   const frame = mat(0x2a3328, { metal: 0.2, rough: 0.7 });
   const glass = mat(0x1a2218, { metal: 0.1, rough: 0.15 });
@@ -147,7 +135,7 @@ export function buildAirfield(RAPIER, world, scene) {
   const debris = [];
 
   function addPiece(lx, ly, lz, sx, sy, sz) {
-    const mesh = boxMesh(unit, metal, lx, ly, lz, sx, sy, sz);
+    const mesh = steelBox(wallMat, lx, ly, lz, sx, sy, sz);
     hangar.add(mesh);
     const col = world.createCollider(
       RAPIER.ColliderDesc.cuboid(sx * 0.5, sy * 0.5, sz * 0.5)
@@ -348,7 +336,7 @@ export function buildAirfield(RAPIER, world, scene) {
   const roofAngle = Math.atan2(rise, roofRun);
   const roofHyp = Math.hypot(roofRun, rise);
   for (const sz of [-1, 1]) {
-    const roof = boxMesh(unit, metal, 0, EAVE_H + rise * 0.5, sz * (roofRun * 0.5), roofLen, 0.12, roofHyp);
+    const roof = steelBox(roofMat, 0, EAVE_H + rise * 0.5, sz * (roofRun * 0.5), roofLen, 0.12, roofHyp);
     roof.rotation.x = sz * roofAngle;
     hangar.add(roof);
   }
@@ -363,7 +351,11 @@ export function buildAirfield(RAPIER, world, scene) {
   gableShape.closePath();
   const gableGeo = new THREE.ExtrudeGeometry(gableShape, { depth: WALL_T, bevelEnabled: false });
   for (const sx of [-1, 1]) {
-    const gable = new THREE.Mesh(gableGeo, metal);
+    // Back gable (rot +Y) maps local X to −Z; flip so ribs continue the wall.
+    const gable = new THREE.Mesh(
+      stampCorrugatedUVs(gableGeo, 0, EAVE_H, 0, sx > 0 ? -1 : 1, 1, 1),
+      wallMat,
+    );
     // Extrude is +Z; rotate so thickness runs along X, flush with front/back walls.
     gable.position.set(sx > 0 ? hd - WALL_T : -hd + WALL_T, EAVE_H, 0);
     gable.rotation.y = sx > 0 ? Math.PI / 2 : -Math.PI / 2;
@@ -393,8 +385,8 @@ export function buildAirfield(RAPIER, world, scene) {
   const shed = new THREE.Group();
   shed.position.set(hd * 0.15, 0, hw + 2.2);
   hangar.add(shed);
-  shed.add(boxMesh(unit, metal, 0, 1.4, 0, 6.5, 2.8, 4.0));
-  shed.add(boxMesh(unit, metalDark, 0, 2.85, 0, 6.8, 0.12, 4.3));
+  shed.add(steelBox(wallMat, 0, 1.4, 0, 6.5, 2.8, 4.0));
+  shed.add(steelBox(roofMat, 0, 2.85, 0, 6.8, 0.12, 4.3));
   addCollider(RAPIER, world, body, 3.25, 1.4, 2.0, hd * 0.15, 1.4, hw + 2.2);
 
   // --- Gooseneck lamp over door ---

@@ -101,7 +101,7 @@ export async function buildShip(scene) {
 
   function update(t) {
     for (const s of ships) {
-      const w = wavePose(s.x, s.z, t, s.baseYaw, WAVE_SAMPLE);
+      const w = wavePose(s.x, s.z, t, s.baseYaw, WAVE_SAMPLE, false);
       s.mesh.position.y = s.baseY + w.h;
       s.mesh.rotation.set(w.eulerX, s.baseYaw, w.eulerZ, 'YXZ');
     }

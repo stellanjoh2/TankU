@@ -371,6 +371,11 @@ canvas { display: block; }
   background: transparent; border: 1px solid rgba(191, 184, 166, 0.28); border-radius: 4px;
 }
 #visuals .vis-row input[type="checkbox"] { justify-self: start; accent-color: var(--army-gold); cursor: pointer; }
+#visuals .vis-row select {
+  width: 100%; font: inherit; color: inherit; cursor: pointer;
+  background: rgba(0, 0, 0, 0.28); border: 1px solid rgba(191, 184, 166, 0.28); border-radius: 4px;
+  padding: 2px 4px;
+}
 #visuals .vis-slider {
   display: grid; grid-template-columns: 1fr 36px; align-items: center; gap: 6px;
 }

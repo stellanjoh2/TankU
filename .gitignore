@@ -3,6 +3,7 @@ dist/
 .DS_Store
 *.blend1
 textures/Source/
+textures/*.zip
 __pycache__/
 *.pyc
 3D assets/free_lowpoly_barrels_set.glb

@@ -4,6 +4,9 @@ import * as THREE from 'three';
 import { float, materialEmissive, mix, positionWorld, smoothstep, uniform } from 'three/tsl';
 import { applyBurntMetal } from './burntMetal.js';
 import { createEngineHeatHaze } from './heatHaze.js';
+import { heightAt, onBridge, WATER_Y } from './terrain.js';
+import { waveHeight } from './waves.js';
+import { createWake } from './wake.js';
 import {
   REPAIR_CHARGES,
   tryNitro as startNitro, updateNitro as stepNitro,
@@ -349,6 +352,47 @@ export class Tank {
       return { side, z: track.position.z, loop, links, wheels, dist: 0, speed: 0 };
     });
 
+    // Wake sits just aft of the rear roadwheel and about as wide as the tracks.
+    let rearX = Infinity;
+    for (const s of this.sides) {
+      for (const w of s.wheels) rearX = Math.min(rearX, w.position.x);
+    }
+    if (!Number.isFinite(rearX)) rearX = -3.2;
+    const trackZ = Math.abs(this.sides[0]?.z) || 1.2;
+    this.wake = createWake(null, {
+      name: 'TankWake',
+      stern: THREE.MathUtils.clamp(-rearX + 0.45, 2.4, 4.2),
+      cruise: SPEED.cruise,
+      step: 0.85,
+      max: 20,
+      life: 5.5,
+      half: Math.min(1.25, Math.max(0.95, trackZ * 0.9)),
+      belly: 0.28,
+      bellyLen: 7,
+      grow: 0.01,
+      growCap: 12,
+      raggedA: 0.07,
+      raggedB: 0.1,
+      fadeStart: 1.2,
+      fadeEnd: 16,
+      crestIn0: 1.4,
+      crestIn1: 4,
+      crestOut0: 7,
+      crestOut1: 14,
+      crestSpread0: 0.12,
+      crestThick: 0.28,
+      crestThickGrow: 0.008,
+      wobble: 0.12,
+      minSpeed: 0.7,
+      // Shore-style foam ring around the hull waterline while wet.
+      collar: {
+        halfL: 3.05,
+        halfW: Math.max(1.55, trackZ + 0.35),
+        band: 0.9,
+        inset: 0.2,
+      },
+    });
+
     // ---- physics body
     const rb = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(spawn.x, spawn.y, spawn.z)
@@ -641,6 +685,8 @@ export class Tank {
       this._syncWreckTurret();
       this._tickRepair(dt);
       this._updateRepairSweep(dt);
+      const t = this.body.translation();
+      this.wake.clear(t.x, t.z);
       return;
     }
     this.model.position.copy(this.body.translation());
@@ -725,6 +771,40 @@ export class Tank {
     this.model.updateMatrixWorld();
     this._tickRepair(dt);
     this._updateRepairSweep(dt);
+    this._updateWake(dt);
+  }
+
+  /** Foam behind / around the hull while the tracks are in the water. */
+  _updateWake(dt) {
+    const parent = this.model.parent;
+    if (parent && !this.wake.group.parent) parent.add(this.wake.group);
+    const t = this.body.translation();
+    _v.set(1, 0, 0).applyQuaternion(_q.copy(this.body.rotation()));
+    _v.y = 0;
+    if (_v.lengthSq() < 1e-8) _v.set(1, 0, 0);
+    else _v.normalize();
+    const fx = _v.x;
+    const fz = _v.z;
+    const sx = t.x - fx * this.wake.stern;
+    const sz = t.z - fz * this.wake.stern;
+    const surface = WATER_Y + waveHeight(sx, sz, 0);
+    const wet = t.y < surface + 2.8
+      && !onBridge(sx, sz, 1.5)
+      && heightAt(sx, sz) < surface - 0.2;
+    const upright = !this.isFlipped();
+    const speed = Math.max(0, this.forwardSpeed());
+    this.wake.update(dt, {
+      x: t.x,
+      z: t.z,
+      fx,
+      fz,
+      rx: -fz,
+      rz: fx,
+      speed,
+      emit: wet && upright && speed > 0.7,
+      foam: wet && upright,
+      time: 0,
+    });
   }
 
   /** Sweep band along the hull (local +X, rear → front). Installed before the wreck mesh exists. */
@@ -873,6 +953,7 @@ export class Tank {
     this.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
     this.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
     this.prevVel = null;
+    this.wake.clear(t.x, t.z);
   }
 
   /**
@@ -902,6 +983,7 @@ export class Tank {
     );
     this.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
     this.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    this.wake.clear(spawn.x, spawn.z);
     this.reload = 0;
     this.reloadDone = false;
     this.recoilT = 1;

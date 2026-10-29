@@ -1,6 +1,7 @@
 // Live Visuals editor — sky / sun / ground / grass / grading / post. Toggle with V.
 import * as THREE from 'three';
 import { VISUAL_DEFAULTS } from './visualDefaults.js';
+import { OCEAN_DEFAULTS, WATER_PRESETS } from './ultraWater/oceanParams.js';
 import { getTankLodScale, setTankLodScale } from './tankLod.js';
 
 const SKY_CLOUD_SPEED = 0.00002; // SkyMesh default cloudSpeed = slider 1×
@@ -102,7 +103,18 @@ function hydrate(json) {
     flareOcclusionFade: json.flareOcclusionFade ?? VISUAL_DEFAULTS.flareOcclusionFade,
     shadowIntensity: json.shadowIntensity ?? 1,
     shadowColor: col(json.shadowColor ?? '#000000'),
+    ocean: oceanFrom(json.ocean),
   };
+}
+
+function oceanFrom(src) {
+  const o = { ...OCEAN_DEFAULTS };
+  if (!src) return o;
+  for (const k of Object.keys(OCEAN_DEFAULTS)) {
+    if (src[k] !== undefined) o[k] = src[k];
+  }
+  if (src.scatter) o.scatter = new THREE.Color(src.scatter);
+  return o;
 }
 
 /**
@@ -236,6 +248,10 @@ export function createVisualsEditor(ctx) {
       flareOcclusionFade: lensFlare?.occlusionFade ?? VISUAL_DEFAULTS.flareOcclusionFade,
       shadowIntensity: sun.shadow.intensity,
       shadowColor: shadowTint.value.clone(),
+      ocean: {
+        ...terrain.water.params,
+        scatter: terrain.water.scatter.value.clone(),
+      },
     };
   }
 
@@ -295,6 +311,12 @@ export function createVisualsEditor(ctx) {
     }
     sun.shadow.intensity = s.shadowIntensity ?? 1;
     if (s.shadowColor) shadowTint.value.copy(s.shadowColor);
+    if (s.ocean) {
+      const { scatter, ...rest } = s.ocean;
+      Object.assign(terrain.water.params, rest);
+      terrain.water.applyPreset(rest.preset);
+      if (scatter) terrain.water.scatter.value.copy(scatter);
+    }
   }
 
   // Bake saved look first so Reset returns here
@@ -369,6 +391,7 @@ export function createVisualsEditor(ctx) {
       flareOcclusionFade: s.flareOcclusionFade,
       shadowIntensity: s.shadowIntensity,
       shadowColor: c(s.shadowColor),
+      ocean: { ...s.ocean, scatter: c(s.ocean.scatter) },
     };
   }
 
@@ -385,10 +408,12 @@ export function createVisualsEditor(ctx) {
     <nav class="vis-tabs" role="tablist">
       <button type="button" class="vis-tab active" data-tab="lighting" role="tab">Lighting</button>
       <button type="button" class="vis-tab" data-tab="world" role="tab">World</button>
+      <button type="button" class="vis-tab" data-tab="ocean" role="tab">Ocean</button>
     </nav>
     <div class="vis-body">
       <div class="vis-pane" data-pane="lighting"></div>
       <div class="vis-pane hidden" data-pane="world"></div>
+      <div class="vis-pane hidden" data-pane="ocean"></div>
     </div>
     <div class="vis-footer">
       <button type="button" class="vis-copy">Copy settings</button>
@@ -397,6 +422,7 @@ export function createVisualsEditor(ctx) {
   const panes = {
     lighting: panel.querySelector('[data-pane="lighting"]'),
     world: panel.querySelector('[data-pane="world"]'),
+    ocean: panel.querySelector('[data-pane="ocean"]'),
   };
   document.body.append(panel);
 
@@ -474,6 +500,25 @@ export function createVisualsEditor(ctx) {
         val.textContent = format(v, step);
       },
     });
+  }
+
+  function addSelect(parent, label, options, get, set) {
+    const row = document.createElement('label');
+    row.className = 'vis-row';
+    const span = document.createElement('span');
+    span.textContent = label;
+    const input = document.createElement('select');
+    for (const name of options) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      input.append(opt);
+    }
+    input.value = get();
+    input.addEventListener('change', () => set(input.value));
+    row.append(span, input);
+    parent.append(row);
+    controls.push({ sync() { input.value = get(); } });
   }
 
   function addToggle(parent, label, get, set) {
@@ -576,7 +621,6 @@ export function createVisualsEditor(ctx) {
     addSlider(s, 'Strength', 0, 8, 0.05, () => sun.intensity, (v) => { sun.intensity = v; });
     addColor(s, 'Sun colour', () => hexOf(sun.color), (v) => {
       sun.color.set(v);
-      terrain.water.sunColor.value.copy(sun.color);
     });
     addSlider(s, 'Shadow strength', 0, 1, 0.02, () => sun.shadow.intensity, (v) => {
       sun.shadow.intensity = v;
@@ -671,13 +715,8 @@ export function createVisualsEditor(ctx) {
   // Ground
   {
     const s = addSection(world, 'Ground');
-    // Soil, rock and beach are photo maps. Concrete and water stay flat colours.
-    for (const [key, label] of [
-      ['concrete', 'Concrete'],
-      ['water', 'Water'],
-    ]) {
-      addColor(s, label, () => hexOf(terrain.palette[key]), (v) => terrain.setPalette({ [key]: v }));
-    }
+    // Soil, rock and beach are photo maps. Concrete stays a flat colour.
+    addColor(s, 'Concrete', () => hexOf(terrain.palette.concrete), (v) => terrain.setPalette({ concrete: v }));
   }
 
   // Grass
@@ -731,6 +770,49 @@ export function createVisualsEditor(ctx) {
     if (trucks) {
       addSlider(s, 'Truck LOD distance ×', 0.25, 4, 0.05, () => trucks.getLodScale(), (v) => trucks.setLodScale(v));
     }
+  }
+
+  // Ultra-Water look. Sliders write params; the ocean pushes them each frame.
+  {
+    const p = terrain.water.params;
+    const ocean = panes.ocean;
+    const waves = addSection(ocean, 'Waves');
+    addSlider(waves, 'Wind', 0, 40, 0.5, () => p.windSpeed, (v) => { p.windSpeed = v; });
+    addSlider(waves, 'Wind dir', -180, 180, 1, () => p.windDirection, (v) => { p.windDirection = v; });
+    addSlider(waves, 'Fetch', 10, 800, 5, () => p.fetchKm, (v) => { p.fetchKm = v; });
+    addSlider(waves, 'Wave scale', 0, 3, 0.05, () => p.waveScale, (v) => { p.waveScale = v; });
+    addSlider(waves, 'Spread', 0, 1, 0.01, () => p.spreadBlend, (v) => { p.spreadBlend = v; });
+    addSlider(waves, 'Swell', 0, 2, 0.05, () => p.swellScale, (v) => { p.swellScale = v; });
+    addSlider(waves, 'Swell dir', -180, 180, 1, () => p.swellDirection, (v) => { p.swellDirection = v; });
+    addSlider(waves, 'Chop', 0, 2, 0.05, () => p.choppiness, (v) => { p.choppiness = v; });
+    addSlider(waves, 'Time', 0, 3, 0.05, () => p.timeScale, (v) => { p.timeScale = v; });
+
+    const shore = addSection(ocean, 'Shore');
+    addSlider(shore, 'Height', 0, 2, 0.05, () => p.shoreAmplitude, (v) => { p.shoreAmplitude = v; });
+    addSlider(shore, 'Length', 4, 80, 1, () => p.shoreWavelength, (v) => { p.shoreWavelength = v; });
+    addSlider(shore, 'Speed', 0, 3, 0.05, () => p.shoreSpeed, (v) => { p.shoreSpeed = v; });
+    addSlider(shore, 'Steep', 0, 2, 0.05, () => p.shoreSteepness, (v) => { p.shoreSteepness = v; });
+
+    const water = addSection(ocean, 'Water');
+    addSelect(water, 'Preset', Object.keys(WATER_PRESETS), () => p.preset, (v) => {
+      terrain.water.applyPreset(v);
+      syncUi();
+    });
+    addSlider(water, 'Clarity', 0.2, 3, 0.05, () => p.clarity, (v) => { p.clarity = v; });
+    addColor(water, 'Scatter', () => hexOf(terrain.water.scatter.value), (v) => {
+      terrain.water.scatter.value.set(v);
+    });
+    addSlider(water, 'Roughness', 0, 0.4, 0.005, () => p.roughness, (v) => { p.roughness = v; });
+    addSlider(water, 'Refraction', 0, 0.25, 0.005, () => p.refraction, (v) => { p.refraction = v; });
+    addSlider(water, 'Reflect', 0, 0.25, 0.005, () => p.reflectionDistort, (v) => { p.reflectionDistort = v; });
+    addSlider(water, 'Crest glow', 0, 4, 0.05, () => p.sssPeak, (v) => { p.sssPeak = v; });
+    addSlider(water, 'Glow width', 0, 0.4, 0.005, () => p.sssView, (v) => { p.sssView = v; });
+    addSlider(water, 'Foam', 0, 1, 0.01, () => p.foamBias, (v) => { p.foamBias = v; });
+    addSlider(water, 'Foam scale', 0, 3, 0.05, () => p.foamScale, (v) => { p.foamScale = v; });
+    addSlider(water, 'Foam fade', 0, 1, 0.01, () => p.foamRecovery, (v) => { p.foamRecovery = v; });
+    addSlider(water, 'Shore foam', 0, 1, 0.01, () => p.shoreFoamBand, (v) => { p.shoreFoamBand = v; });
+    addSlider(water, 'Glitter', 0, 2, 0.05, () => p.glitter, (v) => { p.glitter = v; });
+    addSlider(water, 'Horizon', 80, 4000, 10, () => p.horizon, (v) => { p.horizon = v; });
   }
 
   let open = false;

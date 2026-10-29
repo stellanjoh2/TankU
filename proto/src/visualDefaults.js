@@ -1,3 +1,5 @@
+import { OCEAN_DEFAULTS } from './ultraWater/oceanParams.js';
+
 /** Saved look from the Visuals editor — applied on boot and used as Reset. */
 export const VISUAL_DEFAULTS = {
   horizon: '#9fadb7',
@@ -60,7 +62,7 @@ export const VISUAL_DEFAULTS = {
   gradeMids: '#b5afa1',
   gradeHighlights: '#fff6bd',
   vignette: 1,
-  grain: 0.03,
+  grain: 0,
   // Lens flare (PlayCanvas-style sun look)
   flareEnabled: true,
   flareIntensity: 1.74,
@@ -70,4 +72,5 @@ export const VISUAL_DEFAULTS = {
   flareOcclusionFade: 0.15,
   shadowIntensity: 0.94,
   shadowColor: '#417676',
+  ocean: { ...OCEAN_DEFAULTS, scatter: '#008080' },
 };

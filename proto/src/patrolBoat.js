@@ -2,9 +2,10 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { SIZE, WATER_Y, PORT, shoreSigned, onBridge } from './terrain.js';
-import { waveHeight, wavePose } from './waves.js';
+import { waveHeight } from './waves.js';
 import { lodDist, pickLod } from './lod.js';
 import { applyBurntMetal } from './burntMetal.js';
+import { createWake } from './wake.js';
 
 const HULL = 'PatrolBoat';
 const TURRET = 'FrontTurret';
@@ -47,6 +48,8 @@ const HIT_GLOW = 18;
 
 const PASS_RANGE = 26;       // start arcing around another hull
 const PASS_PAD = 1.8;         // water kept between hull boxes
+// Hull-length samples plus a short ease, so a facet doesn't kick the boat.
+const FLOAT_TAU = 0.45;
 
 const SPAWNS = [
   { x: PORT.x1 + 22, z: -10, yaw: -Math.PI / 2 }, // east bay, heading south
@@ -172,41 +175,6 @@ function prepMesh(root, lod) {
   });
 }
 
-function makeWake() {
-  const group = new THREE.Group();
-  group.name = 'BoatWake';
-  const mat = new THREE.MeshBasicMaterial({
-    color: 0xd8eef4,
-    transparent: true,
-    opacity: 0,
-    depthWrite: false,
-    fog: true,
-    polygonOffset: true,
-    polygonOffsetFactor: -2,
-    polygonOffsetUnits: -2,
-  });
-  // Pivot on the forward edge. Yaw then flares the tail only, so the two
-  // side streaks open into a V instead of crossing behind the stern.
-  const geo = new THREE.PlaneGeometry(1, 1);
-  geo.rotateX(-Math.PI / 2);
-  geo.translate(-0.5, 0, 0);
-  const strip = (name) => {
-    const m = new THREE.Mesh(geo, mat);
-    m.name = name;
-    m.position.y = 0.04;
-    m.renderOrder = 1;
-    group.add(m);
-    return m;
-  };
-  return {
-    group,
-    mat,
-    center: strip('WakeCenter'),
-    left: strip('WakeL'),
-    right: strip('WakeR'),
-  };
-}
-
 function approachAngle(cur, target, maxStep) {
   const d = wrap(target - cur);
   return cur + THREE.MathUtils.clamp(d, -maxStep, maxStep);
@@ -270,8 +238,13 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     });
   }
 
-  const wake = makeWake();
-  root.add(wake.group);
+  const wake = createWake(scene, {
+    name: 'BoatWake',
+    stern: STERN - 0.45,
+    cruise: CRUISE,
+    x: spawn.x,
+    z: spawn.z,
+  });
   scene.add(root);
 
   const body = world.createRigidBody(
@@ -319,6 +292,9 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     hitFlashFrames: 0,
     thinkT: 0,
     waveT: 0,
+    heave: 0,
+    roll: 0,
+    pitch: 0,
     stuckT: 0,
     lastX: spawn.x,
     lastZ: spawn.z,
@@ -338,10 +314,39 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     }
   }
 
-  function poseBody(t = 0) {
-    const w = wavePose(boat.x, boat.z, t, boat.yaw, 1.5);
-    const y = WATER_Y + w.h;
-    _e.set(w.eulerX, boat.yaw, w.eulerZ, 'YXZ');
+  // Height over the hull, not one vertex. Pitch from bow to stern, roll across the beam.
+  function hullWave(t) {
+    const fx = fwdX(boat.yaw);
+    const fz = fwdZ(boat.yaw);
+    const rx = Math.sin(boat.yaw);
+    const rz = Math.cos(boat.yaw);
+    const bow = HX * 0.8;
+    const beam = Math.max(HZ, 2.4);
+    const at = (x, z) => waveHeight(x, z, t);
+    const c = at(boat.x, boat.z);
+    const f = at(boat.x + fx * bow, boat.z + fz * bow);
+    const b = at(boat.x - fx * bow, boat.z - fz * bow);
+    const p = at(boat.x + rx * beam, boat.z + rz * beam);
+    const s = at(boat.x - rx * beam, boat.z - rz * beam);
+    return {
+      h: (c * 2 + f + b + p + s) / 6,
+      eulerX: -Math.atan((p - s) / (2 * beam)),
+      eulerZ: Math.atan((f - b) / (2 * bow)),
+    };
+  }
+
+  function ride(t, dt) {
+    const w = hullWave(t);
+    const k = dt > 0 ? 1 - Math.exp(-dt / FLOAT_TAU) : 1;
+    boat.heave += (w.h - boat.heave) * k;
+    boat.roll += (w.eulerX - boat.roll) * k;
+    boat.pitch += (w.eulerZ - boat.pitch) * k;
+  }
+
+  function poseBody(t = 0, dt = 0) {
+    ride(t, dt);
+    const y = WATER_Y + boat.heave;
+    _e.set(boat.roll, boat.yaw, boat.pitch, 'YXZ');
     _q.setFromEuler(_e);
     body.setNextKinematicTranslation({ x: boat.x, y, z: boat.z });
     body.setNextKinematicRotation(_q);
@@ -420,7 +425,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     const e = player.body.translation();
     const dx = e.x - boat.x, dz = e.z - boat.z;
     if (Math.hypot(dx, dz) > SIGHT) return false;
-    const ax = boat.x, ay = WATER_Y + waveHeight(boat.x, boat.z, boat.waveT) + EYE_H, az = boat.z;
+    const ax = boat.x, ay = WATER_Y + boat.heave + EYE_H, az = boat.z;
     const hull = clear(ax, ay, az, e.x, e.y + TANK_HULL_H, e.z, player);
     return hull || clear(ax, ay, az, e.x, e.y + TANK_EYE_H, e.z, player);
   }
@@ -572,26 +577,24 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     if (boat.goal && Math.hypot(boat.goal.x - boat.x, boat.goal.z - boat.z) < 7) boat.goal = null;
   }
 
-  function updateWake() {
-    const k = boat.alive ? THREE.MathUtils.clamp(boat.speed / CRUISE, 0, 1.25) : 0;
-    wake.group.visible = k > 0.06;
-    if (!wake.group.visible) {
-      wake.mat.opacity = 0;
-      return;
-    }
-    const len = 4.5 + k * 13;
-    const flare = 0.14 + k * 0.12;
-    const beam = 1.05;
-    wake.center.position.set(-STERN - 0.2, 0.04, 0);
-    wake.center.rotation.y = 0;
-    wake.center.scale.set(len * 0.72, 1, 0.36 + k * 0.2);
-    wake.left.position.set(-STERN, 0.04, beam);
-    wake.left.rotation.y = flare;
-    wake.left.scale.set(len, 1, 0.32 + k * 0.12);
-    wake.right.position.set(-STERN, 0.04, -beam);
-    wake.right.rotation.y = -flare;
-    wake.right.scale.set(len, 1, 0.32 + k * 0.12);
-    wake.mat.opacity = 0.2 + k * 0.32;
+  function clearWake() {
+    wake.clear(boat.x, boat.z);
+  }
+
+  function updateWake(dt) {
+    const fx = fwdX(boat.yaw);
+    const fz = fwdZ(boat.yaw);
+    wake.update(dt, {
+      x: boat.x,
+      z: boat.z,
+      fx,
+      fz,
+      rx: Math.sin(boat.yaw),
+      rz: Math.cos(boat.yaw),
+      speed: boat.speed,
+      emit: boat.alive && boat.speed > 0.45,
+      time: boat.waveT,
+    });
   }
 
   function applyHitFlash(on) {
@@ -621,7 +624,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     boat.sinkT = 0;
     boat.sinkSign = Math.random() < 0.5 ? 1 : -1;
     boat.speed = 0;
-    wake.group.visible = false;
+    clearWake();
     if (!boat.burned) {
       applyBurntMetal(hullPivot);
       applyBurntMetal(turret);
@@ -635,7 +638,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     boat.gone = true;
     setLod(-1);
     root.visible = false;
-    wake.group.visible = false;
+    clearWake();
     fx?.setDamageFire(null, 0, fireSlot);
     body.setEnabled(false);
   }
@@ -654,7 +657,8 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
       const u = (boat.sinkT - (SINK_GONE - SINK_SLIDE)) / SINK_SLIDE;
       drop = SINK_DEPTH + (SINK_FLOOR - SINK_DEPTH) * u * u;
     }
-    const swell = waveHeight(boat.x, boat.z, boat.waveT) * (1 - ease);
+    ride(boat.waveT, dt);
+    const swell = boat.heave * (1 - ease);
     const y = WATER_Y + swell - drop;
     _e.set(ease * 0.18, boat.yaw, boat.sinkSign * ease * 0.85, 'YXZ');
     _q.setFromEuler(_e);
@@ -723,7 +727,7 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
     applyHitFlash(false);
     poseBody();
     setLod(lod < 0 ? 0 : lod);
-    updateWake();
+    clearWake();
   }
 
   // Stash live materials so a burnt wreck can be restored on reset.
@@ -801,10 +805,10 @@ function createBoat({ RAPIER, world, scene, hullSrc, turSrc, muzzleLocal, spawnH
         boat.lastZ = boat.z;
         boat.stuckT = 0;
       }
-      poseBody(t);
+      poseBody(t, dt);
       aimTurret(dt, player);
       triggerMg(dt, player);
-      updateWake();
+      updateWake(dt);
       const ping = boat.ping;
       boat.ping = null;
       return ping ?? null;

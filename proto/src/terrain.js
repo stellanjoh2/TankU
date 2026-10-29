@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 import { MeshStandardNodeMaterial } from 'three/webgpu';
 import { attribute, float, mix, normalMap, texture, uniform, uv, vec3 } from 'three/tsl';
-import { WaterMesh } from './WaterMesh.js';
+import { bakeShoreMap } from './ultraWater/shoreMap.js';
+import { createUltraWater } from './ultraWater/OceanSurface.js';
 
 export const SIZE = 380;
 export const WATER_Y = 0.2;
@@ -9,7 +10,7 @@ export const WATER_Y = 0.2;
 const SEGS = 264;
 /** How far offshore (metres of shore distance) the heightfield eases down to the floor. */
 const SHORE_SHELF = 36;
-/** Visual shelf extent — must cover WaterMesh shallowDepth (~2.8 m water → ~16 m shore). */
+/** Visual shelf extent — beach band the ocean's shore breakers run up onto. */
 const SEA_PRUNE = -20;
 /** Flat physical sea floor past the shelf. The shelf lands just above this so the two don't z-fight. */
 const SEA_FLOOR_Y = WATER_Y - 5.5;
@@ -563,7 +564,7 @@ function pruneSeaFaces(geo) {
   geo.setIndex(out);
 }
 
-export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
+export async function buildTerrain(RAPIER, world, scene, { sunDir, renderer, skyCube } = {}) {
   const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEGS, SEGS);
   geo.rotateX(-Math.PI / 2);
   const pos = geo.attributes.position;
@@ -637,39 +638,19 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
   seaFloor.name = 'SeaFloor';
   scene.add(seaFloor);
 
-  // WebGPU ocean (three.js WaterMesh). Shore shelf stays on the terrain mesh; the floor is separate.
-  const waterNormals = await loader.loadAsync('./textures/waternormals.jpg');
-  waterNormals.wrapS = waterNormals.wrapT = THREE.RepeatWrapping;
-  waterNormals.anisotropy = 8;
-  // Swell amps are centimetres — normals carry the look; keep the plane coarse (~90 m quads).
-  const WATER_SEGS = 24;
-  const water = new WaterMesh(
-    new THREE.PlaneGeometry(SIZE * 6, SIZE * 6, WATER_SEGS, WATER_SEGS),
-    {
-      waterNormals,
-      sunDirection: (sunDir || new THREE.Vector3(0.70707, 0.70707, 0)).clone().normalize(),
-      sunColor: 0xffffff,
-      waterColor: palette.water,
-      // Turquoise near shore / hull contact; foam line rides the depth intersection.
-      shallowColor: 0x5ec8c4,
-      shallowDepth: 2.8,
-      foamDepth: 0.45,
-      foamIntensity: 0.65,
-      shoreOpacity: 0.55,
-      distortionScale: 3.7,
-      size: 2.0,
-      timeScale: 0.5,
-    },
-  );
-  water.rotation.x = -Math.PI / 2;
-  water.position.y = WATER_Y;
-  water.receiveShadow = false;
-  // Transparent + depthWrite false: must draw before FX (default order 0). Order 2
-  // painted the ocean over muzzle flashes / explosions; distance sort also fails on
-  // this huge plane when order ties.
-  water.renderOrder = -1;
-  water.name = 'Ocean';
-  scene.add(water);
+  // Ultra-Water FFT ocean. Real shelf near the beach, then a deep basin so swell
+  // isn't killed by the 5 m gameplay sea floor.
+  const SHORE_EXTENT = 900;
+  const shore = bakeShoreMap((x, z) => {
+    const s = shoreSigned(x, z);
+    const h = heightAt(x, z) - WATER_Y;
+    if (s >= -2) return h;
+    const u = Math.min(1, (-s - 2) / 24);
+    return h * (1 - u) + (-42) * u;
+  }, SHORE_EXTENT, 384);
+  const water = createUltraWater(renderer, { shore, skyCube, seaY: WATER_Y });
+  if (sunDir) water.sunDirection.value.copy(sunDir);
+  scene.add(water.mesh);
 
   // Heightfield instead of the 264×264 trimesh. Same vertex heights as the mesh.
   // nrows/ncols are quad counts. Column j is X, row i is Z, column-major.
@@ -707,7 +688,6 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir } = {}) {
       for (const [k, v] of Object.entries(partial)) {
         if (!palette[k]) continue;
         palette[k].set(v);
-        if (k === 'water') water.waterColor.value.copy(palette.water);
       }
       applyPalette();
       for (const fn of paletteListeners) fn();
