@@ -95,6 +95,8 @@ function hydrate(json) {
     gradeHighlights: col(json.gradeHighlights ?? '#ffffff'),
     vignette: json.vignette,
     grain: json.grain,
+    explosionFlareBrightness: json.explosionFlareBrightness ?? VISUAL_DEFAULTS.explosionFlareBrightness,
+    explosionFlareScale: json.explosionFlareScale ?? VISUAL_DEFAULTS.explosionFlareScale,
     flareEnabled: json.flareEnabled ?? VISUAL_DEFAULTS.flareEnabled,
     flareIntensity: json.flareIntensity ?? VISUAL_DEFAULTS.flareIntensity,
     flareScale: json.flareScale ?? VISUAL_DEFAULTS.flareScale,
@@ -124,6 +126,7 @@ export function createVisualsEditor(ctx) {
   const {
     renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe,
     terrain, grass, vegetation, barrels, trucks, post, shadowTint, fx, clouds, lensFlare,
+    explosionFlare,
     getEnvIntensity, setEnvIntensity,
     tanks = [],
     initial = VISUAL_DEFAULTS,
@@ -240,6 +243,8 @@ export function createVisualsEditor(ctx) {
       gradeHighlights: grade.highlights.value.clone(),
       vignette: grade.vignetteIntensity.value,
       grain: finish.grain.value,
+      explosionFlareBrightness: explosionFlare?.brightness ?? VISUAL_DEFAULTS.explosionFlareBrightness,
+      explosionFlareScale: explosionFlare?.scale ?? VISUAL_DEFAULTS.explosionFlareScale,
       flareEnabled: lensFlare?.enabled ?? true,
       flareIntensity: lensFlare?.intensity ?? VISUAL_DEFAULTS.flareIntensity,
       flareScale: lensFlare?.scale ?? VISUAL_DEFAULTS.flareScale,
@@ -301,6 +306,10 @@ export function createVisualsEditor(ctx) {
     if (s.gradeHighlights) grade.highlights.value.copy(s.gradeHighlights);
     grade.vignetteIntensity.value = s.vignette;
     finish.grain.value = s.grain;
+    if (explosionFlare) {
+      explosionFlare.brightness = s.explosionFlareBrightness ?? VISUAL_DEFAULTS.explosionFlareBrightness;
+      explosionFlare.scale = s.explosionFlareScale ?? VISUAL_DEFAULTS.explosionFlareScale;
+    }
     if (lensFlare) {
       lensFlare.enabled = s.flareEnabled ?? true;
       lensFlare.intensity = s.flareIntensity ?? VISUAL_DEFAULTS.flareIntensity;
@@ -383,6 +392,8 @@ export function createVisualsEditor(ctx) {
       gradeHighlights: c(s.gradeHighlights),
       vignette: s.vignette,
       grain: s.grain,
+      explosionFlareBrightness: s.explosionFlareBrightness,
+      explosionFlareScale: s.explosionFlareScale,
       flareEnabled: s.flareEnabled,
       flareIntensity: s.flareIntensity,
       flareScale: s.flareScale,
@@ -697,6 +708,14 @@ export function createVisualsEditor(ctx) {
     addSlider(s, 'Bloom radius', 0, 1.5, 0.05, () => bloom.radius, (v) => { bloom.radius = v; });
     addSlider(s, 'Bloom thresh', 0, 1.5, 0.05, () => bloom.threshold, (v) => { bloom.threshold = v; });
     addSlider(s, 'Grain', 0, 0.2, 0.005, () => finish.grain.value, (v) => { finish.grain.value = v; });
+    if (explosionFlare) {
+      addSlider(s, 'Explosion flare', 0, 4, 0.05, () => explosionFlare.brightness, (v) => {
+        explosionFlare.brightness = v;
+      });
+      addSlider(s, 'Explosion flare size', 0.05, 3, 0.05, () => explosionFlare.scale, (v) => {
+        explosionFlare.scale = v;
+      });
+    }
   }
 
   // Lens flare (sun) — PlayCanvas CameraFrame knobs

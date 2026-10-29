@@ -17,7 +17,7 @@ function skipObject(o) {
     // Ocean + sea floor are huge flat grids — wireframing them fills the underwater view.
     if (
       n === 'FluffyGrass' || n === 'SkyDome' || n === 'DebugOverlay' || n === 'SunLensFlare'
-      || n === 'Ocean' || n === 'SeaFloor'
+      || n === 'ExplosionLensFlare' || n === 'Ocean' || n === 'SeaFloor'
     ) return true;
   }
   return false;

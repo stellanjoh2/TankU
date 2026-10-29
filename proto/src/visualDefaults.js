@@ -63,6 +63,9 @@ export const VISUAL_DEFAULTS = {
   gradeHighlights: '#fff6bd',
   vignette: 1,
   grain: 0,
+  // Explosion lens flare (textured ghosts, same assets as sun).
+  explosionFlareBrightness: 0.15,
+  explosionFlareScale: 0.1,
   // Lens flare (PlayCanvas-style sun look)
   flareEnabled: true,
   flareIntensity: 1.74,

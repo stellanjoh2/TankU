@@ -1,7 +1,7 @@
 // Shells (ballistic, raycast against the physics world), muzzle flash, impacts, smoke and track dust.
 // Glow sprites keep HDR in emissiveNode. Post blooms the whole frame plus that emissive buffer.
 import * as THREE from 'three/webgpu';
-import { float, smoothstep, texture, uniform, uv, vec4 } from 'three/tsl';
+import { float, mix, smoothstep, texture, uniform, uv, vec3, vec4 } from 'three/tsl';
 import { heightAt as terrainHeightAt, WATER_Y } from './terrain.js';
 import { VISUAL_DEFAULTS } from './visualDefaults.js';
 import { decodeGif } from './gif.js';
@@ -369,6 +369,8 @@ export class Effects {
     this.onMgDirtHit = () => {};
     /** Main-gun shell hit terrain/dirt (not metal). Used for near-miss lens splat. */
     this.onShellDirtHit = () => {};
+    /** Fired from every `_explode` (shell, drum, wreck) — cheap post lens ghosts. */
+    this.onExplosionFlare = () => {};
     this.groundExplosionAtlas = null;
     this.mgSoilImpactAtlas = null;
     this.mgWaterImpactAtlas = null;
@@ -462,7 +464,7 @@ export class Effects {
     this._shellDir = new THREE.Vector3();
     this._hitPoint = new THREE.Vector3();
     this._hitNormal = new THREE.Vector3();
-    this._puffTint = new THREE.Color(0.3, 0.27, 0.22);
+    this._puffTint = new THREE.Color(0.78, 0.70, 0.55);
     this._shellHit = new THREE.Vector3();
     this._boomPos = new THREE.Vector3();
     this._boomN = new THREE.Vector3();
@@ -652,6 +654,50 @@ export class Effects {
     });
     this.damageFire = fire;
     this._blitDamageFire(0);
+  }
+
+  /** Build flipbook pools + glow board so the first shot / impact doesn't allocate mid-frame. */
+  warmup() {
+    if (this.groundExplosionAtlas?.image) {
+      this._ensureCardPool('blast', this.groundExplosionAtlas.image, {
+        cols: GROUND_EXPLOSION.cols,
+        rows: GROUND_EXPLOSION.rows,
+        frames: GROUND_EXPLOSION.frameCount,
+        fps: GROUND_EXPLOSION.fps,
+        blast: true,
+      });
+    }
+    if (this.mgSoilImpactAtlas?.image) {
+      this._ensureCardPool('mg-soil', this.mgSoilImpactAtlas.image, {
+        cols: MG_SOIL_IMPACT.cols,
+        rows: MG_SOIL_IMPACT.rows,
+        frames: MG_SOIL_IMPACT.frames,
+        fps: MG_SOIL_IMPACT.fps,
+        poolSize: 12,
+        soil: true,
+      });
+    }
+    if (this.mgWaterImpactAtlas?.image) {
+      this._ensureCardPool('mg-water', this.mgWaterImpactAtlas.image, {
+        cols: MG_WATER_IMPACT.cols,
+        rows: MG_WATER_IMPACT.rows,
+        frames: MG_WATER_IMPACT.frames,
+        fps: MG_WATER_IMPACT.fps,
+        poolSize: 12,
+        soil: true,
+      });
+    }
+    if (this.mainMuzzleFront?.image) {
+      this._ensureCardPool('muzzle-front', this.mainMuzzleFront.image, MAIN_MUZZLE);
+    }
+    if (this.mainMuzzleSide?.image) {
+      this._ensureCardPool('muzzle-side', this.mainMuzzleSide.image, MAIN_MUZZLE);
+    }
+    if (this.impactGlowTex && !this._glowBoard) {
+      this._glowBoard = createBillboard(this.scene, this.impactGlowTex, 8, {
+        emissive: true, renderOrder: 5, depthTest: false,
+      });
+    }
   }
 
   _flashLight(pos, peak, { color = 0xffb060, distance = 40, fade = 0.25 } = {}) {
@@ -1193,8 +1239,11 @@ export class Effects {
           // Lit soil dust — keep the map's albedo, no fireball emissive.
           mat.colorNode = vec4(sample.rgb, sample.a);
         } else {
+          // −30% saturation softens the atlas so low-res cells read less painted.
+          const lum = sample.r.mul(0.299).add(sample.g.mul(0.587)).add(sample.b.mul(0.114));
+          const desat = mix(sample.rgb, vec3(lum), float(0.3));
           mat.colorNode = vec4(0, 0, 0, sample.a);
-          mat.emissiveNode = sample.rgb.mul(uniform(toEmissiveLevel(new THREE.Color(1.35, 1.2, 0.95))));
+          mat.emissiveNode = desat.mul(uniform(toEmissiveLevel(new THREE.Color(1.35, 1.2, 0.95))));
         }
         mat.blending = THREE.CustomBlending;
         mat.blendEquation = THREE.AddEquation;
@@ -1812,11 +1861,23 @@ export class Effects {
       this._spawnSpark(this._hitPoint, v, size, 1.1 + Math.random() * 0.9);
     }
 
-    for (let i = 0; i < 3; i++) {
-      const v = this._shellDir.copy(normal).multiplyScalar(1.5 + Math.random() * 3)
-        .add(this._shellStep.set(Math.random() - 0.5, Math.random(), Math.random() - 0.5).multiplyScalar(3));
-      this._sprite(this.smokeTex, this._puffTint, point, 0.6, 2.5 + Math.random() * 1.5,
-        { vel: v, grow: 3.5, rise: 0.7, opacity: 0.45, drag: 1.8 });
+    // A few beige dust puffs rising out from the impact — softens the flipbook’s hard edges.
+    for (let i = 0; i < 4; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const out = 1.8 + Math.random() * 2.4;
+      const v = this._shellDir.set(
+        Math.cos(a) * out,
+        2.2 + Math.random() * 2.8,
+        Math.sin(a) * out,
+      );
+      this._sprite(
+        this.smokeTex,
+        this._puffTint.clone().offsetHSL(0, (Math.random() - 0.5) * 0.06, (Math.random() - 0.5) * 0.08),
+        this._hitPoint.copy(point).add(this._shellStep.set((Math.random() - 0.5) * 1.2, 0.3, (Math.random() - 0.5) * 1.2)),
+        1.4 + Math.random() * 1.1,
+        1.8 + Math.random() * 1.2,
+        { vel: v, grow: 4.5, rise: 1.1, opacity: 0.5, drag: 1.4 },
+      );
     }
     for (let i = 0; i < 10; i++) {
       const chunk = takeMesh(this._debrisPool);
@@ -1841,6 +1902,7 @@ export class Effects {
       b.applyImpulse(d.normalize().multiplyScalar(BLAST_IMPULSE * (1 - dist / BLAST_RADIUS) ** 2 * Math.min(1, b.mass() / 200)), true);
     }
     this.onImpact(point);
+    this.onExplosionFlare(point);
   }
 
   /** HDR sprites and muzzle cards. Smoke and debris stay in the beauty pass. */

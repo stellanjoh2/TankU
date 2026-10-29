@@ -8,7 +8,7 @@ import { LightProbeGenerator } from 'three/examples/jsm/lights/LightProbeGenerat
 import { SkyMesh } from 'three/examples/jsm/objects/SkyMesh.js';
 import { uniform, vec4 } from 'three/tsl';
 import { createPost } from './post.js';
-import { createSunLensFlare } from './lensFlare.js';
+import { createSunLensFlare, createExplosionLensFlare } from './lensFlare.js';
 import { buildTerrain, heightAt, isGrassable, PLAYER_SPAWN, BRIDGE, ENEMY_SPAWN, ENEMY_SPAWN_BASE, WATER_Y, shoreSigned } from './terrain.js';
 import { buildProps } from './props.js';
 import { buildAirfield } from './airfield.js';
@@ -54,12 +54,60 @@ import { buildTrucks } from './truck.js';
 import { buildPatrolBoat } from './patrolBoat.js';
 import { buildPebbles } from './pebbles.js';
 import { createEngineHeatHaze } from './heatHaze.js';
+import { preloadCorrugated } from './corrugatedTex.js';
+import { preloadConcrete } from './concreteTex.js';
+import { preloadPlanks } from './planksTex.js';
+import { preloadBurntMetal } from './burntMetal.js';
 import './style.css';
 
 const FIXED_DT = 1 / 60;
 const MAX_SUBSTEPS = 2;
 const MAX_RENDER_W = 960;
 const MAX_RENDER_H = 540;
+
+/** Startup progress UI. `phase(weight, label, work)` advances the bar after `work` resolves. */
+function createLoading() {
+  const root = $('loading');
+  const status = root.querySelector('.loading-status');
+  const fill = root.querySelector('.loading-bar-fill');
+  const pct = root.querySelector('.loading-pct');
+  let progress = 0;
+
+  function paint(label) {
+    if (label) status.textContent = label;
+    const p = Math.round(Math.min(1, Math.max(0, progress)) * 100);
+    fill.style.width = `${p}%`;
+    pct.textContent = `${p}%`;
+  }
+
+  /** Double-rAF so the bar paints before the next heavy sync chunk. */
+  function yieldPaint() {
+    return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  }
+
+  return {
+    async phase(weight, label, work) {
+      paint(label);
+      await yieldPaint();
+      const result = await work((subLabel, t = 0) => {
+        const p = progress + weight * Math.min(1, Math.max(0, t));
+        status.textContent = subLabel || label;
+        const pctVal = Math.round(Math.min(1, p) * 100);
+        fill.style.width = `${pctVal}%`;
+        pct.textContent = `${pctVal}%`;
+      });
+      progress = Math.min(1, progress + weight);
+      paint(label);
+      await yieldPaint();
+      return result;
+    },
+    finish() {
+      progress = 1;
+      paint('Ready');
+      root.remove();
+    },
+  };
+}
 
 /** Bake local matrices and stop recomputing them. Safe for scenery that never moves. */
 function freezeStatic(root) {
@@ -87,11 +135,13 @@ const MUSIC_VOL_KEY = 'sherman.musicVol';
 const $ = (id) => document.getElementById(id);
 
 async function main() {
-  await RAPIER.init();
+  const load = createLoading();
+
+  await load.phase(0.03, 'Physics…', () => RAPIER.init());
 
   // ---------------------------------------------------------------- renderer / scene
   const renderer = new WebGPURenderer({ antialias: false, powerPreference: 'high-performance' });
-  await renderer.init();
+  await load.phase(0.04, 'WebGPU…', () => renderer.init());
   if (!renderer.backend.isWebGPUBackend) {
     throw new Error('WebGPU is required (WebGL2 fallback disabled for this proto).');
   }
@@ -109,97 +159,136 @@ async function main() {
   scene.fog = new THREE.Fog(fogColor, 30, 151);
 
   // HDRI → cube RT → LightProbe (diffuse SH) + PMREM env (specular), same path as webgpu_lightprobe
-  const equirect = await new EXRLoader().loadAsync('./textures/hdri/env.exr');
-  equirect.mapping = THREE.EquirectangularReflectionMapping;
+  const { cubeRT, lightProbe, sky, sun, hemi, ambient } = await load.phase(0.08, 'Sky & lighting…', async () => {
+    const equirect = await new EXRLoader().loadAsync('./textures/hdri/env.exr');
+    equirect.mapping = THREE.EquirectangularReflectionMapping;
 
-  const cubeRT = new THREE.CubeRenderTarget(256, {
-    type: THREE.HalfFloatType,
-    format: THREE.RGBAFormat,
-    generateMipmaps: true,
+    const cubeRT = new THREE.CubeRenderTarget(256, {
+      type: THREE.HalfFloatType,
+      format: THREE.RGBAFormat,
+      generateMipmaps: true,
+    });
+    cubeRT.texture.minFilter = THREE.LinearMipmapLinearFilter;
+    cubeRT.texture.magFilter = THREE.LinearFilter;
+    cubeRT.texture.generateMipmaps = true;
+    cubeRT.fromEquirectangularTexture(renderer, equirect);
+    const lightProbe = await LightProbeGenerator.fromCubeRenderTarget(renderer, cubeRT);
+    lightProbe.intensity = 1;
+    scene.add(lightProbe);
+    // Kept for the ocean's mipmapped sky reflections.
+
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromEquirectangular(equirect).texture;
+    scene.environmentIntensity = 1;
+    equirect.dispose();
+    pmrem.dispose();
+
+    // Procedural skydome (three.js SkyMesh / webgpu_sky) — depth forced to far plane.
+    const sky = new SkyMesh();
+    sky.scale.setScalar(450000);
+    sky.turbidity.value = 6;
+    sky.rayleigh.value = 0.293;
+    sky.mieCoefficient.value = 0.001;
+    sky.mieDirectionalG.value = 0.413;
+    sky.cloudCoverage.value = 0.22;
+    sky.cloudDensity.value = 0.39;
+    sky.cloudElevation.value = 0.46;
+    sky.showSunDisc.value = true;
+    sky.sunPosition.value.copy(sunDir);
+    // Fog colour + sky tint live on the mesh for the visuals editor (sky itself is procedural).
+    sky.userData.fogColor = fogColor;
+    const skyTint = uniform(new THREE.Color(1, 1, 1));
+    sky.userData.skyTint = skyTint;
+    const skyBase = sky.material.colorNode;
+    sky.material.colorNode = vec4(skyBase.rgb.mul(skyTint), skyBase.a);
+    scene.add(sky);
+
+    const sun = new THREE.DirectionalLight(new THREE.Color(1.0, 0.93, 0.82), 3.2);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(512, 512);
+    Object.assign(sun.shadow.camera, { left: -SHADOW_EXTENT, right: SHADOW_EXTENT, top: SHADOW_EXTENT,
+                                       bottom: -SHADOW_EXTENT, near: 1, far: 260 });
+    sun.shadow.bias = -0.0004;
+    sun.shadow.normalBias = 0.035;
+    sun.shadow.radius = 1;
+    sun.shadow.intensity = 1;
+    scene.add(sun, sun.target);
+    const hemi = new THREE.HemisphereLight(new THREE.Color(0.55, 0.65, 0.85), new THREE.Color(0.32, 0.27, 0.18), 0.85);
+    const ambient = new THREE.AmbientLight(0xffffff, 0.12);
+    scene.add(hemi, ambient);
+    return { cubeRT, lightProbe, sky, sun, hemi, ambient };
   });
-  cubeRT.texture.minFilter = THREE.LinearMipmapLinearFilter;
-  cubeRT.texture.magFilter = THREE.LinearFilter;
-  cubeRT.texture.generateMipmaps = true;
-  cubeRT.fromEquirectangularTexture(renderer, equirect);
-  const lightProbe = await LightProbeGenerator.fromCubeRenderTarget(renderer, cubeRT);
-  lightProbe.intensity = 1;
-  scene.add(lightProbe);
-  // Kept for the ocean's mipmapped sky reflections.
 
-  const pmrem = new THREE.PMREMGenerator(renderer);
-  scene.environment = pmrem.fromEquirectangular(equirect).texture;
-  scene.environmentIntensity = 1;
-  equirect.dispose();
-  pmrem.dispose();
-
-  // Procedural skydome (three.js SkyMesh / webgpu_sky) — depth forced to far plane.
-  const sky = new SkyMesh();
-  sky.scale.setScalar(450000);
-  sky.turbidity.value = 6;
-  sky.rayleigh.value = 0.293;
-  sky.mieCoefficient.value = 0.001;
-  sky.mieDirectionalG.value = 0.413;
-  sky.cloudCoverage.value = 0.22;
-  sky.cloudDensity.value = 0.39;
-  sky.cloudElevation.value = 0.46;
-  sky.showSunDisc.value = true;
-  sky.sunPosition.value.copy(sunDir);
-  // Fog colour + sky tint live on the mesh for the visuals editor (sky itself is procedural).
-  sky.userData.fogColor = fogColor;
-  const skyTint = uniform(new THREE.Color(1, 1, 1));
-  sky.userData.skyTint = skyTint;
-  const skyBase = sky.material.colorNode;
-  sky.material.colorNode = vec4(skyBase.rgb.mul(skyTint), skyBase.a);
-  scene.add(sky);
-
-  const sun = new THREE.DirectionalLight(new THREE.Color(1.0, 0.93, 0.82), 3.2);
-  sun.castShadow = true;
-  sun.shadow.mapSize.set(512, 512);
-  Object.assign(sun.shadow.camera, { left: -SHADOW_EXTENT, right: SHADOW_EXTENT, top: SHADOW_EXTENT,
-                                     bottom: -SHADOW_EXTENT, near: 1, far: 260 });
-  sun.shadow.bias = -0.0004;
-  sun.shadow.normalBias = 0.035;
-  sun.shadow.radius = 1;
-  sun.shadow.intensity = 1;
-  scene.add(sun, sun.target);
-  const hemi = new THREE.HemisphereLight(new THREE.Color(0.55, 0.65, 0.85), new THREE.Color(0.32, 0.27, 0.18), 0.85);
-  const ambient = new THREE.AmbientLight(0xffffff, 0.12);
-  scene.add(hemi, ambient);
-  const clouds = await createCloudShadows([[sun, 1], [hemi, 0.5], [ambient, 0.5]], sky);
+  const clouds = await load.phase(0.02, 'Cloud shadows…', () => (
+    createCloudShadows([[sun, 1], [hemi, 0.5], [ambient, 0.5]], sky)
+  ));
 
   const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 2000);
   scene.add(camera); // so camera-parented overlays (lens flare) render
-  const post = await createPost(renderer, scene, camera);
+  const post = await load.phase(0.03, 'Post FX…', () => createPost(renderer, scene, camera));
 
   // ---------------------------------------------------------------- world
   const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
   world.timestep = FIXED_DT;
-  const lensFlare = await createSunLensFlare({ camera, RAPIER, world, sunDir });
-  const terrain = await buildTerrain(RAPIER, world, scene, { sunDir, renderer, skyCube: cubeRT.texture });
+  const lensFlare = await load.phase(0.02, 'Lens flare…', () => (
+    createSunLensFlare({ camera, RAPIER, world, sunDir })
+  ));
+  const explosionFlare = createExplosionLensFlare({ camera, maps: lensFlare.maps });
+  const terrain = await load.phase(0.10, 'Terrain & ocean…', () => (
+    buildTerrain(RAPIER, world, scene, { sunDir, renderer, skyCube: cubeRT.texture })
+  ));
   buildBgIsland(scene, terrain);
   buildProps(RAPIER, world, scene);
+
+  await load.phase(0.04, 'Surface textures…', async (sub) => {
+    sub('Corrugated steel…', 0);
+    await preloadCorrugated();
+    sub('Concrete…', 0.4);
+    await preloadConcrete();
+    sub('Planks…', 0.7);
+    await preloadPlanks();
+    sub('Burnt metal…', 0.9);
+    await preloadBurntMetal();
+  });
+
   const airfield = buildAirfield(RAPIER, world, scene);
   freezeStatic(airfield.root);
   const port = buildPort(RAPIER, world, scene);
   freezeStatic(port.root);
-  const [grass, vegetation, planes, transport, ship, waterTower, flag, barrels, woodenCrates, trucks, bridge, patrolBoat] = await Promise.all([
-    buildGrass(scene),
-    buildVegetation(scene, { RAPIER, world }),
-    buildPlanes(scene),
-    buildTransport(scene),
-    buildShip(scene),
-    buildWaterTower(scene, { RAPIER, world }),
-    buildFlag(scene, { RAPIER, world }),
-    buildBarrels(scene, { RAPIER, world }),
-    buildWoodenCrates(scene, { RAPIER, world }),
-    buildTrucks(scene, { RAPIER, world }),
-    buildBridge(scene, { RAPIER, world }),
-    buildPatrolBoat(scene, { RAPIER, world }),
-  ]);
+
+  const [grass, vegetation, planes, transport, ship, waterTower, flag, barrels, woodenCrates, trucks, bridge, patrolBoat] = await load.phase(
+    0.30,
+    'World props…',
+    async (sub) => {
+      const jobs = [
+        ['Grass', buildGrass(scene)],
+        ['Vegetation', buildVegetation(scene, { RAPIER, world })],
+        ['Planes', buildPlanes(scene)],
+        ['C-47', buildTransport(scene)],
+        ['Ship', buildShip(scene)],
+        ['Water tower', buildWaterTower(scene, { RAPIER, world })],
+        ['Flag', buildFlag(scene, { RAPIER, world })],
+        ['Barrels', buildBarrels(scene, { RAPIER, world })],
+        ['Crates', buildWoodenCrates(scene, { RAPIER, world })],
+        ['Trucks', buildTrucks(scene, { RAPIER, world })],
+        ['Bridge', buildBridge(scene, { RAPIER, world })],
+        ['Patrol boat', buildPatrolBoat(scene, { RAPIER, world })],
+      ];
+      let done = 0;
+      return Promise.all(jobs.map(async ([name, promise]) => {
+        const value = await promise;
+        done++;
+        sub(`Loading ${name}…`, done / jobs.length);
+        return value;
+      }));
+    },
+  );
   freezeStatic(ship.root);
   ship.wakeTurrets();
   freezeStatic(bridge.root);
-  await buildPebbles(scene, vegetation.pebbleAnchors, terrain.groundSets, terrain.palette.concrete);
+  await load.phase(0.02, 'Pebbles…', () => (
+    buildPebbles(scene, vegetation.pebbleAnchors, terrain.groundSets, terrain.palette.concrete)
+  ));
 
   // Player keeps the parsed scene. Each enemy gets a skinned clone and its own
   // materials, taken before the player installs the repair glow on the original.
@@ -222,69 +311,87 @@ async function main() {
     return { scene };
   }
 
-  const loader = new GLTFLoader();
-  const [gltf, wreckGltf, wrenchGltf] = await Promise.all([
-    loader.loadAsync('./models/sherman.glb'),
-    loader.loadAsync('./models/sherman_destroyed.glb'),
-    loader.loadAsync('./models/wrench_pickup.glb'),
-  ]);
-  let wrenchGeo = null;
-  wrenchGltf.scene.traverse((o) => {
-    if (o.isMesh && !wrenchGeo) wrenchGeo = o.geometry;
-  });
-  if (!wrenchGeo) throw new Error('wrench_pickup.glb: missing mesh');
-  const { x: sx, z: sz } = PLAYER_SPAWN;
-  const spawn = { x: sx, y: heightAt(sx, sz) + 0.6, z: sz, yaw: Math.atan2(-(BRIDGE.z - sz), BRIDGE.x - sx) };
-  const wreckSrc = wreckGltf.scene;
-  const enemyScenes = [cloneSherman(gltf), cloneSherman(gltf)];
-  const tank = new Tank(gltf, RAPIER, world, spawn, { wreck: wreckSrc, repairGlow: true });
-  scene.add(tank.model);
-  const heatHaze = createEngineHeatHaze();
-  const HEAT_HAZE = heatHaze.userData.heatStrength.value;
-  heatHaze.visible = false;
-  tank.model.add(heatHaze);
-  const fx = new Effects(scene, RAPIER, world, tank.body, barrels.dynamic);
-  fx.camera = camera;
-  const smoke = createSmokeField(fx);
+  const { wrenchGeo, spawn, tank, heatHaze, HEAT_HAZE, fx, smoke, nav, foes, enemy, ai, hud, tankCam, sfx } = await load.phase(
+    0.08,
+    'Tanks…',
+    async (sub) => {
+      const loader = new GLTFLoader();
+      sub('Sherman…', 0.1);
+      const [gltf, wreckGltf, wrenchGltf] = await Promise.all([
+        loader.loadAsync('./models/sherman.glb'),
+        loader.loadAsync('./models/sherman_destroyed.glb'),
+        loader.loadAsync('./models/wrench_pickup.glb'),
+      ]);
+      let wrenchGeo = null;
+      wrenchGltf.scene.traverse((o) => {
+        if (o.isMesh && !wrenchGeo) wrenchGeo = o.geometry;
+      });
+      if (!wrenchGeo) throw new Error('wrench_pickup.glb: missing mesh');
+      const { x: sx, z: sz } = PLAYER_SPAWN;
+      const spawn = { x: sx, y: heightAt(sx, sz) + 0.6, z: sz, yaw: Math.atan2(-(BRIDGE.z - sz), BRIDGE.x - sx) };
+      const wreckSrc = wreckGltf.scene;
+      const enemyScenes = [cloneSherman(gltf), cloneSherman(gltf)];
+      sub('Spawning…', 0.7);
+      const tank = new Tank(gltf, RAPIER, world, spawn, { wreck: wreckSrc, repairGlow: true });
+      scene.add(tank.model);
+      const heatHaze = createEngineHeatHaze();
+      const HEAT_HAZE = heatHaze.userData.heatStrength.value;
+      heatHaze.visible = false;
+      tank.model.add(heatHaze);
+      const fx = new Effects(scene, RAPIER, world, tank.body, barrels.dynamic);
+      fx.camera = camera;
+      fx.onExplosionFlare = (p) => explosionFlare.trigger(p);
+      const smoke = createSmokeField(fx);
 
-  const nav = new NavGrid();
-  nav.setObstacles([
-    ...vegetation.navObstacles(), ...airfield.navObstacles(),
-    ...port.navObstacles(), ...waterTower.navObstacles(), ...flag.navObstacles(),
-    ...trucks.navObstacles(), ...woodenCrates.navObstacles(),
-  ]);
-  const foeSpecs = [
-    { src: enemyScenes[0], anchor: ENEMY_SPAWN, fireSlot: 1, mgId: 'enemy' },
-    { src: enemyScenes[1], anchor: ENEMY_SPAWN_BASE, spawnR: 10, patrolR: [8, 16], fireSlot: 6, mgId: 'enemy2' },
-  ];
-  const foes = foeSpecs.map(({ src, anchor, fireSlot, mgId, patrolR, spawnR }) => {
-    const foe = new Tank(src, RAPIER, world, pickSpawn(nav, spawn, anchor, spawnR), { tint: ENEMY_TINT, wreck: wreckSrc });
-    scene.add(foe.model);
-    const brain = new TankAI({ tank: foe, enemy: tank, nav, world, RAPIER, coverRocks: vegetation.coverRocks, anchor, patrolR, smoke });
-    return { tank: foe, ai: brain, anchor, spawnR, fireSlot, mgId };
-  });
-  const enemy = foes[0].tank;
-  const ai = foes[0].ai;
-  const hud = createHud();
+      const nav = new NavGrid();
+      nav.setObstacles([
+        ...vegetation.navObstacles(), ...airfield.navObstacles(),
+        ...port.navObstacles(), ...waterTower.navObstacles(), ...flag.navObstacles(),
+        ...trucks.navObstacles(), ...woodenCrates.navObstacles(),
+      ]);
+      const foeSpecs = [
+        { src: enemyScenes[0], anchor: ENEMY_SPAWN, fireSlot: 1, mgId: 'enemy' },
+        { src: enemyScenes[1], anchor: ENEMY_SPAWN_BASE, spawnR: 10, patrolR: [8, 16], fireSlot: 6, mgId: 'enemy2' },
+      ];
+      const foes = foeSpecs.map(({ src, anchor, fireSlot, mgId, patrolR, spawnR }) => {
+        const foe = new Tank(src, RAPIER, world, pickSpawn(nav, spawn, anchor, spawnR), { tint: ENEMY_TINT, wreck: wreckSrc });
+        scene.add(foe.model);
+        const brain = new TankAI({ tank: foe, enemy: tank, nav, world, RAPIER, coverRocks: vegetation.coverRocks, anchor, patrolR, smoke });
+        return { tank: foe, ai: brain, anchor, spawnR, fireSlot, mgId };
+      });
+      const enemy = foes[0].tank;
+      const ai = foes[0].ai;
+      const hud = createHud();
 
-  const tankCam = new TankCamera(camera);
-  const camRay = new RAPIER.Ray({ x: 0, y: 0, z: 0 }, { x: 1, y: 0, z: 0 });
-  tankCam.setCollisionCast((origin, dir, maxDist) => {
-    camRay.origin.x = origin.x; camRay.origin.y = origin.y; camRay.origin.z = origin.z;
-    camRay.dir.x = dir.x; camRay.dir.y = dir.y; camRay.dir.z = dir.z;
-    const hit = world.castRay(
-      camRay, maxDist, true,
-      undefined, undefined, undefined, undefined,
-      (col) => col.parent()?.userData?.camBlock === true,
-    );
-    return hit ? hit.timeOfImpact : null;
+      const tankCam = new TankCamera(camera);
+      const camRay = new RAPIER.Ray({ x: 0, y: 0, z: 0 }, { x: 1, y: 0, z: 0 });
+      tankCam.setCollisionCast((origin, dir, maxDist) => {
+        camRay.origin.x = origin.x; camRay.origin.y = origin.y; camRay.origin.z = origin.z;
+        camRay.dir.x = dir.x; camRay.dir.y = dir.y; camRay.dir.z = dir.z;
+        const hit = world.castRay(
+          camRay, maxDist, true,
+          undefined, undefined, undefined, undefined,
+          (col) => col.parent()?.userData?.camBlock === true,
+        );
+        return hit ? hit.timeOfImpact : null;
+      });
+      const sfx = new Sfx();
+      return { wrenchGeo, spawn, tank, heatHaze, HEAT_HAZE, fx, smoke, nav, foes, enemy, ai, hud, tankCam, sfx };
+    },
+  );
+
+  await load.phase(0.10, 'Audio & VFX…', async (sub) => {
+    sub('Sound…', 0);
+    const audio = sfx.load();
+    sub('Effects…', 0.2);
+    const effects = fx.load();
+    sub('Tank LODs…', 0.5);
+    await Promise.all([
+      audio,
+      effects,
+      ...foes.map((f) => installTankLods(f.tank)),
+    ]);
   });
-  const sfx = new Sfx();
-  await Promise.all([
-    sfx.load(),
-    fx.load(),
-    ...foes.map((f) => installTankLods(f.tank)),
-  ]);
   sfx.setMusicMuted(localStorage.getItem(MUSIC_MUTE_KEY) === '1');
   {
     const saved = localStorage.getItem(MUSIC_VOL_KEY);
@@ -403,7 +510,7 @@ async function main() {
 
   patchShadowTint(scene);
   const visuals = createVisualsEditor({
-    renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe, terrain, grass, vegetation, barrels, trucks, post, shadowTint, fx, clouds, lensFlare,
+    renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe, terrain, grass, vegetation, barrels, trucks, post, shadowTint, fx, clouds, lensFlare, explosionFlare,
     getEnvIntensity: () => scene.environmentIntensity,
     setEnvIntensity: (v) => { scene.environmentIntensity = v; },
     tanks: [tank, ...foes.map((f) => f.tank)],
@@ -1320,6 +1427,7 @@ async function main() {
     const freezeDt = menuPaused ? 0 : dt;
     hud.update(freezeDt, camera);
     lensFlare.update(freezeDt || 1 / 60);
+    explosionFlare.update(freezeDt || 1 / 60);
     let bright = fx.emissiveHot() || tank.emissiveHot();
     if (!bright) {
       for (const f of foes) if (f.tank.emissiveHot()) { bright = true; break; }
@@ -1353,12 +1461,32 @@ async function main() {
     presentTick(dt, inp);
     requestAnimationFrame(frame);
   }
+
+  snapCam();
+  await load.phase(0.04, 'Warming audio & effects…', async () => {
+    sfx.warmup();
+    fx.warmup();
+  });
+  await load.phase(0.10, 'Compiling shaders…', async (sub) => {
+    // Drive both post chains (plain + glow) and a few ocean FFT ticks under the loading screen.
+    for (let i = 0; i < 5; i++) {
+      sub(i === 1 ? 'Bloom / glow path…' : 'Scene pipelines…', (i + 1) / 5);
+      updateSun();
+      terrain.water.update(1 / 60, camera);
+      post.render(1 / 60, i === 1, sunDir);
+      await new Promise((r) => requestAnimationFrame(r));
+    }
+  });
+  load.finish();
   requestAnimationFrame(frame);
-  $('loading').remove();
   window.__sherman = { renderer, tank, enemy, foes, ai, nav, game, match, input, fx, smoke, airSupport, shipSupport, radial, tankCam, sfx, world, grass, vegetation, terrain, visuals, debug, fly, lightProbe, sky, planes, flag, barrels, crates, clouds, patrolBoat };
 }
 
 main().catch((e) => {
   console.error(e);
-  $('loading').textContent = `Error: ${e.message}`;
+  const el = $('loading');
+  if (!el) return;
+  const status = el.querySelector('.loading-status');
+  if (status) status.textContent = `Error: ${e.message}`;
+  else el.textContent = `Error: ${e.message}`;
 });
