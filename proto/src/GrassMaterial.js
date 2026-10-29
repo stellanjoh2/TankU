@@ -66,7 +66,7 @@ export class GrassMaterial {
 
     // Lambert so InstancedMesh receiveShadow works (MeshBasic is unlit).
     this.material = new THREE.MeshLambertNodeMaterial({
-      side: THREE.DoubleSide,
+      side: THREE.FrontSide,
       transparent: false,
       depthWrite: true,
       fog: true,

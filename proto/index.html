@@ -10,7 +10,14 @@
   <link href="https://fonts.googleapis.com/css2?family=Black+Ops+One&display=swap" rel="stylesheet" />
 </head>
 <body>
-  <div id="loading">Loading…</div>
+  <div id="loading">
+    <div class="loading-panel">
+      <div class="loading-title">Tank U</div>
+      <div class="loading-status">Starting…</div>
+      <div class="loading-bar" aria-hidden="true"><div class="loading-bar-fill"></div></div>
+      <div class="loading-pct">0%</div>
+    </div>
+  </div>
   <div id="crosshair" data-gun="cannon">
     <!-- Aim ring + reload share one SVG so they stay concentric. -->
     <svg class="reticle reticle-cannon" viewBox="0 0 100 100" aria-hidden="true">

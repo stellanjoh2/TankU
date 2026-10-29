@@ -75,9 +75,9 @@ const PALM_MG_IMPULSE = 1800;
 const PALM_RAM_BASE = 2200;
 const PALM_RAM_PER_SPEED = 380;
 
-/** Visible palms at slider 1.0. −20% from the previous 35. */
+/** Visible palms at slider 1.0. +15% vs prior 28. */
 export const PALM_AMOUNT_DEFAULT = 1;
-const BASE_PALM_TARGET = 28;
+const BASE_PALM_TARGET = 32;
 const MAX_PALM_TARGET = Math.ceil(BASE_PALM_TARGET * 2);
 
 /** Default visible ground-plant count (+25% vs prior 200). Slider 1.0 = this; pool is 2× for headroom. */
@@ -954,7 +954,7 @@ export async function buildVegetation(scene, { RAPIER, world }) {
   // Hill-crown sand: beach radial clusters never sample inland peaks.
   let hillPalmTries = 0;
   let hillPalms = 0;
-  const HILL_PALM_TARGET = 10;
+  const HILL_PALM_TARGET = 12; // +15% vs prior 10; still gated by canPlaceTree
   while (hillPalms < HILL_PALM_TARGET && palms.length < MAX_PALM_TARGET && hillPalmTries < HILL_PALM_TARGET * 100) {
     hillPalmTries++;
     const x = (rand() * 2 - 1) * (HALF - 8);

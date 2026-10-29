@@ -5,13 +5,22 @@ const BURNT_MAP_URL = './textures/ground/rock_color.jpg';
 const BURNT_DARKEN = 0.15;
 let _burntMap = null;
 
-function burntMetalMap() {
+function prepBurnt(tex) {
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(2.5, 2.5);
+  tex.anisotropy = 8;
+  return tex;
+}
+
+export async function preloadBurntMetal() {
   if (_burntMap) return _burntMap;
-  _burntMap = new THREE.TextureLoader().load(BURNT_MAP_URL);
-  _burntMap.colorSpace = THREE.SRGBColorSpace;
-  _burntMap.wrapS = _burntMap.wrapT = THREE.RepeatWrapping;
-  _burntMap.repeat.set(2.5, 2.5);
-  _burntMap.anisotropy = 8;
+  _burntMap = prepBurnt(await new THREE.TextureLoader().loadAsync(BURNT_MAP_URL));
+  return _burntMap;
+}
+
+function burntMetalMap() {
+  if (!_burntMap) throw new Error('burnt metal texture not preloaded');
   return _burntMap;
 }
 

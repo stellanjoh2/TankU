@@ -13,16 +13,27 @@ function prep(tex, colorSpace) {
   return tex;
 }
 
-function loadMaps() {
+export async function preloadConcrete() {
   if (maps) return maps;
   const loader = new THREE.TextureLoader();
   const base = './textures/concrete/';
+  const [color, normal, rough, ao] = await Promise.all([
+    loader.loadAsync(`${base}color.jpg`),
+    loader.loadAsync(`${base}normal.jpg`),
+    loader.loadAsync(`${base}rough.jpg`),
+    loader.loadAsync(`${base}ao.jpg`),
+  ]);
   maps = {
-    color: prep(loader.load(`${base}color.jpg`), THREE.SRGBColorSpace),
-    normal: prep(loader.load(`${base}normal.jpg`), THREE.NoColorSpace),
-    rough: prep(loader.load(`${base}rough.jpg`), THREE.NoColorSpace),
-    ao: prep(loader.load(`${base}ao.jpg`), THREE.NoColorSpace),
+    color: prep(color, THREE.SRGBColorSpace),
+    normal: prep(normal, THREE.NoColorSpace),
+    rough: prep(rough, THREE.NoColorSpace),
+    ao: prep(ao, THREE.NoColorSpace),
   };
+  return maps;
+}
+
+function loadMaps() {
+  if (!maps) throw new Error('concrete textures not preloaded');
   return maps;
 }
 

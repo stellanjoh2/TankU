@@ -97,9 +97,19 @@ export function buildAirfield(RAPIER, world, scene) {
   const roofMat = roofCorrugatedMaterial();
   const metalDark = mat(0x6a7074, { metal: 0.65, rough: 0.5 });
   const frame = mat(0x2a3328, { metal: 0.2, rough: 0.7 });
-  const glass = mat(0x1a2218, { metal: 0.1, rough: 0.15 });
-  glass.transparent = true;
-  glass.opacity = 0.45;
+  const glass = new THREE.MeshPhysicalMaterial({
+    color: 0xa8c4b0,
+    metalness: 0.05,
+    roughness: 0.08,
+    transparent: true,
+    opacity: 0.8,
+    envMapIntensity: 2.2,
+    reflectivity: 1,
+    clearcoat: 0.6,
+    clearcoatRoughness: 0.1,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
   const rust = mat(0x6b3a22, { metal: 0.3, rough: 0.85 });
   const concrete = mat(0xffffff);
   applyConcreteMaps(concrete);

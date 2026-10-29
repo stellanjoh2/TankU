@@ -297,6 +297,19 @@ export class Sfx {
     this._ensureMusic();
   }
 
+  /** Build looping graphs up front so the first drive / MG / ocean doesn't hitch. */
+  warmup() {
+    if (!this.ready) return;
+    this._ensureEngine();
+    this._ensureMusic();
+    this._ensureMg();
+    this._ensureHostileMg();
+    this._ensureFire();
+    this._ensureOcean();
+    this._ensureP51Orbit();
+    this._ensureTurret();
+  }
+
   get musicMuted() { return this._musicMuted; }
   get musicVolume() { return this._musicVol; }
 

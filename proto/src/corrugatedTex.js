@@ -1,9 +1,9 @@
 // Hangar sheet metal. AmbientCG CC0, 1K JPG downscaled to 256.
 // Wall = CorrugatedSteel007A, roof = CorrugatedSteel007C.
-// One repeat is 4 m, same texel density as the ground maps.
+// One repeat is 2 m (half the ground maps) so hangar sheet ribs read denser / building larger.
 import * as THREE from 'three';
 
-export const STEEL_TILE_M = 4;
+export const STEEL_TILE_M = 2;
 
 const KINDS = {
   wall: './textures/corrugated/wall/',
@@ -19,23 +19,35 @@ function prep(tex, colorSpace) {
   return tex;
 }
 
-function loadKind(base) {
+async function loadKind(base) {
   const loader = new THREE.TextureLoader();
+  const [color, normal, rough, ao, metal] = await Promise.all([
+    loader.loadAsync(`${base}color.jpg`),
+    loader.loadAsync(`${base}normal.jpg`),
+    loader.loadAsync(`${base}rough.jpg`),
+    loader.loadAsync(`${base}ao.jpg`),
+    loader.loadAsync(`${base}metal.jpg`),
+  ]);
   return {
-    color: prep(loader.load(`${base}color.jpg`), THREE.SRGBColorSpace),
-    normal: prep(loader.load(`${base}normal.jpg`), THREE.NoColorSpace),
-    rough: prep(loader.load(`${base}rough.jpg`), THREE.NoColorSpace),
-    ao: prep(loader.load(`${base}ao.jpg`), THREE.NoColorSpace),
-    metal: prep(loader.load(`${base}metal.jpg`), THREE.NoColorSpace),
+    color: prep(color, THREE.SRGBColorSpace),
+    normal: prep(normal, THREE.NoColorSpace),
+    rough: prep(rough, THREE.NoColorSpace),
+    ao: prep(ao, THREE.NoColorSpace),
+    metal: prep(metal, THREE.NoColorSpace),
   };
 }
 
-function maps() {
+export async function preloadCorrugated() {
   if (cache) return cache;
   cache = {
-    wall: loadKind(KINDS.wall),
-    roof: loadKind(KINDS.roof),
+    wall: await loadKind(KINDS.wall),
+    roof: await loadKind(KINDS.roof),
   };
+  return cache;
+}
+
+function maps() {
+  if (!cache) throw new Error('corrugated textures not preloaded');
   return cache;
 }
 
