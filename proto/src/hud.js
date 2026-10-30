@@ -1,4 +1,5 @@
-// Health bars (bottom-left), hit-rate (stress + smoke), turret compass, round banner, hit flash.
+// Health bars (bottom-left), hit-rate (stress + smoke), turret compass, hit flash.
+// Round callouts live in messages.js.
 export function createHud() {
   const root = document.createElement('div');
   root.id = 'hud';
@@ -10,7 +11,6 @@ export function createHud() {
     <div class="weapon" data-who="weapon"><span>GUN</span><b>MAIN GUN</b></div>
     <div class="reload hidden" data-who="reload"><span>RELOAD</span><div class="reload-bar"><i></i></div><b>0.0s</b></div>
     <div class="overheat hidden" data-who="overheat"><span>HEAT</span><div class="overheat-bar"><i></i></div><b>0.0s</b></div>
-    <div class="pickup" data-who="pickup"><span>PICKUP IN</span><b>2:00</b></div>
     <div id="turret-compass" aria-hidden="true">
       <svg viewBox="0 0 80 80">
         <circle class="ring" cx="40" cy="40" r="36"/>
@@ -25,18 +25,13 @@ export function createHud() {
       </svg>
     </div>
     <div class="ai-debug hidden"></div>`;
-  const banner = document.createElement('div');
-  banner.id = 'banner';
-  banner.className = 'hidden';
-  const BANNER_FADE = 0.4;
-  let bannerTimer = null; // { t, fading } while a callout should dismiss itself
   const flash = document.createElement('div');
   flash.id = 'hit-flash';
   const dirRoot = document.createElement('div');
   dirRoot.id = 'hit-dirs';
   const compass = root.querySelector('#turret-compass');
   const turretNeedle = compass.querySelector('.turret');
-  document.body.append(root, banner, flash, dirRoot);
+  document.body.append(root, flash, dirRoot);
 
   // Directional hit markers: a red arc around the screen centre, turned toward the shooter.
   // Kept as world positions so they keep pointing the right way while you turn.
@@ -55,7 +50,6 @@ export function createHud() {
     weapon: root.querySelector('[data-who="weapon"]'),
     reload: root.querySelector('[data-who="reload"]'),
     overheat: root.querySelector('[data-who="overheat"]'),
-    pickup: root.querySelector('[data-who="pickup"]'),
     repair: root.querySelector('[data-who="repair"]'),
     playerHit: root.querySelector('[data-who="player-hit"]'),
   };
@@ -81,10 +75,9 @@ export function createHud() {
   }
 
   return {
-    /** Photomode / pause: hide bars, compass, banners, and hit markers. */
+    /** Photomode / pause: hide bars, compass, and hit markers. */
     setVisible(on) {
       root.classList.toggle('hidden', !on);
-      banner.classList.toggle('chrome-off', !on);
       flash.classList.toggle('chrome-off', !on);
       dirRoot.classList.toggle('chrome-off', !on);
     },
@@ -150,13 +143,6 @@ export function createHud() {
       rows.nitro.classList.toggle('empty', pct <= 0);
       rows.nitro.classList.toggle('active', !!active);
     },
-    /** Seconds until the next supply drop. Shown as m:ss. */
-    setPickup(seconds) {
-      const s = Math.max(0, Math.ceil(seconds));
-      const m = Math.floor(s / 60);
-      const r = s % 60;
-      rows.pickup.querySelector('b').textContent = `${m}:${String(r).padStart(2, '0')}`;
-    },
     /** Repair channel. Hidden when idle. Bar fills over `total` seconds; label stays REPAIRING. */
     setRepair(remaining, total) {
       const on = remaining > 0.02 && total > 0;
@@ -165,25 +151,6 @@ export function createHud() {
       const done = 1 - remaining / total;
       rows.repair.querySelector('i').style.width = `${Math.round(Math.max(0, Math.min(1, done)) * 100)}%`;
       rows.repair.querySelector('b').textContent = `${remaining.toFixed(1)}s`;
-    },
-    /**
-     * Round callout. `hold` > 0 dismisses itself (remaining-enemy notices);
-     * 0 stays up until the next banner() (win / lose).
-     */
-    banner(title, sub = '', tone = 'win', hold = 0) {
-      banner.classList.remove('in', 'out', 'win', 'lose');
-      bannerTimer = null;
-      if (!title) {
-        banner.classList.add('hidden');
-        banner.innerHTML = '';
-        return;
-      }
-      banner.classList.remove('hidden');
-      banner.classList.add(tone === 'lose' ? 'lose' : 'win');
-      banner.innerHTML = `<div class="banner-inner"><strong>${title}</strong>${sub ? `<span>${sub}</span>` : ''}</div>`;
-      void banner.offsetWidth;
-      banner.classList.add('in');
-      if (hold > 0) bannerTimer = { t: hold, fading: false };
     },
     flash() {
       flash.classList.remove('on');
@@ -206,21 +173,6 @@ export function createHud() {
     },
     /** Per frame: re-aim the markers relative to the camera's heading and fade them out. */
     update(dt, camera) {
-      if (bannerTimer) {
-        bannerTimer.t -= dt;
-        if (!bannerTimer.fading && bannerTimer.t <= 0) {
-          banner.classList.remove('in');
-          banner.classList.add('out');
-          bannerTimer.fading = true;
-          bannerTimer.t = BANNER_FADE + bannerTimer.t;
-        }
-        if (bannerTimer?.fading && bannerTimer.t <= 0) {
-          bannerTimer = null;
-          banner.classList.add('hidden');
-          banner.classList.remove('out', 'win', 'lose');
-          banner.innerHTML = '';
-        }
-      }
       if (!hitDirs.length) return;
       const e = camera.matrixWorld.elements;
       const fx = -e[8], fz = -e[10], fl = Math.hypot(fx, fz) || 1;

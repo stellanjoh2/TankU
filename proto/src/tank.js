@@ -21,6 +21,10 @@ import {
 import {
   obliterateTank, restoreTankWreck, spawnWreckTurret, syncWreckTurret, clearWreckTurret,
 } from './tankWreck.js';
+import {
+  installPickupLights, pulsePickupLight, updatePickupLights, clearPickupLights, pickupLightsHot,
+  PICKUP_LIGHT_HEALTH, PICKUP_LIGHT_REPAIR,
+} from './pickupLights.js';
 
 export { RELOAD, MG_HEAT_TIME, MG_COOLDOWN, SHELL_SPEED } from './tankWeapons.js';
 export { stepMgHeat } from './tankWeapons.js';
@@ -277,6 +281,7 @@ export class Tank {
     });
     if (opts.repairGlow) this._installRepairGlow();
     // Destroyed hull (static) + turret template (physics on obliterate). Hidden until death.
+    // Snapshot before pickup/tail lights so obliterate only toggles mesh roots.
     this.intactRoots = [...this.model.children];
     this.wreck = null;
     this.wreckTurretSrc = null;
@@ -302,6 +307,7 @@ export class Tank {
         applyBurntMetal(this.wreckTurretSrc, opts.tint);
       }
     }
+    if (opts.repairGlow) installPickupLights(this);
     // Red point lights at the two rear brake lenses — spill onto hull/grass when braking.
     this.tailLights = TAIL_LIGHT_LOCALS.map((local) => {
       const l = new THREE.PointLight(new THREE.Color(...TAIL_RGB), TAIL_LIGHT_IDLE, TAIL_LIGHT_DIST, 1);
@@ -835,18 +841,29 @@ export class Tank {
   }
 
   _tickRepair(dt) { tickRepair(this, dt); }
-  _updateRepairSweep(dt) { updateRepairSweep(this, dt); }
+  _updateRepairSweep(dt) {
+    updateRepairSweep(this, dt);
+    updatePickupLights(this, dt);
+  }
 
   /** Green hull band — health pickup. */
   showHeal() {
     if (!this._repairU) return;
     this._repairU.color.value.setRGB(0.22, 2.4, 0.4);
+    this._sweepLit = false;
     this._sweep = 0;
+    pulsePickupLight(this, PICKUP_LIGHT_HEALTH);
+  }
+
+  /** Purple world light when a repair-charge pickup is grabbed. */
+  showRepairPickup() {
+    pulsePickupLight(this, PICKUP_LIGHT_REPAIR);
   }
 
   /** Brake lights, hit flash, repair sweep, or a hot .50 barrel. */
   emissiveHot() {
     if (this.hitFlashFrames > 0 || this.repairT > 0 || this.mgHeat > 0.5) return true;
+    if (pickupLightsHot(this)) return true;
     for (const m of this.tailMats) if (m.emissiveIntensity > 1.2) return true;
     return false;
   }
@@ -1001,6 +1018,7 @@ export class Tank {
     this.repairCancelled = false;
     this._sweep = -1;
     if (this._repairU) this._repairU.amp.value = 0;
+    clearPickupLights(this);
     this.hitFlashFrames = 0;
     this._applyHitFlash(false);
     this.cmd.throttle = this.cmd.turn = 0;

@@ -1849,7 +1849,12 @@ export class Effects {
         fade: 1,
       });
     } else {
-      this._flashLight(this._hitPoint.copy(point).addScaledVector(normal, 1.5), 220);
+      // Wreck / drum blasts — always warm fire colour (never pickup green/purple).
+      this._flashLight(this._hitPoint.copy(point).addScaledVector(normal, 1.5), 520, {
+        color: FIRE_LIGHT.color,
+        distance: 28,
+        fade: 0.4,
+      });
     }
 
     // Emissive sparks: fly out from center, bounce, white → red as they die.

@@ -30,6 +30,7 @@ import { NavGrid } from './navgrid.js';
 import { TankAI, pickSpawn } from './ai.js';
 import { createMatch } from './match.js';
 import { createHud } from './hud.js';
+import { createMessages } from './messages.js';
 import { createRadialMenu } from './radialMenu.js';
 import cloudIcon from '@phosphor-icons/core/assets/fill/cloud-fill.svg?raw';
 import planeIcon from '@phosphor-icons/core/assets/fill/airplane-tilt-fill.svg?raw';
@@ -104,7 +105,13 @@ function createLoading() {
     finish() {
       progress = 1;
       paint('Ready');
-      root.remove();
+      // Solid black, then fade in the game (panel chrome cleared so only the veil remains).
+      root.querySelector('.loading-panel')?.remove();
+      root.style.backgroundImage = 'none';
+      root.classList.add('boot-fade');
+      const done = () => root.remove();
+      root.addEventListener('transitionend', done, { once: true });
+      setTimeout(done, 1400);
     },
   };
 }
@@ -311,7 +318,7 @@ async function main() {
     return { scene };
   }
 
-  const { wrenchGeo, spawn, tank, heatHaze, HEAT_HAZE, fx, smoke, nav, foes, enemy, ai, hud, tankCam, sfx } = await load.phase(
+  const { wrenchGeo, spawn, tank, heatHaze, HEAT_HAZE, fx, smoke, nav, foes, enemy, ai, hud, messages, tankCam, sfx } = await load.phase(
     0.08,
     'Tanks…',
     async (sub) => {
@@ -362,6 +369,7 @@ async function main() {
       const enemy = foes[0].tank;
       const ai = foes[0].ai;
       const hud = createHud();
+      const messages = createMessages();
 
       const tankCam = new TankCamera(camera);
       const camRay = new RAPIER.Ray({ x: 0, y: 0, z: 0 }, { x: 1, y: 0, z: 0 });
@@ -376,7 +384,7 @@ async function main() {
         return hit ? hit.timeOfImpact : null;
       });
       const sfx = new Sfx();
-      return { wrenchGeo, spawn, tank, heatHaze, HEAT_HAZE, fx, smoke, nav, foes, enemy, ai, hud, tankCam, sfx };
+      return { wrenchGeo, spawn, tank, heatHaze, HEAT_HAZE, fx, smoke, nav, foes, enemy, ai, hud, messages, tankCam, sfx };
     },
   );
 
@@ -407,7 +415,7 @@ async function main() {
   addEventListener('keydown', unlockAudio, { once: true });
 
   const match = createMatch({
-    tank, foes, nav, fx, hud, sfx, tankCam, input,
+    tank, foes, nav, fx, hud, messages, sfx, tankCam, input,
     vegetation, airfield, port, waterTower, barrels, woodenCrates, trucks, patrolBoat, spawn,
     smoke, post,
     onRestart: (opts) => onMatchRestart(opts),
@@ -431,7 +439,7 @@ async function main() {
     onIncoming: () => {
       sfx.c47Pass();
       if (game.overT > 0) return;
-      hud.banner('Pickup Incoming', '', 'win', 3);
+      messages.small('SUPPLY DROP INCOMING');
     },
   });
 
@@ -530,6 +538,8 @@ async function main() {
       setFlyFov: (v) => fly.setFov(v),
       getFlyTilt: () => fly.getTiltDeg(),
       setFlyTilt: (v) => fly.setTiltDeg(v),
+      getFlySpeed: () => fly.speed,
+      setFlySpeed: (v) => fly.setSpeed(v),
       getMusicMuted: () => sfx.musicMuted,
       setMusicMuted: (v) => {
         sfx.setMusicMuted(v);
@@ -660,12 +670,14 @@ async function main() {
 
   // ---------------------------------------------------------------- pause (one overlay: Esc / unlock)
   // True pause whenever the menu is up — sim, camera, FX time, and audio all freeze.
-  let menuPaused = true;
+  // Boot unpaused: black veil fades in, then the start callout; Esc still opens this menu.
+  let menuPaused = false;
   // Esc that exits pointer-lock must not also count as "resume" on the same keypress.
   let escHeld = false;
   let suppressEscResume = false;
   const overlayEl = $('overlay');
   const canvasEl = renderer.domElement;
+  overlayEl.classList.add('hidden');
 
   function setMenuPaused(on) {
     on = !!on;
@@ -736,7 +748,7 @@ async function main() {
     e.stopPropagation();
     resetCameraDefaults();
   });
-  sfx.setPaused(true);
+  sfx.setPaused(false);
 
   function setDebug(on) {
     debug.setEnabled(on);
@@ -967,6 +979,7 @@ async function main() {
     // Photomode / pause: clean frame (no bars, reticle, or hit chrome)
     const hideChrome = fly.enabled || menuPaused;
     hud.setVisible(!hideChrome);
+    messages.setVisible(!hideChrome);
     if (hideChrome) {
       gunMarker.style.display = 'none';
       crosshair.style.display = 'none';
@@ -1029,7 +1042,6 @@ async function main() {
       },
     });
     hud.setRepair(tank.repairT, REPAIR_TIME);
-    hud.setPickup(crates.timeToDrop());
     // HIT% = stress jitter + smoke (−35% when either tank is in a cloud)
     const pPos = tank.position;
     const near = game.solo ? null : nearestLivingFoe();
@@ -1426,6 +1438,7 @@ async function main() {
     updateHud(inp);
     const freezeDt = menuPaused ? 0 : dt;
     hud.update(freezeDt, camera);
+    messages.update(freezeDt);
     lensFlare.update(freezeDt || 1 / 60);
     explosionFlare.update(freezeDt || 1 / 60);
     let bright = fx.emissiveHot() || tank.emissiveHot();

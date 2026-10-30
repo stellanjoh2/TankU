@@ -1,6 +1,7 @@
 // Kill-shot swap: freeze the hull, show the destroyed mesh, and pop the turret as a rigid body.
 import * as THREE from 'three';
 import { applyWreckMeshFade } from './fx.js';
+import { clearPickupLights } from './pickupLights.js';
 
 const WRECK_TURRET_LOCAL = new THREE.Vector3(-0.16, 2.35, 0);
 const WRECK_TURRET_HALF = { x: 0.9, y: 0.42, z: 0.72 };
@@ -27,6 +28,7 @@ export function obliterateTank(tank) {
   tank.wrecked = true;
   tank.wreckGone = false;
   tank.wreckBurn = 0;
+  clearPickupLights(tank);
   spawnWreckTurret(tank);
 }
 

@@ -420,11 +420,13 @@ export function createVisualsEditor(ctx) {
       <button type="button" class="vis-tab active" data-tab="lighting" role="tab">Lighting</button>
       <button type="button" class="vis-tab" data-tab="world" role="tab">World</button>
       <button type="button" class="vis-tab" data-tab="ocean" role="tab">Ocean</button>
+      <button type="button" class="vis-tab" data-tab="photomode" role="tab">Photomode</button>
     </nav>
     <div class="vis-body">
       <div class="vis-pane" data-pane="lighting"></div>
       <div class="vis-pane hidden" data-pane="world"></div>
       <div class="vis-pane hidden" data-pane="ocean"></div>
+      <div class="vis-pane hidden" data-pane="photomode"></div>
     </div>
     <div class="vis-footer">
       <button type="button" class="vis-copy">Copy settings</button>
@@ -434,6 +436,7 @@ export function createVisualsEditor(ctx) {
     lighting: panel.querySelector('[data-pane="lighting"]'),
     world: panel.querySelector('[data-pane="world"]'),
     ocean: panel.querySelector('[data-pane="ocean"]'),
+    photomode: panel.querySelector('[data-pane="photomode"]'),
   };
   document.body.append(panel);
 
@@ -567,14 +570,22 @@ export function createVisualsEditor(ctx) {
     if (game.getDebug && game.setDebug) {
       addToggle(s, 'Debug (F3)', game.getDebug, game.setDebug);
     }
+  }
+
+  // Photomode — freefly camera (also not part of Reset / Copy)
+  if (game && (game.getFly || game.getFlyFov || game.getFlySpeed || game.getFlyTilt)) {
+    const s = addSection(panes.photomode, 'Camera');
     if (game.getFly && game.setFly) {
-      addToggle(s, 'Freefly / photomode (F)', game.getFly, game.setFly);
+      addToggle(s, 'Enable (F)', game.getFly, game.setFly);
     }
     if (game.getFlyFov && game.setFlyFov) {
-      addSlider(s, 'Photomode FOV', 15, 120, 1, game.getFlyFov, game.setFlyFov);
+      addSlider(s, 'FOV', 15, 120, 1, game.getFlyFov, game.setFlyFov);
+    }
+    if (game.getFlySpeed && game.setFlySpeed) {
+      addSlider(s, 'Speed', 2, 220, 1, game.getFlySpeed, game.setFlySpeed);
     }
     if (game.getFlyTilt && game.setFlyTilt) {
-      addSlider(s, 'Photomode tilt', -45, 45, 1, game.getFlyTilt, game.setFlyTilt);
+      addSlider(s, 'Tilt', -45, 45, 1, game.getFlyTilt, game.setFlyTilt);
     }
   }
 

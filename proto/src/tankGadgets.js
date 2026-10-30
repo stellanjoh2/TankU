@@ -1,5 +1,6 @@
 // Nitro burst, stress, smoke launchers, and the repair channel. The hull still owns the fields.
 import { SMOKE_COOLDOWN } from './smoke.js';
+import { updateSweepLight } from './pickupLights.js';
 
 export const REPAIR_CHARGES = 2;
 export const REPAIR_TIME = 5;
@@ -114,15 +115,21 @@ export function tickRepair(tank, dt) {
   tank.repairDone = true;
   // Shield-violet band (health pickup keeps the green via showHeal).
   if (tank._repairU) tank._repairU.color.value.setRGB(0.95, 0.42, 2.55);
+  tank._sweepLit = true;
   tank._sweep = 0;
 }
 
 export function updateRepairSweep(tank, dt) {
   const u = tank._repairU;
-  if (!u || tank._sweep < 0) return;
+  if (!u || tank._sweep < 0) {
+    updateSweepLight(tank, 0, 0);
+    return;
+  }
   if (!tank.alive) {
     tank._sweep = -1;
+    tank._sweepLit = false;
     u.amp.value = 0;
+    updateSweepLight(tank, 0, 0);
     return;
   }
   tank._sweep += dt;
@@ -131,8 +138,11 @@ export function updateRepairSweep(tank, dt) {
   u.amp.value = k > 0.84 ? Math.max(0, (1 - k) / 0.16) : 1;
   u.origin.value.copy(tank.model.position);
   u.forward.value.set(1, 0, 0).transformDirection(tank.model.matrixWorld);
+  updateSweepLight(tank, k, u.amp.value);
   if (k >= 1) {
     tank._sweep = -1;
+    tank._sweepLit = false;
     u.amp.value = 0;
+    updateSweepLight(tank, 0, 0);
   }
 }

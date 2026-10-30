@@ -7,7 +7,7 @@ import { WATER_Y } from './terrain.js';
 
 const ROUND_RESTART_DELAY = 4;          // seconds the wreck burns before the next round
 const REMAIN_HOLD = 2.6;                // seconds "N ENEMIES REMAINING" stays up
-const START_DELAY = 2;                  // seconds of play before "Eliminate all invaders"
+const START_DELAY = 3;                  // seconds of play before "Eliminate all invaders"
 const START_HOLD = 3;                   // seconds that callout stays up
 const BARREL_BLAST_FULL = 3;            // m from a fuel drum blast: 1 HP (same as a shell hit)
 const BARREL_BLAST_EDGE = 5.5;          // m: chip damage out to here
@@ -65,7 +65,7 @@ function shellDamage(victim, point, owner) {
  * @param {() => void} [deps.onRestart]  main resets look / cam / path / freefly after entity reset
  */
 export function createMatch({
-  tank, foes, nav, fx, hud, sfx, tankCam, input,
+  tank, foes, nav, fx, hud, messages, sfx, tankCam, input,
   vegetation, airfield, port, waterTower, barrels, woodenCrates, trucks, patrolBoat, spawn,
   smoke = null,
   post = null,
@@ -101,10 +101,12 @@ export function createMatch({
     return hostileCount() > 0;
   }
 
+  /** Remaining hostiles after a kill — big layered callout + kill jingle. */
   function announceRemaining() {
     const n = hostileCount();
     if (n <= 0 || !tank.alive) return;
-    hud.banner(n === 1 ? '1 ENEMY REMAINING' : `${n} ENEMIES REMAINING`, '', 'win', REMAIN_HOLD);
+    messages.big(n === 1 ? '1 ENEMY REMAINING' : `${n} ENEMIES REMAINING`, { hold: REMAIN_HOLD });
+    sfx.enemyKill();
   }
 
   function pushHealth() {
@@ -115,11 +117,11 @@ export function createMatch({
     if (game.overT > 0) return;
     game.overT = ROUND_RESTART_DELAY;
     game.wreck = victim;
-    hud.banner(
-      playerDead ? 'YOU WERE DESTROYED' : 'ENEMIES CLEARED',
-      'next round in a moment',
-      playerDead ? 'lose' : 'win',
-    );
+    messages.big(playerDead ? 'YOU WERE DESTROYED' : 'ENEMIES CLEARED', {
+      sub: 'next round in a moment',
+      tone: playerDead ? 'lose' : 'win',
+      hold: 0,
+    });
     if (!playerDead) sfx.victory();
   }
 
@@ -149,7 +151,7 @@ export function createMatch({
     game.overT = 0;
     game.wreck = null;
     game.startBannerT = START_DELAY;
-    hud.banner(null);
+    messages.clear();
     hud.clearHits();
     hud.setHealth(1);
     hud.setNitro(1, false);
@@ -362,7 +364,7 @@ export function createMatch({
       game.startBannerT -= dt;
       if (game.startBannerT <= 0) {
         game.startBannerT = 0;
-        if (game.overT <= 0) hud.banner('Eliminate all invaders', '', 'win', START_HOLD);
+        if (game.overT <= 0) messages.big('Eliminate all invaders', { hold: START_HOLD });
       }
     }
     if (game.overT <= 0 && tank.alive) {
@@ -423,6 +425,7 @@ export function createMatch({
     if (!victim?.alive || game.overT > 0) return false;
     if (victim.repairs >= REPAIR_CHARGES) return false;
     victim.repairs = REPAIR_CHARGES;
+    victim.showRepairPickup();
     if (victim === tank) sfx.repairComplete();
     return true;
   }

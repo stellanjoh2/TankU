@@ -18,6 +18,7 @@
 // + repair wrench (Sounds/591528__rudmer_rotteveel__ratchet-wrench-slow-multiple.wav).
 // + repair complete (Sounds/242501__gabrielaraujo__powerupsuccess.wav).
 // + victory fanfare (Sounds/161984__robinhood76__03599-majestic-foreboding-fanfare.wav).
+// + enemy kill jingle (Sounds/270404__littlerobotsoundfactory__jingle_achievement_00.wav).
 // + C-47 supply pass (Sounds/515293__breviceps__propeller-plane.wav, +5 dB).
 // + ship horn (Sounds/371535__robinhood76__06934-distant-ship-horn.wav).
 // + weapon switch (Sounds/414439__inspectorj__light-pulley-switch-on-b.wav).
@@ -47,11 +48,13 @@ const FLYBY_URL = './sounds/bullet_flyby.wav';
 const REPAIR_URL = './sounds/repair_wrench.wav';
 const REPAIR_DONE_URL = './sounds/repair_done.wav';
 const FANFARE_URL = './sounds/161984__robinhood76__03599-majestic-foreboding-fanfare.wav';
+const KILL_JINGLE_URL = './sounds/270404__littlerobotsoundfactory__jingle_achievement_00.wav';
 const SHIP_HORN_URL = './sounds/371535__robinhood76__06934-distant-ship-horn.wav';
 const WEAPON_SWITCH_URL = './sounds/414439__inspectorj__light-pulley-switch-on-b.wav';
 // Source peaks at ~0 dBFS; leave headroom so it sits over a ducked music bed.
 const FANFARE_GAIN = 0.72;
 const FANFARE_MUSIC_DUCK = 0.32;
+const KILL_JINGLE_GAIN = 0.7 * Math.pow(10, 5 / 20); // +5 dB
 // Source wrench is 4.88s; slow it so the clip fills the 5s repair channel.
 const REPAIR_WRENCH_RATE = 4.880295 / 5;
 // Success sample peaks at −11.5 dBFS; +12 dB puts it up with the wrench clicks.
@@ -234,7 +237,7 @@ export class Sfx {
       const res = await fetch(url);
       return this.ctx.decodeAudioData(await res.arrayBuffer());
     };
-    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, ocean, p51Pass, p51Mg, p51Orbit, c47, dirtThump, waterSplash, mgBass, smokeBomb, flyby, repair, repairDone, fanfare, shipHorn, weaponSwitch] = await Promise.all([
+    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, ocean, p51Pass, p51Mg, p51Orbit, c47, dirtThump, waterSplash, mgBass, smokeBomb, flyby, repair, repairDone, fanfare, killJingle, shipHorn, weaponSwitch] = await Promise.all([
       Promise.all(SHOT_URLS.map(decode)),
       decode(ENGINE_URL),
       decode(MG50_URL),
@@ -258,6 +261,7 @@ export class Sfx {
       decode(REPAIR_URL),
       decode(REPAIR_DONE_URL),
       decode(FANFARE_URL),
+      decode(KILL_JINGLE_URL),
       decode(SHIP_HORN_URL),
       decode(WEAPON_SWITCH_URL),
     ]);
@@ -284,6 +288,7 @@ export class Sfx {
     this.repairBuf = repair;
     this.repairDoneBuf = repairDone;
     this.fanfareBuf = fanfare;
+    this.killJingleBuf = killJingle;
     this.shipHornBuf = shipHorn;
     this.weaponSwitchBuf = weaponSwitch;
     this.ready = true;
@@ -792,6 +797,20 @@ export class Sfx {
     src.onended = () => this._active.delete(src);
     // A few ms after the wrench is cut, so the attack isn't lost in that stop.
     src.start(this.ctx.currentTime + 0.05);
+  }
+
+  /** Enemy kill — plays with the remaining-count callout. */
+  enemyKill(volume = 1) {
+    if (!this.ready || !this.killJingleBuf) return;
+    this.unlock();
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.killJingleBuf;
+    const g = this.ctx.createGain();
+    g.gain.value = volume * KILL_JINGLE_GAIN;
+    src.connect(g).connect(this.ctx.destination);
+    this._active.add(src);
+    src.onended = () => this._active.delete(src);
+    src.start();
   }
 
   /** Match-won sting. Music ducks for the clip (~8s), including into the next round. */

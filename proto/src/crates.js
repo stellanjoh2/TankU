@@ -10,6 +10,11 @@ import {
 } from './terrain.js';
 import { HANGAR } from './airfield.js';
 import { WATER_TOWER } from './watertower.js';
+import {
+  WORLD_PICKUP_LIGHT,
+  PICKUP_LIGHT_HEALTH,
+  PICKUP_LIGHT_REPAIR,
+} from './pickupLights.js';
 
 const DROP_EVERY = 2 * 60; // dev cadence; ship timing is 5 min
 const FIRST_PASS = 30;        // earliest the first C-47 / "Pickup Incoming" starts
@@ -176,7 +181,8 @@ function buildPickup(kind) {
   }
   mesh.scale.setScalar(PICKUP_BOXED);
   mesh.castShadow = true;
-  return { kind, mesh, mat, base: PICKUP_SCALE, phase: Math.random() * Math.PI * 2, takeT: -1, dead: false };
+  // Light comes from the createCrates pool — never new PointLight at release (WebGPU recompile hitch).
+  return { kind, mesh, mat, light: null, base: PICKUP_SCALE, phase: Math.random() * Math.PI * 2, takeT: -1, dead: false };
 }
 
 /** One hinge per wall. `axis`/`sign`/`angle` flop it outward onto the ground. */
@@ -276,11 +282,45 @@ export function createCrates({ scene, RAPIER, world, fx, getPlayer, getTanks, tr
   root.name = 'SupplyCrates';
   scene.add(root);
 
+  // Keep light count fixed for the whole match. Adding/removing a PointLight at drop
+  // time forces a full material recompile on WebGPU and freezes the game for seconds.
+  const lightPool = Array.from({ length: MAX_LIVE }, () => {
+    const l = new THREE.PointLight(
+      0xffffff, 0, WORLD_PICKUP_LIGHT.distance, WORLD_PICKUP_LIGHT.decay,
+    );
+    l.castShadow = false;
+    root.add(l);
+    return l;
+  });
+
   const live = [];
   function openingTimer() {
     return DROP_EVERY - FIRST_PASS;
   }
   let timer = openingTimer();
+
+  function bindLight(item) {
+    const used = new Set();
+    for (const c of live) {
+      for (const it of c.items) if (it.light) used.add(it.light);
+    }
+    const light = lightPool.find((l) => !used.has(l));
+    if (!light) return;
+    light.color.copy(item.kind === 'health' ? PICKUP_LIGHT_HEALTH : PICKUP_LIGHT_REPAIR);
+    light.intensity = 0;
+    light.position.set(0, 0, 0);
+    item.mesh.add(light);
+    item.light = light;
+  }
+
+  function unbindLight(item) {
+    const light = item.light;
+    if (!light) return;
+    light.intensity = 0;
+    root.add(light);
+    light.position.set(0, 0, 0);
+    item.light = null;
+  }
 
   function closestTank(x, z, maxD) {
     let best = null;
@@ -312,6 +352,7 @@ export function createCrates({ scene, RAPIER, world, fx, getPlayer, getTanks, tr
     const i = live.indexOf(c);
     if (i < 0) return;
     live.splice(i, 1);
+    for (const item of c.items) unbindLight(item);
     root.remove(c.root);
     if (c.body) world.removeRigidBody(c.body);
     for (const item of c.items) item.mat.dispose();
@@ -394,6 +435,7 @@ export function createCrates({ scene, RAPIER, world, fx, getPlayer, getTanks, tr
     makeRoom(getPlayer());
     const { x, z } = spot;
     const visual = buildVisual();
+    for (const item of visual.items) bindLight(item);
     poseChuteClosed(visual.chute);
     const yaw = Math.random() * Math.PI * 2;
     visual.root.position.set(x, dropY, z);
@@ -485,7 +527,9 @@ export function createCrates({ scene, RAPIER, world, fx, getPlayer, getTanks, tr
         const k = Math.max(0, item.takeT / 0.24);
         item.mesh.scale.setScalar(item.base * k);
         item.mesh.position.y += dt * 1.6;
+        if (item.light) item.light.intensity = WORLD_PICKUP_LIGHT.intensity * k;
         if (item.takeT <= 0) {
+          unbindLight(item);
           item.mesh.removeFromParent();
           item.mat.dispose();
           item.dead = true;
@@ -497,6 +541,8 @@ export function createCrates({ scene, RAPIER, world, fx, getPlayer, getTanks, tr
       item.mesh.position.y = THREE.MathUtils.lerp(REST_Y, FLOAT_Y, reveal) + bob;
       item.mesh.scale.setScalar(THREE.MathUtils.lerp(PICKUP_BOXED, item.base, reveal));
       item.mat.emissiveIntensity = 1 + Math.sin(c.age * 4 + item.phase) * 0.12;
+      // Reveal with the crate open so it doesn't bleed through closed walls.
+      if (item.light) item.light.intensity = WORLD_PICKUP_LIGHT.intensity * reveal;
       if (open && d < GRAB_R && tryPickup(item.kind)) item.takeT = 0.24;
     }
     if (any) return;

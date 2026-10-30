@@ -44,6 +44,10 @@ export class FreeFlight {
     return THREE.MathUtils.radToDeg(this.tilt);
   }
 
+  setSpeed(v) {
+    this.speed = THREE.MathUtils.clamp(v, MIN_SPEED, MAX_SPEED);
+  }
+
   /** Steal the current view so the handoff doesn't jump. */
   enter() {
     const cam = this.camera;
