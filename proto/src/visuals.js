@@ -127,6 +127,7 @@ export function createVisualsEditor(ctx) {
     renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe,
     terrain, grass, vegetation, barrels, trucks, post, shadowTint, fx, clouds, lensFlare,
     explosionFlare,
+    bakeOceanSky,
     getEnvIntensity, setEnvIntensity,
     tanks = [],
     initial = VISUAL_DEFAULTS,
@@ -172,6 +173,7 @@ export function createVisualsEditor(ctx) {
     sunDir.set(Math.cos(el) * Math.cos(a), Math.sin(el), Math.cos(el) * Math.sin(a)).normalize();
     sky.sunPosition.value.copy(sunDir);
     terrain.water.sunDirection.value.copy(sunDir);
+    bakeOceanSky?.();
   }
 
   function applySky(s) {
@@ -184,6 +186,7 @@ export function createVisualsEditor(ctx) {
     sky.cloudElevation.value = s.cloudElevation;
     sky.showSunDisc.value = s.showSunDisc ? 1 : 0;
     if (renderer) renderer.toneMappingExposure = s.toneExposure;
+    bakeOceanSky?.();
   }
 
   function readState() {
@@ -592,7 +595,10 @@ export function createVisualsEditor(ctx) {
   // Sky & fog (SkyMesh / webgpu_sky params)
   {
     const s = addSection(lighting, 'Sky & fog');
-    addColor(s, 'Sky colour', () => hexOf(skyTint.value), (v) => skyTint.value.set(v));
+    addColor(s, 'Sky colour', () => hexOf(skyTint.value), (v) => {
+      skyTint.value.set(v);
+      bakeOceanSky?.();
+    });
     addColor(s, 'Fog colour', () => hexOf(fogColor), (v) => {
       fogColor.set(v);
       scene.fog.color.copy(fogColor);
@@ -608,30 +614,38 @@ export function createVisualsEditor(ctx) {
     });
     addSlider(s, 'Turbidity', 0, 20, 0.1, () => sky.turbidity.value, (v) => {
       sky.turbidity.value = v;
+      bakeOceanSky?.();
     });
     addSlider(s, 'Rayleigh', 0, 4, 0.001, () => sky.rayleigh.value, (v) => {
       sky.rayleigh.value = v;
+      bakeOceanSky?.();
     });
     addSlider(s, 'Mie coeff', 0, 0.1, 0.001, () => sky.mieCoefficient.value, (v) => {
       sky.mieCoefficient.value = v;
+      bakeOceanSky?.();
     });
     addSlider(s, 'Mie G', 0, 1, 0.001, () => sky.mieDirectionalG.value, (v) => {
       sky.mieDirectionalG.value = v;
+      bakeOceanSky?.();
     });
     addSlider(s, 'Tone exposure', 0, 1, 0.01, () => renderer.toneMappingExposure, (v) => {
       renderer.toneMappingExposure = v;
     });
     addToggle(s, 'Sun disc', () => !!sky.showSunDisc.value, (v) => {
       sky.showSunDisc.value = v ? 1 : 0;
+      bakeOceanSky?.();
     });
     addSlider(s, 'Cloud coverage', 0, 1, 0.01, () => sky.cloudCoverage.value, (v) => {
       sky.cloudCoverage.value = v;
+      bakeOceanSky?.();
     });
     addSlider(s, 'Cloud density', 0, 1, 0.01, () => sky.cloudDensity.value, (v) => {
       sky.cloudDensity.value = v;
+      bakeOceanSky?.();
     });
     addSlider(s, 'Cloud elevation', 0, 1, 0.01, () => sky.cloudElevation.value, (v) => {
       sky.cloudElevation.value = v;
+      bakeOceanSky?.();
     });
   }
 

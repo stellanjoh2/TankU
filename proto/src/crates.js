@@ -317,6 +317,7 @@ export function createCrates({ scene, RAPIER, world, fx, getPlayer, getTanks, tr
     const light = item.light;
     if (!light) return;
     light.intensity = 0;
+    light.color.setRGB(0, 0, 0);
     root.add(light);
     light.position.set(0, 0, 0);
     item.light = null;

@@ -5,8 +5,8 @@
 
 import { CASCADE_LENGTHS } from './oceanParams.js';
 
-const N = 256;
-const CASCADES = 3;
+const N = 128;
+const CASCADES = CASCADE_LENGTHS.length;
 const ROW_BYTES = N * 8;
 const BUF_SIZE = N * ROW_BYTES;
 

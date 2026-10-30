@@ -6,8 +6,8 @@ import { createUltraWater } from './ultraWater/OceanSurface.js';
 
 export const SIZE = 380;
 export const WATER_Y = 0.2;
-// Keep ~1.44 m cells after the map grew to fit the satellite island.
-const SEGS = 264;
+// ~2.04 m cells — half the triangles of the old 264-seg (~1.44 m) mesh.
+const SEGS = 186;
 /** How far offshore (metres of shore distance) the heightfield eases down to the floor. */
 const SHORE_SHELF = 36;
 /** Visual shelf extent — beach band the ocean's shore breakers run up onto. */
@@ -652,7 +652,7 @@ export async function buildTerrain(RAPIER, world, scene, { sunDir, renderer, sky
   if (sunDir) water.sunDirection.value.copy(sunDir);
   scene.add(water.mesh);
 
-  // Heightfield instead of the 264×264 trimesh. Same vertex heights as the mesh.
+  // Heightfield instead of a dense trimesh. Same vertex heights as the mesh.
   // nrows/ncols are quad counts. Column j is X, row i is Z, column-major.
   const n = SEGS + 1;
   const heights = new Float32Array(n * n);

@@ -3,13 +3,13 @@
 import * as THREE from 'three';
 
 /** Grab pulse (health / repair pickup). Base was MAIN_GUN_LIGHT; −25% intensity.
- *  Distance stays tank-local so green/purple doesn’t wash combat explosions. */
+ *  Tight radius — HDR-ish spill used to tint nearby orange explosion flashes green. */
 export const PICKUP_LIGHT = {
   intensity: 928.5,
-  distance: 14,
+  distance: 7,
   decay: 2,
   rise: 0.08,   // s to peak
-  fade: 2,      // s peak → 0
+  fade: 1.2,    // s peak → 0
   y: 1.5,       // hull-local height
   pool: 3,
 };
@@ -17,21 +17,29 @@ export const PICKUP_LIGHT = {
 /** Floating icon light while the pickup sits in the world — 6.25% intensity, short reach. */
 export const WORLD_PICKUP_LIGHT = {
   intensity: PICKUP_LIGHT.intensity * 0.0625,
-  distance: 9,
+  distance: 5,
   decay: PICKUP_LIGHT.decay,
 };
 
-/** Repair-finish streak follower. −50% radius vs grab; intensity −50% then −75%. */
+/** Repair-finish / heal streak follower — same tight reach as the grab pulse. */
 export const STREAK_LIGHT = {
   intensity: 154.75,
-  distance: 18,
+  distance: 7,
   decay: 2,
   y: 1.5,
 };
 
-/** Same HDR greens / shield-violets as crates.js + hull sweeps. */
-export const PICKUP_LIGHT_HEALTH = new THREE.Color().setRGB(0.22, 2.4, 0.4);
-export const PICKUP_LIGHT_REPAIR = new THREE.Color().setRGB(0.95, 0.42, 2.55);
+/** Unit-peak hues for PointLights only. Emissive bands keep their own HDR in tank/crates. */
+export const PICKUP_LIGHT_HEALTH = new THREE.Color().setRGB(0.15, 1.0, 0.28);
+export const PICKUP_LIGHT_REPAIR = new THREE.Color().setRGB(0.85, 0.35, 1.0);
+
+/** Force unit-peak so an HDR emissive uniform never becomes a wash light colour. */
+function unitPeak(dst, src) {
+  dst.copy(src);
+  const peak = Math.max(dst.r, dst.g, dst.b, 1e-6);
+  if (peak > 1) dst.multiplyScalar(1 / peak);
+  return dst;
+}
 
 // Match the TSL band in tank._installRepairGlow (rear → front).
 const SWEEP_X0 = -4.2;
@@ -69,7 +77,7 @@ export function pulsePickupLight(tank, color) {
   const sys = tank._pickupLights;
   if (!sys) return;
   const slot = sys.pulses[sys._i++ % sys.pulses.length];
-  slot.light.color.copy(color);
+  unitPeak(slot.light.color, color);
   slot.light.intensity = 0;
   slot.age = 0;
 }
@@ -97,7 +105,7 @@ export function updatePickupLights(tank, dt) {
 }
 
 /**
- * Purple world light locked to the hull sweep band.
+ * World light locked to the hull sweep band (green heal / purple repair finish).
  * @param {import('./tank.js').Tank} tank
  * @param {number} k  0..1 sweep progress
  * @param {number} amp  0..1 band strength (already fades out at the end)
@@ -108,9 +116,13 @@ export function updateSweepLight(tank, k, amp) {
   const streak = sys.streak;
   if (!tank._sweepLit || amp <= 0) {
     streak.intensity = 0;
+    streak.color.setRGB(0, 0, 0);
     return;
   }
-  streak.color.copy(PICKUP_LIGHT_REPAIR);
+  // Band uniform is HDR for bloom; illumination must stay unit-peak.
+  const sweepColor = tank._repairU?.color?.value;
+  if (sweepColor) unitPeak(streak.color, sweepColor);
+  else streak.color.copy(PICKUP_LIGHT_REPAIR);
   // Hull-local +X tracks the same rear→front band as the TSL sweep.
   streak.position.set(
     THREE.MathUtils.lerp(SWEEP_X0, SWEEP_X1, k),
@@ -130,6 +142,7 @@ export function clearPickupLights(tank) {
     slot.light.color.setRGB(0, 0, 0);
   }
   sys.streak.intensity = 0;
+  sys.streak.color.setRGB(0, 0, 0);
   tank._sweepLit = false;
 }
 

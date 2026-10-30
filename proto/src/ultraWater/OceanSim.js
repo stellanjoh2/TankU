@@ -1,12 +1,13 @@
-// Tessendorf FFT ocean: 4 cascades of 256² in one 256×1024 atlas.
+// Tessendorf FFT ocean: 3 cascades of 128² in one 128×384 atlas.
 // WebGPU port of Ultra-Water's OceanSim (MIT, Copyright (c) 2026 Humpalumps).
 import { FloatType, HalfFloatType, LinearFilter, LinearMipmapLinearFilter, NearestFilter, RepeatWrapping, StorageTexture, Vector4 } from 'three/webgpu';
 import { instanceIndex, storageTexture, texture, uniform, wgslFn } from 'three/tsl';
 import { CASCADE_LENGTHS } from './oceanParams.js';
 
-const N = 256;
-const LOG_N = 8;
+const N = 128;
+const LOG_N = 7;
 const H = N * CASCADE_LENGTHS.length;
+const NC = CASCADE_LENGTHS.length;
 const LOOP = 300;
 const G = 9.81;
 
@@ -17,8 +18,8 @@ fn initSpectrum(
   specA0: vec4f, specB0: vec4f, specA1: vec4f, specB1: vec4f,
   wl: vec4f, cut: vec4f, capFade: f32, seed: f32
 ) -> void {
-  let N: i32 = 256;
-  let p = vec2i(i32(idx % 256u), i32(idx / 256u));
+  let N: i32 = 128;
+  let p = vec2i(i32(idx % 128u), i32(idx / 128u));
   let c = p.y / N;
   let id = vec2i(p.x, p.y - c * N);
   let a = h0(id, c, specA0, specB0, specA1, specB1, wl, cut, capFade, u32(seed));
@@ -79,21 +80,20 @@ fn directional(theta: f32, w: f32, a: vec4f, b: vec4f) -> f32 {
 
 fn spectrum(w: f32, theta: f32, kl: f32, c: i32, specA: vec4f, specB: vec4f, capFade: f32) -> f32 {
   if (specA.x <= 0.0) { return 0.0; }
-  let fade = select(specB.w, capFade, c == 3);
+  let fade = select(specB.w, capFade, c == 2);
   return jonswap(w, specA, specB) * directional(theta, w, specA, specB) * exp(-fade * fade * kl * kl);
 }
 
 fn h0(id: vec2i, c: i32, specA0: vec4f, specB0: vec4f, specA1: vec4f, specB1: vec4f, wl: vec4f, cut: vec4f, capFade: f32, seed: u32) -> vec2f {
   let L = wl[c];
   let dk = 2.0 * 3.14159265359 / L;
-  let k = vec2f(f32(id.x - 128), f32(id.y - 128)) * dk;
+  let k = vec2f(f32(id.x - 64), f32(id.y - 64)) * dk;
   let kl = length(k);
   var lo = 1e-4;
   var hi = 1e4;
   if (c == 0) { hi = cut.x; }
   else if (c == 1) { lo = cut.x; hi = cut.y; }
-  else if (c == 2) { lo = cut.y; hi = cut.z; }
-  else { lo = cut.z; }
+  else { lo = cut.y; }
   if (kl < lo || kl > hi) { return vec2f(0.0); }
   let w = omega(kl);
   let dwdk = (9.81 + 3.0 * 7.4e-5 * kl * kl) / (2.0 * w);
@@ -110,8 +110,8 @@ fn evolveSpectrum(
   out1: texture_storage_2d<rgba16float, write>,
   idx: u32, wl: vec4f, time: f32
 ) -> void {
-  let N: i32 = 256;
-  let p = vec2i(i32(idx % 256u), i32(idx / 256u));
+  let N: i32 = 128;
+  let p = vec2i(i32(idx % 128u), i32(idx / 128u));
   let c = p.y / N;
   let local = vec2i(p.x, p.y - c * N);
   let L = wl[c];
@@ -148,8 +148,8 @@ fn fftStage(
   out1: texture_storage_2d<rgba16float, write>,
   idx: u32, sub: f32, vertical: f32
 ) -> void {
-  let N: i32 = 256;
-  let p = vec2i(i32(idx % 256u), i32(idx / 256u));
+  let N: i32 = 128;
+  let p = vec2i(i32(idx % 128u), i32(idx / 128u));
   let uSub = i32(sub);
   let i = select(p.x, p.y % N, vertical > 0.5);
   let hs = uSub >> 1;
@@ -184,8 +184,8 @@ fn assembleCascade(
   outSlope: texture_storage_2d<rgba16float, write>,
   idx: u32, cascade: f32, lambda: f32, dt: f32, foamRecovery: f32
 ) -> void {
-  let N: i32 = 256;
-  let id = vec2i(i32(idx % 256u), i32(idx / 256u));
+  let N: i32 = 128;
+  let id = vec2i(i32(idx % 128u), i32(idx / 128u));
   let p = vec2i(id.x, id.y + i32(cascade) * N);
   let s = select(-1.0, 1.0, ((id.x + id.y) & 1) == 0);
   let a = textureLoad(in0, vec2u(u32(p.x), u32(p.y)), 0) * s;
@@ -205,7 +205,7 @@ fn assembleCascade(
 
 const CLEAR_WGSL = /* wgsl */`
 fn clearTex(outTex: texture_storage_2d<rgba16float, write>, idx: u32) -> void {
-  textureStore(outTex, vec2u(idx % 256u, idx / 256u), vec4f(0.0, 0.0, 0.0, 1.0));
+  textureStore(outTex, vec2u(idx % 128u, idx / 128u), vec4f(0.0, 0.0, 0.0, 1.0));
 }
 `;
 
@@ -275,8 +275,8 @@ export class OceanSim {
     this.specB0 = uniform(new Vector4());
     this.specA1 = uniform(new Vector4());
     this.specB1 = uniform(new Vector4());
-    this.wl = uniform(new Vector4(...CASCADE_LENGTHS));
-    this.cut = uniform(new Vector4(...CASCADE_LENGTHS.slice(1).map((L) => (2 * Math.PI / L) * 6), 0));
+    this.wl = uniform(new Vector4(...CASCADE_LENGTHS, 0));
+    this.cut = uniform(new Vector4(...CASCADE_LENGTHS.slice(1).map((L) => (2 * Math.PI / L) * 6), 0, 0));
     this.capFade = uniform(0.08);
     this.seed = uniform(1337);
     this.uTime = uniform(0);
@@ -328,8 +328,8 @@ export class OceanSim {
 
     this.clearCompute = clearFn({ outTex: this.clearOut, idx: instanceIndex }).compute(N * N);
 
-    this.dispNodes = [0, 1, 2, 3].map((c) => texture(this.out[c][0].disp));
-    this.slopeNodes = [0, 1, 2, 3].map((c) => texture(this.out[c][0].slope));
+    this.dispNodes = CASCADE_LENGTHS.map((_, c) => texture(this.out[c][0].disp));
+    this.slopeNodes = CASCADE_LENGTHS.map((_, c) => texture(this.out[c][0].slope));
 
     for (const pair of this.out) {
       for (const buf of pair) {
@@ -390,7 +390,7 @@ export class OceanSim {
     this.uDt.value = step;
     this.uFoam.value = p.foamRecovery;
     const next = this.parity ^ 1;
-    for (let c = 0; c < 4; c++) {
+    for (let c = 0; c < NC; c++) {
       this.uCascade.value = c;
       this.prevNode.value = this.out[c][this.parity].disp;
       this.dispOut.value = this.out[c][next].disp;

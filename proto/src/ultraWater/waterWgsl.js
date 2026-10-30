@@ -162,12 +162,12 @@ export const DISPLACE_WGSL = /* wgsl */`
 fn displace(
   xz: vec2f, cell: f32, time: f32, wl: vec4f, waveDamp: vec2f, shoreWave: vec4f, swellDir: vec2f, extent: f32, wind: f32,
   d0: texture_2d<f32>, d0s: sampler, d1: texture_2d<f32>, d1s: sampler, d2: texture_2d<f32>, d2s: sampler,
-  s0: texture_2d<f32>, s0s: sampler, s1: texture_2d<f32>, s1s: sampler, s2: texture_2d<f32>, s2s: sampler, s3: texture_2d<f32>, s3s: sampler,
+  s0: texture_2d<f32>, s0s: sampler, s1: texture_2d<f32>, s1s: sampler, s2: texture_2d<f32>, s2s: sampler,
   shMap: texture_2d<f32>, shS: sampler, trMap: texture_2d<f32>, trS: sampler
 ) -> vec4f {
   let sh = mapSample(xz, shMap, shS, extent);
   let damp = cascadeDamp(-sh.x, waveDamp);
-  let lod = max(log2(max(cell, 1e-3) * vec3f(256.0) / wl.xyz) + vec3f(1.0), vec3f(0.0));
+  let lod = max(log2(max(cell, 1e-3) * vec3f(128.0) / wl.xyz) + vec3f(1.0), vec3f(0.0));
   var d = textureSampleLevel(d0, d0s, xz / wl.x, lod.x).xyz * damp.x
     + textureSampleLevel(d1, d1s, xz / wl.y, lod.y).xyz * damp.y
     + textureSampleLevel(d2, d2s, xz / wl.z, lod.z).xyz * damp.z;
@@ -176,8 +176,7 @@ fn displace(
   let m0 = textureSampleLevel(s0, s0s, vec2f(0.5), 8.0);
   let m1 = textureSampleLevel(s1, s1s, vec2f(0.5), 8.0);
   let m2 = textureSampleLevel(s2, s2s, vec2f(0.5), 8.0);
-  let m3 = textureSampleLevel(s3, s3s, vec2f(0.5), 8.0);
-  let unresolved = max(0.003 + 0.00512 * wind - (m0.z + m0.w + m1.z + m1.w + m2.z + m2.w + m3.z + m3.w), 0.0);
+  let unresolved = max(0.003 + 0.00512 * wind - (m0.z + m0.w + m1.z + m1.w + m2.z + m2.w), 0.0);
   return vec4f(d, unresolved);
 }
 ` + HELPERS;
@@ -189,7 +188,7 @@ fn shade(
   optics: vec4f, sss: vec4f, foamP: vec4f, absorption: vec3f, scatter: vec3f, foamTint: vec3f,
   sunDir: vec3f, sunCol: vec3f, fogCol: vec3f, glint: f32, seaY: f32, nearFar: vec2f, skyMaxLod: f32, viewM: mat4x4f,
   d0: texture_2d<f32>, d0s: sampler, d1: texture_2d<f32>, d1s: sampler, d2: texture_2d<f32>, d2s: sampler,
-  s0: texture_2d<f32>, s0s: sampler, s1: texture_2d<f32>, s1s: sampler, s2: texture_2d<f32>, s2s: sampler, s3: texture_2d<f32>, s3s: sampler,
+  s0: texture_2d<f32>, s0s: sampler, s1: texture_2d<f32>, s1s: sampler, s2: texture_2d<f32>, s2s: sampler,
   shMap: texture_2d<f32>, shS: sampler, trMap: texture_2d<f32>, trS: sampler,
   foamMap: texture_2d<f32>, foamS: sampler, sceneMap: texture_2d<f32>, depthMap: DEPTH_TEX,
   skyMap: texture_cube<f32>, skyS: sampler
@@ -198,29 +197,27 @@ fn shade(
   let sh = mapSample(xz, shMap, shS, extent);
   let depthBelow = -sh.x;
   let damp = cascadeDamp(depthBelow, waveDamp);
-  var s0v = textureSampleLevel(s0, s0s, xz / wl.x, 0.0) * damp.x;
-  var s1v = textureSampleLevel(s1, s1s, xz / wl.y, 0.0) * damp.y;
-  var s2v = textureSampleLevel(s2, s2s, xz / wl.z, 0.0) * damp.z;
-  var s3v = textureSampleLevel(s3, s3s, xz / wl.w, 0.0) * damp.z;
+  let fw = max(max(length(dpdx(xz)), length(dpdy(xz))), 1e-3);
+  let lodS = max(log2(fw * vec3f(128.0) / wl.xyz) + vec3f(1.0), vec3f(0.0));
+  var s0v = textureSampleLevel(s0, s0s, xz / wl.x, lodS.x) * damp.x;
+  var s1v = textureSampleLevel(s1, s1s, xz / wl.y, lodS.y) * damp.y;
+  var s2v = textureSampleLevel(s2, s2s, xz / wl.z, lodS.z) * damp.z;
   s0v = vec4f(s0v.xy, s0v.zw * damp.x);
   s1v = vec4f(s1v.xy, s1v.zw * damp.y);
   s2v = vec4f(s2v.xy, s2v.zw * damp.z);
-  s3v = vec4f(s3v.xy, s3v.zw * damp.z);
   let pack = shorePack(xz, sh, time, shoreWave, swellDir, trMap, trS, extent);
-  let shoreDisp = pack[0].xyz;
   let shoreFoam = clamp(pack[0].w, 0.0, 1.0);
   let shoreSlope = pack[1].xy;
   let lip = pack[1].z;
   let residual = pack[1].w;
   let wave0 = pack[2];
   let dir = pack[3].xy;
-  let slope = s0v.xy + s1v.xy + s2v.xy + s3v.xy + shoreSlope;
+  let slope = s0v.xy + s1v.xy + s2v.xy + shoreSlope;
   let variance = max(s0v.zw - s0v.xy * s0v.xy, vec2f(0.0)) + max(s1v.zw - s1v.xy * s1v.xy, vec2f(0.0))
-    + max(s2v.zw - s2v.xy * s2v.xy, vec2f(0.0)) + max(s3v.zw - s3v.xy * s3v.xy, vec2f(0.0));
+    + max(s2v.zw - s2v.xy * s2v.xy, vec2f(0.0));
   let nrm = normalize(vec3f(-slope.x, 1.0, -slope.y));
   let dndx = dpdx(nrm);
   let dndy = dpdy(nrm);
-  let fw = max(max(length(dpdx(xz)), length(dpdy(xz))), 1e-3);
   let geoVar = min(0.25 * (dot(dndx, dndx) + dot(dndy, dndy)), 0.18);
   let alpha2 = optics.x * optics.x + unresolved * damp.z * damp.z + variance.x + variance.y + geoVar;
   let alpha = sqrt(max(alpha2, 1e-6));
@@ -238,38 +235,9 @@ fn shade(
   let nS = dv.xy - vp.xy / min(vp.z, -1e-3) * dv.z;
   let sun = sunCol;
 
-  if (facing < 0.5) {
-    let Nu = -nrm;
-    let cosI = dot(V, Nu);
-    var Rd = reflect(-V, Nu);
-    let ambientU = skyAt(vec3f(0.0, 1.0, 0.0), skyMaxLod, skyMap, skyS, skyMaxLod);
-    let deep = scatter * (ambientU + sunCol * max(sunDir.y, 0.0)) * mix(0.55, 1.35, Rd.y * 0.5 + 0.5);
-    let edge = max(alpha * 1.5, 0.02);
-    let win = smoothstep(0.6614 - edge, 0.6614 + edge, cosI);
-    var colU = deep;
-    if (win > 0.0) {
-      var Tdir = refract(-V, Nu, 1.33);
-      if (dot(Tdir, Tdir) < 1e-8) { Tdir = normalize(-V - Nu * dot(-V, Nu)); }
-      let cosT = max(dot(Tdir, nrm), 0.0);
-      let Fu = 0.02 + 0.98 * pow(1.0 - cosT, 5.0);
-      let wuv = uv + nS * 0.04;
-      let above = select(
-        skyAt(Tdir, clamp(log2(alpha * 900.0), 0.0, skyMaxLod), skyMap, skyS, skyMaxLod),
-        sceneAt(sceneMap, wuv),
-        (depthAt(depthMap, wuv) < 0.999999)
-      );
-      let aT = max(alpha * 1.4, 0.03);
-      let mu = max(dot(Tdir, sunDir), 0.0);
-      let dT = mu * mu * (aT * aT - 1.0) + 1.0;
-      let sunLobe = aT * aT / (PI * dT * dT) * 0.25;
-      colU = mix(deep, mix(above + sun * sunLobe, deep, Fu), win);
-    }
-    return vec4f(colU, 1.0);
-  }
-
-  let t0 = textureSampleLevel(d0, d0s, xz / wl.x, 0.0).w;
-  let t1 = textureSampleLevel(d1, d1s, xz / wl.y, 0.0).w;
-  let t2 = textureSampleLevel(d2, d2s, xz / wl.z, 0.0).w;
+  let t0 = textureSampleLevel(d0, d0s, xz / wl.x, lodS.x).w;
+  let t1 = textureSampleLevel(d1, d1s, xz / wl.y, lodS.y).w;
+  let t2 = textureSampleLevel(d2, d2s, xz / wl.z, lodS.z).w;
   let jac = mix(1.0, t0, damp.x) + mix(1.0, t1, damp.y) + mix(1.0, t2, damp.z) - 2.0;
   var foam = clamp((foamP.x - jac) * foamP.y, 0.0, 1.0);
 
@@ -313,7 +281,7 @@ fn shade(
   let vis = 0.5 / (nl * sqrt(NoV * NoV * (1.0 - aS2) + aS2) + NoV * sqrt(nl * nl * (1.0 - aS2) + aS2) + 1e-5);
   let Fs = F0 + (1.0 - F0) * pow(1.0 - max(dot(V, H), 0.0), 5.0);
   var spec = sun * (PI * D * vis * Fs * nl);
-  if (glint > 0.0 && dot(spec, vec3f(1.0)) > 0.02) {
+  if (glint > 0.0 && dist < 40.0 && dot(spec, vec3f(1.0)) > 0.02) {
     let lf = log2(fw) + 1.0;
     let l0 = floor(lf);
     let per = 2e4 * D * NoH * 6.8e-5 / (4.0 * max(dot(V, H), 0.05));
@@ -340,15 +308,22 @@ fn shade(
   var fh = 0.5;
   var dens = 0.0;
   var fg = vec2f(0.0);
+  let nearFoam = dist < 100.0;
   if (foam > 0.0) {
-    let tA = textureSampleLevel(foamMap, foamS, xz * 0.11, 0.0);
-    pat = tA.r * 0.65 + textureSampleLevel(foamMap, foamS, xz * 0.031 + vec2f(0.37), 0.0).r * 0.35;
-    cover = smoothstep(1.05 - foam, 1.3 - foam, pat) * sqrt(foam);
-    fh = tA.g;
-    fg = (tA.ba - vec2f(0.5)) * 64.0 * 0.11;
-    dens = foam;
+    if (nearFoam) {
+      let tA = textureSampleLevel(foamMap, foamS, xz * 0.11, 0.0);
+      pat = tA.r * 0.65 + textureSampleLevel(foamMap, foamS, xz * 0.031 + vec2f(0.37), 0.0).r * 0.35;
+      cover = smoothstep(1.05 - foam, 1.3 - foam, pat) * sqrt(foam);
+      fh = tA.g;
+      fg = (tA.ba - vec2f(0.5)) * 64.0 * 0.11;
+      dens = foam;
+    } else {
+      cover = sqrt(foam) * 0.55;
+      dens = foam;
+      pat = foam;
+    }
   }
-  if (shoreFoam > 0.0) {
+  if (nearFoam && shoreFoam > 0.0) {
     let FLOW_T = 2.5;
     let vel = dir * wave0.z / max(wave0.y, 1e-3);
     let f0 = fract(time / FLOW_T);
@@ -367,7 +342,7 @@ fn shade(
     }
     cover = max(cover, sCover);
   }
-  if (residual > 0.0) {
+  if (nearFoam && residual > 0.0) {
     let fp = fract(time / 8.0);
     let drift = dir * 2.8;
     let r0 = textureSampleLevel(foamMap, foamS, (world.xz - drift * fp) * 0.06, 0.0).r;

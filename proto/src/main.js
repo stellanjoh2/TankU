@@ -166,7 +166,7 @@ async function main() {
   scene.fog = new THREE.Fog(fogColor, 30, 151);
 
   // HDRI → cube RT → LightProbe (diffuse SH) + PMREM env (specular), same path as webgpu_lightprobe
-  const { cubeRT, lightProbe, sky, sun, hemi, ambient } = await load.phase(0.08, 'Sky & lighting…', async () => {
+  const { cubeRT, lightProbe, sky, sun, hemi, ambient, oceanCubeRT, bakeOceanSky } = await load.phase(0.08, 'Sky & lighting…', async () => {
     const equirect = await new EXRLoader().loadAsync('./textures/hdri/env.exr');
     equirect.mapping = THREE.EquirectangularReflectionMapping;
 
@@ -182,7 +182,6 @@ async function main() {
     const lightProbe = await LightProbeGenerator.fromCubeRenderTarget(renderer, cubeRT);
     lightProbe.intensity = 1;
     scene.add(lightProbe);
-    // Kept for the ocean's mipmapped sky reflections.
 
     const pmrem = new THREE.PMREMGenerator(renderer);
     scene.environment = pmrem.fromEquirectangular(equirect).texture;
@@ -210,6 +209,25 @@ async function main() {
     sky.material.colorNode = vec4(skyBase.rgb.mul(skyTint), skyBase.a);
     scene.add(sky);
 
+    // Ocean reflections: bake SkyMesh into its own cubemap (not the HDRI), so the
+    // reflected sun matches sky.sunPosition / the directional light.
+    const oceanCubeRT = new THREE.CubeRenderTarget(256, {
+      type: THREE.HalfFloatType,
+      format: THREE.RGBAFormat,
+      generateMipmaps: true,
+    });
+    oceanCubeRT.texture.minFilter = THREE.LinearMipmapLinearFilter;
+    oceanCubeRT.texture.magFilter = THREE.LinearFilter;
+    oceanCubeRT.texture.generateMipmaps = true;
+    const oceanCubeCam = new THREE.CubeCamera(1, 1e6, oceanCubeRT);
+    const skyBakeScene = new THREE.Scene();
+    function bakeOceanSky() {
+      skyBakeScene.add(sky);
+      oceanCubeCam.update(renderer, skyBakeScene);
+      scene.add(sky);
+    }
+    bakeOceanSky();
+
     const sun = new THREE.DirectionalLight(new THREE.Color(1.0, 0.93, 0.82), 3.2);
     sun.castShadow = true;
     sun.shadow.mapSize.set(512, 512);
@@ -223,7 +241,7 @@ async function main() {
     const hemi = new THREE.HemisphereLight(new THREE.Color(0.55, 0.65, 0.85), new THREE.Color(0.32, 0.27, 0.18), 0.85);
     const ambient = new THREE.AmbientLight(0xffffff, 0.12);
     scene.add(hemi, ambient);
-    return { cubeRT, lightProbe, sky, sun, hemi, ambient };
+    return { cubeRT, lightProbe, sky, sun, hemi, ambient, oceanCubeRT, bakeOceanSky };
   });
 
   const clouds = await load.phase(0.02, 'Cloud shadows…', () => (
@@ -242,7 +260,7 @@ async function main() {
   ));
   const explosionFlare = createExplosionLensFlare({ camera, maps: lensFlare.maps });
   const terrain = await load.phase(0.10, 'Terrain & ocean…', () => (
-    buildTerrain(RAPIER, world, scene, { sunDir, renderer, skyCube: cubeRT.texture })
+    buildTerrain(RAPIER, world, scene, { sunDir, renderer, skyCube: oceanCubeRT.texture })
   ));
   buildBgIsland(scene, terrain);
   buildProps(RAPIER, world, scene);
@@ -519,6 +537,7 @@ async function main() {
   patchShadowTint(scene);
   const visuals = createVisualsEditor({
     renderer, scene, sky, sun, sunDir, hemi, ambient, lightProbe, terrain, grass, vegetation, barrels, trucks, post, shadowTint, fx, clouds, lensFlare, explosionFlare,
+    bakeOceanSky,
     getEnvIntensity: () => scene.environmentIntensity,
     setEnvIntensity: (v) => { scene.environmentIntensity = v; },
     tanks: [tank, ...foes.map((f) => f.tank)],

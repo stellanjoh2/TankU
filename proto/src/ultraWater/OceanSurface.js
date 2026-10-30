@@ -1,6 +1,6 @@
 // Camera-centred FFT ocean mesh. WebGPU port of Ultra-Water (MIT, Copyright (c) 2026 Humpalumps).
 import {
-  BufferAttribute, BufferGeometry, Color, DoubleSide, Mesh, NoColorSpace, NodeMaterial, Vector2, Vector3, Vector4,
+  BufferAttribute, BufferGeometry, Color, FrontSide, Mesh, NoColorSpace, NodeMaterial, Vector2, Vector3, Vector4,
 } from 'three/webgpu';
 import {
   Fn, cameraPosition, cameraViewMatrix, float, frontFacing, length, max, positionLocal, positionView,
@@ -14,8 +14,8 @@ import { DISPLACE_WGSL, SHADE_WGSL } from './waterWgsl.js';
 import { createSurfaceHeight } from './surfaceHeight.js';
 import { bindOceanHeight } from '../waves.js';
 
-const ANGULAR = 192;
-const HIGH_CAMERA = 60;
+const ANGULAR = 128;
+const HIGH_CAMERA = 35;
 const INNER = 1;
 const OUTER = 3000;
 const SKIRT = 60000;
@@ -94,7 +94,6 @@ export function createUltraWater(renderer, { shore, skyCube, seaY }) {
   const s0 = sim.slopeNodes[0];
   const s1 = sim.slopeNodes[1];
   const s2 = sim.slopeNodes[2];
-  const s3 = sim.slopeNodes[3];
   const shMap = texture(shore.texture);
   const trMap = texture(shore.travel);
   const foamMap = texture(foamTex);
@@ -104,7 +103,7 @@ export function createUltraWater(renderer, { shore, skyCube, seaY }) {
 
   const maps = {
     d0, d0s: d0, d1, d1s: d1, d2, d2s: d2,
-    s0, s0s: s0, s1, s1s: s1, s2, s2s: s2, s3, s3s: s3,
+    s0, s0s: s0, s1, s1s: s1, s2, s2s: s2,
     shMap, shS: shMap, trMap, trS: trMap,
   };
   const look = {
@@ -157,7 +156,7 @@ export function createUltraWater(renderer, { shore, skyCube, seaY }) {
     depthMap,
     skyMap, skyS: skyMap,
   }))();
-  material.side = DoubleSide;
+  material.side = FrontSide;
   material.forceSinglePass = true;
   material.transparent = true;
   material.depthWrite = false;

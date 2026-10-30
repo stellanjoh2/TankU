@@ -1842,16 +1842,16 @@ export class Effects {
       glow.color.setRGB(21, 10.5, 2.4).multiplyScalar(SPRITE_EMISSIVE / peak);
     }
     if (muzzle) {
-      // Same peak as the muzzle flash; linger 1 s so the impact pool reads across the ground.
+      // Same yellow-orange as the muzzle / shell — never pickup green/purple.
       this._flashLight(this._hitPoint.copy(point).addScaledVector(normal, 1.5), MAIN_GUN_LIGHT.intensity, {
-        color: FIRE_LIGHT.color,
+        color: MAIN_GUN_LIGHT.color,
         distance: MAIN_GUN_LIGHT.distance,
         fade: 1,
       });
     } else {
-      // Wreck / drum blasts — always warm fire colour (never pickup green/purple).
+      // Wreck / drum blasts — warm muzzle yellow (never pickup green/purple).
       this._flashLight(this._hitPoint.copy(point).addScaledVector(normal, 1.5), 520, {
-        color: FIRE_LIGHT.color,
+        color: MAIN_GUN_LIGHT.color,
         distance: 28,
         fade: 0.4,
       });

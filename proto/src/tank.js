@@ -846,11 +846,11 @@ export class Tank {
     updatePickupLights(this, dt);
   }
 
-  /** Green hull band — health pickup. */
+  /** Green hull band + streak light — health pickup (same swipe as repair finish). */
   showHeal() {
     if (!this._repairU) return;
     this._repairU.color.value.setRGB(0.22, 2.4, 0.4);
-    this._sweepLit = false;
+    this._sweepLit = true;
     this._sweep = 0;
     pulsePickupLight(this, PICKUP_LIGHT_HEALTH);
   }
@@ -860,9 +860,10 @@ export class Tank {
     pulsePickupLight(this, PICKUP_LIGHT_REPAIR);
   }
 
-  /** Brake lights, hit flash, repair sweep, or a hot .50 barrel. */
+  /** Brake lights, hit flash, repair/heal sweep, or a hot .50 barrel. */
   emissiveHot() {
     if (this.hitFlashFrames > 0 || this.repairT > 0 || this.mgHeat > 0.5) return true;
+    if (this._sweep >= 0) return true;
     if (pickupLightsHot(this)) return true;
     for (const m of this.tailMats) if (m.emissiveIntensity > 1.2) return true;
     return false;
