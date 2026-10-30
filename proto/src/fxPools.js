@@ -1,5 +1,5 @@
-// Fixed pools for combat VFX. One material per billboard batch; meshes share the
-// geometry and material they were built with. Slots are reused, never disposed.
+// Fixed pools for combat VFX. One material per billboard batch; mesh pools are
+// InstancedMesh draws with Object3D proxies for transform. Slots are reused, never disposed.
 import * as THREE from 'three/webgpu';
 import { instanceColor, instancedDynamicBufferAttribute, texture, vec3 } from 'three/tsl';
 
@@ -33,7 +33,7 @@ function takeFree(pool) {
 export function releaseSlot(pool, s) {
   if (!s.alive) return;
   s.alive = false;
-  if (s.mesh) s.mesh.visible = false;
+  if (s.mesh && !pool.instanced) s.mesh.visible = false;
   pool.free.push(s);
 }
 
@@ -125,18 +125,30 @@ export function takeBillboard(board) {
   return s;
 }
 
-export function createMeshPool(scene, geo, mat, capacity) {
+/**
+ * One InstancedMesh. Callers keep using `slot.mesh` as a transform proxy (not in the scene).
+ * Pass `colored: true` when slots set `slot.color` (e.g. torn grass tints).
+ */
+export function createMeshPool(scene, geo, mat, capacity, { colored = false } = {}) {
+  const inst = new THREE.InstancedMesh(geo, mat, capacity);
+  inst.count = 0;
+  inst.visible = false;
+  inst.frustumCulled = false;
+  inst.castShadow = false;
+  inst.receiveShadow = false;
+  inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  if (colored) {
+    inst.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(capacity * 3), 3);
+    inst.instanceColor.setUsage(THREE.DynamicDrawUsage);
+  }
+  scene.add(inst);
+
   const slots = [];
   const free = [];
   for (let i = 0; i < capacity; i++) {
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.visible = false;
-    mesh.frustumCulled = false;
-    mesh.castShadow = false;
-    mesh.receiveShadow = false;
-    scene.add(mesh);
+    const proxy = new THREE.Object3D();
     const s = {
-      mesh,
+      mesh: proxy,
       alive: false,
       age: 0,
       life: 1,
@@ -148,11 +160,12 @@ export function createMeshPool(scene, geo, mat, capacity) {
       traveled: 0,
       maxDist: 0,
       brass: false,
+      color: colored ? new THREE.Color(1, 1, 1) : null,
     };
     slots.push(s);
     free.push(s);
   }
-  return { slots, free };
+  return { slots, free, instanced: true, mesh: inst };
 }
 
 export function takeMesh(pool) {
@@ -161,8 +174,28 @@ export function takeMesh(pool) {
   s.owner = null;
   s.traveled = 0;
   s.maxDist = 0;
-  s.mesh.visible = true;
+  if (!pool.instanced) s.mesh.visible = true;
   return s;
+}
+
+/** Pack live slot proxies into the InstancedMesh draw. */
+export function syncMeshPool(pool) {
+  if (!pool?.instanced) return;
+  const inst = pool.mesh;
+  let n = 0;
+  for (const s of pool.slots) {
+    if (!s.alive) continue;
+    s.mesh.updateMatrix();
+    inst.setMatrixAt(n, s.mesh.matrix);
+    if (inst.instanceColor && s.color) inst.setColorAt(n, s.color);
+    n++;
+  }
+  inst.count = n;
+  inst.visible = n > 0;
+  if (n > 0) {
+    inst.instanceMatrix.needsUpdate = true;
+    if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+  }
 }
 
 function writeQuad(board, index, pos, rot, sx, sy, pivotX, pivotY, color, fade, camQ) {
@@ -281,4 +314,5 @@ export function stepMeshPool(pool, dt, heightAt) {
     p.mesh.rotation.y += p.spin.y * dt;
     if (p.brass) p.mesh.rotation.z += p.spin.z * dt;
   }
+  syncMeshPool(pool);
 }

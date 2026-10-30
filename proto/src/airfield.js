@@ -2,8 +2,9 @@
 // Door clear opening is sized so a Sherman (~3.3 m wide × ~2.8 m tall) just fits.
 // Walls are pre-fractured into ~130 shell-hittable panels (roof / door / shed stay solid).
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { AIRFIELD, AIRFIELD_Y, heightAt } from './terrain.js';
-import { applyConcreteMaps, prepareSlabGeometry } from './concreteTex.js';
+import { addInstancedBoxes, applyConcreteMaps, prepareSlabGeometry } from './concreteTex.js';
 import { roofCorrugatedMaterial, stampCorrugatedUVs, wallCorrugatedMaterial } from './corrugatedTex.js';
 
 // Sherman hull ≈ 3.24 m track-outer width, turret roof ≈ 2.81 m — leave a few cm.
@@ -226,8 +227,22 @@ export function buildAirfield(RAPIER, world, scene) {
     }
   }
 
+  /** Intact hangar draws as one merged wall mesh; first hit swaps to per-panel meshes. */
+  let wallsIntact = true;
+  let intactWalls = null;
+
+  function revealWallPanels() {
+    if (!wallsIntact) return;
+    wallsIntact = false;
+    if (intactWalls) intactWalls.visible = false;
+    for (const p of pieces) {
+      if (!p.dead) p.mesh.visible = true;
+    }
+  }
+
   function destroyPiece(piece, dir, withDebris) {
     if (piece.dead) return;
+    revealWallPanels();
     piece.dead = true;
     piece.mesh.visible = false;
     for (const m of piece.extras) m.visible = false;
@@ -373,6 +388,29 @@ export function buildAirfield(RAPIER, world, scene) {
     hangar.add(gable);
   }
 
+  // One draw for ~130 wall panels until the first shell; panels stay for fracture.
+  {
+    const geos = [];
+    for (const p of pieces) {
+      p.mesh.updateMatrix();
+      const g = p.mesh.geometry.clone();
+      g.applyMatrix4(p.mesh.matrix);
+      geos.push(g);
+      p.mesh.visible = false;
+    }
+    const merged = mergeGeometries(geos);
+    for (const g of geos) g.dispose();
+    if (merged) {
+      intactWalls = new THREE.Mesh(merged, wallMat);
+      intactWalls.name = 'HangarWallsIntact';
+      intactWalls.castShadow = intactWalls.receiveShadow = true;
+      hangar.add(intactWalls);
+    } else {
+      wallsIntact = false;
+      for (const p of pieces) p.mesh.visible = true;
+    }
+  }
+
   // --- Side window strip (tied to upper wall panels so they vanish with the hole) ---
   const winY = EAVE_H * 0.72;
   for (const sz of [-1, 1]) {
@@ -435,16 +473,25 @@ export function buildAirfield(RAPIER, world, scene) {
   const z1 = AIRFIELD.cz + AIRFIELD.hd - 0.5;
   const step = SLAB + SLAB_GAP;
   let si = 0;
+  const slabItems = [];
   for (let x = x0; x < x1 - SLAB * 0.5; x += step) {
     for (let z = z0; z < z1 - SLAB * 0.5; z += step) {
       const w = Math.min(SLAB, x1 - x);
       const d = Math.min(SLAB, z1 - z);
-      const m = boxMesh(unit, (si++ & 1) ? concrete : concreteDark, x + w * 0.5, y0 + SLAB_T * 0.5, z + d * 0.5, w, SLAB_T, d);
-      // Slight height jitter so joints read
-      m.position.y += ((si * 17) % 5) * 0.004;
-      slabs.add(m);
+      const mat = si++ & 1;
+      slabItems.push({
+        mat,
+        x: x + w * 0.5,
+        y: y0 + SLAB_T * 0.5 + ((si * 17) % 5) * 0.004,
+        z: z + d * 0.5,
+        sx: w,
+        sy: SLAB_T,
+        sz: d,
+      });
     }
   }
+  // mat index = si&1: 0 → dark, 1 → light (matches prior ternary)
+  addInstancedBoxes(slabs, unit, [concreteDark, concrete], slabItems, { name: 'ApronSlab' });
 
   // One box over the slab field. Top is the concrete surface, so the tracks
   // sit on the slabs instead of the terrain buried 6 cm under them.
@@ -508,9 +555,11 @@ export function buildAirfield(RAPIER, world, scene) {
       }
     },
     reset() {
+      wallsIntact = !!intactWalls;
+      if (intactWalls) intactWalls.visible = true;
       for (const p of pieces) {
         p.dead = false;
-        p.mesh.visible = true;
+        p.mesh.visible = !wallsIntact;
         for (const m of p.extras) m.visible = true;
         p.collider.setEnabled(true);
       }

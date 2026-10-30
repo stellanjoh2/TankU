@@ -6,8 +6,8 @@ import { GrassMaterial } from './GrassMaterial.js';
 import { SIZE, heightAt, isGrassable, grassCluster, GRASS_CLUSTER_CUT } from './terrain.js';
 import { pickLod } from './lod.js';
 
-// 16 m chunks so LOD bands (measured to the nearest chunk edge) stay meaningful.
-const CHUNK = 16;
+// 24 m chunks: fewer InstancedMesh draws than 16 m; LOD bands still read at chunk edges.
+const CHUNK = 24;
 /**
  * Band edges (m) from camera to chunk edge. Bands 0–2 pick LOD00/01/02 geometry;
  * the outer bands keep LOD02 and only thin the clump count (BAND_DENSITY).

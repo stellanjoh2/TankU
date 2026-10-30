@@ -21,7 +21,7 @@ import { createCloudShadows } from './cloudShadows.js';
 import { Input, PAD } from './input.js';
 import { Tank, RELOAD, REPAIR_TIME, MG_HEAT_TIME } from './tank.js';
 import { tankPose, boatPose } from './combatPose.js';
-import { installTankLods, updateTankLod } from './tankLod.js';
+import { installTankLods, installTrackInstances, updateTankLod } from './tankLod.js';
 import { setLodFov } from './lod.js';
 import { Effects, wreckFireFade, wreckMeshFade, applyWreckMeshFade } from './fx.js';
 import { TankCamera } from './TankCamera.js';
@@ -412,6 +412,7 @@ async function main() {
     sub('Effects…', 0.2);
     const effects = fx.load();
     sub('Tank LODs…', 0.5);
+    installTrackInstances(tank);
     await Promise.all([
       audio,
       effects,

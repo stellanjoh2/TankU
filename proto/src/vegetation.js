@@ -1,7 +1,7 @@
 // Stylized tropical vegetation pack (Serhii3D) — clustered along beaches / land.
 // Distance LODs come from vegetation_lods.glb (scripts/build_vegetation_lods.py).
-// Ground plants and rocks are InstancedMesh batches (one per prefab mesh / LOD).
-// Palms stay as skinned clones so each trunk can lean on its own phase.
+// Ground plants / gray rocks: BatchedMesh per shared material (one draw for many geos).
+// Cover rocks stay InstancedMesh (cast shadows). Palms stay skinned clones.
 import * as THREE from 'three';
 import { PropertyBinding } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
@@ -98,6 +98,9 @@ const PALM_WIND_LEAN = 1.35;
  */
 const LOD_EDGES = [20, 36, 55];
 const LOD_LEVELS = LOD_EDGES.length + 1;
+/** Drop palm / cover castShadow past this — matches grass shadow-receive gate roughly. */
+const PALM_SHADOW_DIST = 42;
+const COVER_SHADOW_DIST = 42;
 /** Big cover boulders are 3–5 m tall, so they step down at twice the distance. */
 const COVER_LOD_MUL = 2;
 /** Ground plants are fully hidden past this (palms and rocks never cull). */
@@ -666,6 +669,16 @@ export async function buildVegetation(scene, { RAPIER, world }) {
 
   /** Show this record on the LOD parts that should draw it. Other parts are left alone. */
   function syncRec(batch, rec) {
+    if (rec.batchRefs) {
+      for (const ref of rec.batchRefs) {
+        const show = !!(rec.visible && rec.lod >= ref.lo && rec.lod <= ref.hi);
+        if (ref.shown !== show) {
+          ref.shown = show;
+          ref.mesh.setVisibleAt(ref.id, show);
+        }
+      }
+      return;
+    }
     if (!rec.slots || rec.slots.length !== batch.parts.length) {
       rec.slots = batch.parts.map(() => -1);
     }
@@ -676,6 +689,80 @@ export async function buildVegetation(scene, { RAPIER, world }) {
       const shown = rec.slots[p] >= 0;
       if (show && !shown) showPart(mesh, rec, p);
       else if (!show && shown) hidePart(mesh, rec, p);
+    }
+  }
+
+  function matBatchKey(mat) {
+    const m = Array.isArray(mat) ? mat[0] : mat;
+    const mapId = m.map?.uuid ?? 'nomap';
+    return `${mapId}|${m.color?.getHexString?.() ?? ''}|${m.side}|${m.alphaTest}|${m.metalness}|${m.roughness}`;
+  }
+
+  function geoVertIndex(geo) {
+    const v = geo.attributes.position.count;
+    const i = geo.index ? geo.index.count : v;
+    return { v, i };
+  }
+
+  /** One BatchedMesh per material covering every prefab LOD part that shares it. */
+  function bakeBatched(itemRecs, parent, lodMul) {
+    const groups = new Map();
+    for (const { item, recs } of itemRecs) {
+      if (!recs.length) continue;
+      for (const src of lodMeshesOf(item.template)) {
+        src.updateMatrix();
+        const mat = Array.isArray(src.material) ? src.material[0] : src.material;
+        const key = matBatchKey(mat);
+        let g = groups.get(key);
+        if (!g) {
+          g = { mat, parts: [] };
+          groups.set(key, g);
+        }
+        const [lo, hi] = src.userData.lodRange;
+        const local = src.matrix.clone();
+        for (const rec of recs) {
+          g.parts.push({ geo: src.geometry, local, lo, hi, rec });
+        }
+      }
+    }
+
+    for (const { mat, parts } of groups.values()) {
+      if (!parts.length) continue;
+      const geoIds = new Map();
+      let vertCount = 0;
+      let idxCount = 0;
+      for (const p of parts) {
+        if (geoIds.has(p.geo.uuid)) continue;
+        geoIds.set(p.geo.uuid, -1);
+        const s = geoVertIndex(p.geo);
+        vertCount += s.v;
+        idxCount += s.i;
+      }
+      const mesh = new THREE.BatchedMesh(parts.length, vertCount, idxCount, mat);
+      mesh.name = 'FoliageBatch';
+      mesh.castShadow = false;
+      mesh.receiveShadow = true;
+      mesh.frustumCulled = true;
+      mesh.perObjectFrustumCulled = true;
+      parent.add(mesh);
+
+      for (const [uuid] of geoIds) {
+        const geo = parts.find((p) => p.geo.uuid === uuid).geo;
+        geoIds.set(uuid, mesh.addGeometry(geo));
+      }
+
+      const recSet = new Set();
+      for (const p of parts) {
+        const id = mesh.addInstance(geoIds.get(p.geo.uuid));
+        composeRec(p.rec, p.local, _m);
+        mesh.setMatrixAt(id, _m);
+        const show = !!(p.rec.visible && p.rec.lod >= p.lo && p.rec.lod <= p.hi);
+        mesh.setVisibleAt(id, show);
+        if (!p.rec.batchRefs) p.rec.batchRefs = [];
+        p.rec.batchRefs.push({ mesh, id, lo: p.lo, hi: p.hi, shown: show });
+        recSet.add(p.rec);
+      }
+      staticBatches.push({ recs: [...recSet], parts: [], lodMul, batched: mesh });
     }
   }
 
@@ -705,6 +792,7 @@ export async function buildVegetation(scene, { RAPIER, world }) {
       const mesh = new THREE.InstancedMesh(src.geometry, src.material, recs.length);
       mesh.name = `${item.name}:${src.name}`;
       mesh.castShadow = castShadow;
+      mesh.userData.wantShadow = castShadow;
       mesh.receiveShadow = true;
       mesh.frustumCulled = true;
       mesh.userData.lodRange = src.userData.lodRange.slice();
@@ -722,16 +810,24 @@ export async function buildVegetation(scene, { RAPIER, world }) {
   }
 
   function bakeStatic() {
+    const plantItems = [];
     for (const item of catalog.plant) {
-      const batch = makeBatch(item, item.plantRecs, root, 1, false);
-      if (batch) plantBatches.push(batch);
+      if (item.plantRecs.length) plantItems.push({ item, recs: item.plantRecs });
     }
+    bakeBatched(plantItems, root, 1);
+    for (const batch of staticBatches) {
+      if (batch.batched) plantBatches.push(batch);
+    }
+
+    const rockItems = [];
     for (const item of catalog.rock) {
-      makeBatch(item, item.rockRecs, root, 1, false);
+      if (item.rockRecs.length) rockItems.push({ item, recs: item.rockRecs });
       makeBatch(item, item.coverRecs, coverRoot, COVER_LOD_MUL, true);
     }
+    bakeBatched(rockItems, root, 1);
+
     for (const batch of staticBatches) {
-      sealBounds(batch);
+      if (batch.parts?.length) sealBounds(batch);
       for (const rec of batch.recs) syncRec(batch, rec);
     }
   }
@@ -766,6 +862,11 @@ export async function buildVegetation(scene, { RAPIER, world }) {
       const d = inst.position.distanceTo(camPos);
       const cur = inst.userData.lod;
       setLodLevel(inst, pickLod(d, LOD_EDGES, lodScale, cur));
+      const cast = d < PALM_SHADOW_DIST;
+      if (inst.userData.shadowCast !== cast) {
+        inst.userData.shadowCast = cast;
+        inst.traverse((c) => { if (c.isMesh) c.castShadow = cast; });
+      }
     }
     const cullPad = plantCull * 0.05;
     for (const batch of staticBatches) {
@@ -782,6 +883,23 @@ export async function buildVegetation(scene, { RAPIER, world }) {
           rec.lod = level;
           syncRec(batch, rec);
         }
+      }
+    }
+    let coverNear = false;
+    for (const batch of staticBatches) {
+      if (!batch.parts?.some((p) => p.userData.wantShadow)) continue;
+      for (const rec of batch.recs) {
+        if (!rec.visible || rec.lod < 0) continue;
+        if (Math.hypot(rec.x - camPos.x, rec.z - camPos.z) < COVER_SHADOW_DIST) {
+          coverNear = true;
+          break;
+        }
+      }
+      if (coverNear) break;
+    }
+    for (const batch of staticBatches) {
+      for (const part of batch.parts || []) {
+        if (part.userData.wantShadow) part.castShadow = coverNear;
       }
     }
   }

@@ -52,3 +52,41 @@ export function prepareSlabGeometry(geo) {
   if (!geo.attributes.tangent) geo.computeTangents();
   return geo;
 }
+
+const _slabM = new THREE.Matrix4();
+const _slabP = new THREE.Vector3();
+const _slabQ = new THREE.Quaternion();
+const _slabS = new THREE.Vector3();
+
+/**
+ * One InstancedMesh per material for scaled unit boxes (apron / quay slabs).
+ * @param {THREE.Object3D} parent
+ * @param {THREE.BufferGeometry} unitGeo
+ * @param {THREE.Material[]} materials
+ * @param {{ mat: number, x: number, y: number, z: number, sx: number, sy: number, sz: number }[]} items
+ */
+export function addInstancedBoxes(parent, unitGeo, materials, items, {
+  castShadow = true,
+  receiveShadow = true,
+  name = 'InstancedBoxes',
+} = {}) {
+  const buckets = materials.map(() => []);
+  for (const it of items) buckets[it.mat].push(it);
+  for (let mi = 0; mi < materials.length; mi++) {
+    const list = buckets[mi];
+    if (!list.length) continue;
+    const mesh = new THREE.InstancedMesh(unitGeo, materials[mi], list.length);
+    mesh.name = `${name}_${mi}`;
+    mesh.castShadow = castShadow;
+    mesh.receiveShadow = receiveShadow;
+    for (let i = 0; i < list.length; i++) {
+      const it = list[i];
+      _slabP.set(it.x, it.y, it.z);
+      _slabS.set(it.sx, it.sy, it.sz);
+      _slabM.compose(_slabP, _slabQ, _slabS);
+      mesh.setMatrixAt(i, _slabM);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    parent.add(mesh);
+  }
+}

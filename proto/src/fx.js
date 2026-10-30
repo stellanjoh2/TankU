@@ -1,12 +1,14 @@
 // Shells (ballistic, raycast against the physics world), muzzle flash, impacts, smoke and track dust.
 // Glow sprites keep HDR in emissiveNode. Post blooms the whole frame plus that emissive buffer.
 import * as THREE from 'three/webgpu';
-import { float, mix, smoothstep, texture, uniform, uv, vec3, vec4 } from 'three/tsl';
+import {
+  float, instancedDynamicBufferAttribute, mix, smoothstep, texture, uniform, uv, vec2, vec3, vec4,
+} from 'three/tsl';
 import { heightAt as terrainHeightAt, WATER_Y } from './terrain.js';
 import { VISUAL_DEFAULTS } from './visualDefaults.js';
 import { decodeGif } from './gif.js';
 import {
-  createBillboard, createMeshPool, releaseSlot, stepBillboards, stepMeshPool, takeBillboard, takeMesh,
+  createBillboard, createMeshPool, releaseSlot, stepBillboards, stepMeshPool, syncMeshPool, takeBillboard, takeMesh,
 } from './fxPools.js';
 
 /** Shared glow. Peak channel is this; a tint keeps its hue. */
@@ -50,23 +52,6 @@ function emissiveSpriteMat(map, hdr, opts = {}) {
 }
 
 /** Unlit card. Black albedo, HDR in emissive, plain additive so black texels add nothing. */
-function emissiveCardMat(map, hdr) {
-  const hdrCol = toEmissiveLevel(hdr);
-  const uEm = uniform(hdrCol);
-  const mat = new THREE.MeshBasicNodeMaterial({
-    color: new THREE.Color(0, 0, 0),
-    lights: false,
-    transparent: true,
-    depthWrite: false,
-    side: THREE.DoubleSide,
-    fog: false,
-    blending: THREE.AdditiveBlending,
-  });
-  mat.emissiveNode = texture(map).rgb.mul(uEm);
-  mat.userData.emissiveUniform = uEm;
-  return mat;
-}
-
 /**
  * RGB painted on black, no alpha mask. Add the texel and leave framebuffer
  * alpha alone so the card can't stamp a square into the target.
@@ -338,18 +323,21 @@ function sparkBurstTexture(seed) {
   return t;
 }
 
-/** Blit one atlas cell into a canvas texture — reliable flipbook on WebGPU (offset/repeat is flaky). */
-function blitFlipbookFrame(fb, frame) {
-  if (frame === fb.frame) return;
-  fb.frame = frame;
-  const atlasFrame = fb.frameMap ? fb.frameMap[frame] : frame;
-  const col = atlasFrame % fb.cols;
-  const row = Math.floor(atlasFrame / fb.cols);
-  const { ctx, cellW, cellH, atlasImg } = fb;
-  ctx.clearRect(0, 0, cellW, cellH);
-  ctx.drawImage(atlasImg, col * cellW, row * cellH, cellW, cellH, 0, 0, cellW, cellH);
-  fb.map.needsUpdate = true;
+/** Sub-UV into an atlas from a per-instance frame index (row 0 = top of image). */
+function atlasUvNode(frameNode, cols, rows) {
+  const c = float(cols);
+  const r = float(rows);
+  const col = frameNode.mod(c);
+  const row = frameNode.div(c).floor();
+  const u = uv();
+  return vec2(col.add(u.x).div(c), r.sub(row.add(float(1))).add(u.y).div(r));
 }
+
+const _cardM = new THREE.Matrix4();
+const _cardP = new THREE.Vector3();
+const _cardQ = new THREE.Quaternion();
+const _cardS = new THREE.Vector3();
+const _cardZ = new THREE.Vector3(0, 0, 1);
 
 export class Effects {
   constructor(scene, RAPIER, world, excludeBody, dynamicProps) {
@@ -401,20 +389,16 @@ export class Effects {
     });
     this.debrisGeo = new THREE.BoxGeometry(0.15, 0.15, 0.15);
     this.debrisMat = new THREE.MeshStandardMaterial({ color: 0x2b2418, roughness: 1 });
-    // Tiny torn blades kicked up by tracks on yellow meadows (match primary grass)
+    // Tiny torn blades kicked up by tracks on yellow meadows (match primary grass).
+    // Material stays white; per-bit tint is instanceColor.
     this.grassBitGeo = new THREE.PlaneGeometry(0.05, 0.16);
+    this.grassBitColors = [
+      new THREE.Color(VISUAL_DEFAULTS.grassBase),
+      new THREE.Color(VISUAL_DEFAULTS.grassTip1),
+      new THREE.Color(VISUAL_DEFAULTS.grassTip2),
+    ];
     this.grassBitMat = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(VISUAL_DEFAULTS.grassBase),
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    this.grassBitMatB = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(VISUAL_DEFAULTS.grassTip1),
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    this.grassBitMatC = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(VISUAL_DEFAULTS.grassTip2),
+      color: 0xffffff,
       side: THREE.DoubleSide,
       depthWrite: false,
     });
@@ -493,7 +477,7 @@ export class Effects {
     this._tracerPool = createMeshPool(scene, this.mgTracerGeo, this.mgTracerMat, 128);
     this._brassPool = createMeshPool(scene, this.brassGeo, this.brassMat, 96);
     this._debrisPool = createMeshPool(scene, this.debrisGeo, this.debrisMat, 48);
-    this._grassPool = createMeshPool(scene, this.grassBitGeo, this.grassBitMat, 48);
+    this._grassPool = createMeshPool(scene, this.grassBitGeo, this.grassBitMat, 48, { colored: true });
     this.shells = [];
     this.mgTracers = [];
   }
@@ -573,34 +557,86 @@ export class Effects {
       blackAdditive(mat);
       return mat;
     };
-    const makeKit = () => {
-      const star = new THREE.Sprite(flashCard(starMap, 0.02, true));
+    // Four kits share two InstancedMeshes (stars + plumes) instead of 12 draws.
+    const starGeo = new THREE.PlaneGeometry(1, 1);
+    const starMat = flashCard(starMap, 0.02, false);
+    const plumeGeo = new THREE.PlaneGeometry(1, 1);
+    const plumeMat = flashCard(plumeMap, 0.1, false);
+    this._mgStarInst = new THREE.InstancedMesh(starGeo, starMat, 4);
+    this._mgStarInst.count = 4;
+    this._mgStarInst.frustumCulled = false;
+    this._mgStarInst.castShadow = false;
+    this._mgStarInst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.scene.add(this._mgStarInst);
+    this._mgPlumeInst = new THREE.InstancedMesh(plumeGeo, plumeMat, 8);
+    this._mgPlumeInst.count = 8;
+    this._mgPlumeInst.frustumCulled = false;
+    this._mgPlumeInst.castShadow = false;
+    this._mgPlumeInst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.scene.add(this._mgPlumeInst);
+    const hideMgFlashInstances = () => {
+      _cardS.set(0, 0, 0);
+      _cardP.set(0, -999, 0);
+      _cardQ.identity();
+      _cardM.compose(_cardP, _cardQ, _cardS);
+      for (let i = 0; i < 4; i++) this._mgStarInst.setMatrixAt(i, _cardM);
+      for (let i = 0; i < 8; i++) this._mgPlumeInst.setMatrixAt(i, _cardM);
+      this._mgStarInst.instanceMatrix.needsUpdate = true;
+      this._mgPlumeInst.instanceMatrix.needsUpdate = true;
+    };
+    hideMgFlashInstances();
+    const makeKit = (kitIndex) => {
+      const star = new THREE.Object3D();
       star.scale.setScalar(MG_FLASH.starSize);
-      star.visible = false;
-      this.scene.add(star);
-      const plumeGeo = new THREE.PlaneGeometry(1, 1);
-      const plumeMat = flashCard(plumeMap, 0.1, false);
-      const plumes = [0, 1].map(() => {
-        const mesh = new THREE.Mesh(plumeGeo, plumeMat);
-        mesh.visible = false;
-        this.scene.add(mesh);
-        return mesh;
-      });
-      // Ground pool ahead of the muzzle — short range, no shadows (cheap + soft).
+      const plumes = [0, 1].map(() => new THREE.Object3D());
       const light = new THREE.PointLight(0xffc060, 0, 15, 2);
       light.castShadow = false;
       this.scene.add(light);
-      return { star, plumes, light };
+      return {
+        star, plumes, light,
+        starSlot: kitIndex,
+        plumeSlots: [kitIndex * 2, kitIndex * 2 + 1],
+        flashVisible: false,
+      };
     };
-    this.mgFlash = makeKit();
-    this.mgFlashB = makeKit();
-    this.mgFlashC = makeKit();
-    this.mgFlashD = makeKit();
+    this.mgFlash = makeKit(0);
+    this.mgFlashB = makeKit(1);
+    this.mgFlashC = makeKit(2);
+    this.mgFlashD = makeKit(3);
     this._mgKit = {
       player: this.mgFlash,
       enemy: this.mgFlashB,
       boat: this.mgFlashC,
       enemy2: this.mgFlashD,
+    };
+    this._syncMgFlashKit = (fx) => {
+      const starInst = this._mgStarInst;
+      const plumeInst = this._mgPlumeInst;
+      if (!fx.flashVisible) {
+        _cardS.set(0, 0, 0);
+        _cardP.set(0, -999, 0);
+        _cardQ.identity();
+        _cardM.compose(_cardP, _cardQ, _cardS);
+        starInst.setMatrixAt(fx.starSlot, _cardM);
+        plumeInst.setMatrixAt(fx.plumeSlots[0], _cardM);
+        plumeInst.setMatrixAt(fx.plumeSlots[1], _cardM);
+      } else {
+        if (this.camera) {
+          fx.star.quaternion.copy(this._camQ);
+          if (fx.starSpin) {
+            _cardQ.setFromAxisAngle(_cardZ, fx.starSpin);
+            fx.star.quaternion.multiply(_cardQ);
+          }
+        }
+        fx.star.updateMatrix();
+        starInst.setMatrixAt(fx.starSlot, fx.star.matrix);
+        for (let i = 0; i < 2; i++) {
+          fx.plumes[i].updateMatrix();
+          plumeInst.setMatrixAt(fx.plumeSlots[i], fx.plumes[i].matrix);
+        }
+      }
+      starInst.instanceMatrix.needsUpdate = true;
+      plumeInst.instanceMatrix.needsUpdate = true;
     };
 
     const gif = decodeGif(await (await fetch(DAMAGE_FIRE_URL)).arrayBuffer());
@@ -658,8 +694,8 @@ export class Effects {
 
   /** Build flipbook pools + glow board so the first shot / impact doesn't allocate mid-frame. */
   warmup() {
-    if (this.groundExplosionAtlas?.image) {
-      this._ensureCardPool('blast', this.groundExplosionAtlas.image, {
+    if (this.groundExplosionAtlas) {
+      this._ensureCardPool('blast', this.groundExplosionAtlas, {
         cols: GROUND_EXPLOSION.cols,
         rows: GROUND_EXPLOSION.rows,
         frames: GROUND_EXPLOSION.frameCount,
@@ -667,8 +703,8 @@ export class Effects {
         blast: true,
       });
     }
-    if (this.mgSoilImpactAtlas?.image) {
-      this._ensureCardPool('mg-soil', this.mgSoilImpactAtlas.image, {
+    if (this.mgSoilImpactAtlas) {
+      this._ensureCardPool('mg-soil', this.mgSoilImpactAtlas, {
         cols: MG_SOIL_IMPACT.cols,
         rows: MG_SOIL_IMPACT.rows,
         frames: MG_SOIL_IMPACT.frames,
@@ -677,8 +713,8 @@ export class Effects {
         soil: true,
       });
     }
-    if (this.mgWaterImpactAtlas?.image) {
-      this._ensureCardPool('mg-water', this.mgWaterImpactAtlas.image, {
+    if (this.mgWaterImpactAtlas) {
+      this._ensureCardPool('mg-water', this.mgWaterImpactAtlas, {
         cols: MG_WATER_IMPACT.cols,
         rows: MG_WATER_IMPACT.rows,
         frames: MG_WATER_IMPACT.frames,
@@ -687,11 +723,11 @@ export class Effects {
         soil: true,
       });
     }
-    if (this.mainMuzzleFront?.image) {
-      this._ensureCardPool('muzzle-front', this.mainMuzzleFront.image, MAIN_MUZZLE);
+    if (this.mainMuzzleFront) {
+      this._ensureCardPool('muzzle-front', this.mainMuzzleFront, MAIN_MUZZLE);
     }
-    if (this.mainMuzzleSide?.image) {
-      this._ensureCardPool('muzzle-side', this.mainMuzzleSide.image, MAIN_MUZZLE);
+    if (this.mainMuzzleSide) {
+      this._ensureCardPool('muzzle-side', this.mainMuzzleSide, MAIN_MUZZLE);
     }
     if (this.impactGlowTex && !this._glowBoard) {
       this._glowBoard = createBillboard(this.scene, this.impactGlowTex, 8, {
@@ -770,8 +806,8 @@ export class Effects {
     if (!pose) {
       const s = this._mgStreams.get(id);
       if (s) {
-        s.flash.star.visible = false;
-        for (const p of s.flash.plumes) p.visible = false;
+        s.flash.flashVisible = false;
+        this._syncMgFlashKit?.(s.flash);
         s.flash.light.intensity = 0;
         this._mgStreams.delete(id);
       }
@@ -794,7 +830,7 @@ export class Effects {
   }
 
   _layoutMgFlash(fx, pos, dir, visible, roll) {
-    fx.star.visible = visible;
+    fx.flashVisible = visible;
     fx.star.position.copy(pos);
 
     const up = this._mgUp.set(0, 1, 0);
@@ -818,16 +854,15 @@ export class Effects {
     fx.plumes[0].quaternion.setFromRotationMatrix(this._mgMat);
     fx.plumes[0].position.copy(pos).addScaledVector(dir, along);
     fx.plumes[0].scale.set(size, size, 1);
-    fx.plumes[0].visible = visible;
 
     this._mgMat.makeBasis(up, dir, this._mgSide2.copy(this._mgSide).negate());
     fx.plumes[1].quaternion.setFromRotationMatrix(this._mgMat);
     fx.plumes[1].position.copy(pos).addScaledVector(dir, along);
     fx.plumes[1].scale.set(size, size, 1);
-    fx.plumes[1].visible = visible;
 
     // ~5 m downrange so the pulse reads on the ground, not just at the muzzle.
     fx.light.position.copy(pos).addScaledVector(dir, 5);
+    this._syncMgFlashKit?.(fx);
   }
 
   /**
@@ -1092,7 +1127,7 @@ export class Effects {
   _triggerMgShot(stream) {
     const fx = stream.flash;
     const { pos, dir } = stream.pose;
-    fx.star.material.rotation = Math.random() * Math.PI * 2;
+    fx.starSpin = Math.random() * Math.PI * 2;
     stream.roll = Math.random() * Math.PI;
     this._layoutMgFlash(fx, pos, dir, true, stream.roll);
     const kick = 0.95 + Math.random() * 0.2;
@@ -1203,79 +1238,134 @@ export class Effects {
     mesh.quaternion.setFromRotationMatrix(this._mgMat);
   }
 
-  /** Built once per atlas. Later shots reuse the canvas and the node material. */
-  _ensureCardPool(key, atlasImg, {
+  /**
+   * One InstancedMesh per atlas. Frame + fade are per-instance attributes (no canvas blit).
+   * @param {THREE.Texture} atlasTex
+   */
+  _ensureCardPool(key, atlasTex, {
     cols, rows, frames, fps, blast = false, soil = false, frameMap = null, poolSize = 4,
   }) {
     if (!this._cardPools) this._cardPools = new Map();
     let pool = this._cardPools.get(key);
     if (pool) return pool;
-    const cellW = Math.floor(atlasImg.width / cols);
-    const cellH = Math.floor(atlasImg.height / rows);
+    const img = atlasTex.image;
+    const cellW = Math.floor(img.width / cols);
+    const cellH = Math.floor(img.height / rows);
     const n = poolSize;
+    atlasTex.colorSpace = THREE.SRGBColorSpace;
+    atlasTex.magFilter = THREE.LinearFilter;
+    atlasTex.minFilter = THREE.LinearFilter;
+    atlasTex.generateMipmaps = false;
+
+    const frameAttr = new THREE.InstancedBufferAttribute(new Float32Array(n), 1);
+    const fadeAttr = new THREE.InstancedBufferAttribute(new Float32Array(n), 1);
+    frameAttr.setUsage(THREE.DynamicDrawUsage);
+    fadeAttr.setUsage(THREE.DynamicDrawUsage);
+    const frameNode = instancedDynamicBufferAttribute(frameAttr, 'float');
+    const fadeNode = instancedDynamicBufferAttribute(fadeAttr, 'float');
+    const sample = texture(atlasTex, atlasUvNode(frameNode, cols, rows));
+
+    const mat = new THREE.MeshBasicNodeMaterial({
+      color: new THREE.Color(0, 0, 0),
+      lights: false,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      fog: false,
+    });
+    if (soil) {
+      mat.colorNode = sample.rgb;
+      mat.opacityNode = sample.a.mul(fadeNode);
+    } else if (blast) {
+      const lum = sample.r.mul(0.299).add(sample.g.mul(0.587)).add(sample.b.mul(0.114));
+      const desat = mix(sample.rgb, vec3(lum), float(0.3));
+      mat.colorNode = vec3(0, 0, 0);
+      mat.emissiveNode = desat.mul(uniform(toEmissiveLevel(new THREE.Color(1.35, 1.2, 0.95))));
+      mat.opacityNode = sample.a.mul(fadeNode);
+      mat.blending = THREE.CustomBlending;
+      mat.blendEquation = THREE.AddEquation;
+      mat.blendSrc = THREE.SrcAlphaFactor;
+      mat.blendDst = THREE.OneMinusSrcAlphaFactor;
+      mat.blendEquationAlpha = THREE.AddEquation;
+      mat.blendSrcAlpha = THREE.ZeroFactor;
+      mat.blendDstAlpha = THREE.OneFactor;
+    } else {
+      const hdr = toEmissiveLevel(new THREE.Color(MAIN_MUZZLE.emissive, MAIN_MUZZLE.emissive, MAIN_MUZZLE.emissive));
+      mat.emissiveNode = sample.rgb.mul(uniform(hdr)).mul(fadeNode);
+      mat.opacityNode = fadeNode;
+      mat.blending = THREE.AdditiveBlending;
+    }
+
+    const mesh = new THREE.InstancedMesh(this.muzzleCardGeo, mat, n);
+    mesh.count = n;
+    mesh.frustumCulled = false;
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    mesh.renderOrder = blast || soil ? 2 : 3;
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.scene.add(mesh);
+
     const slots = [];
     for (let i = 0; i < n; i++) {
-      const canvas = document.createElement('canvas');
-      canvas.width = cellW;
-      canvas.height = cellH;
-      const ctx = canvas.getContext('2d', { alpha: true });
-      const map = new THREE.CanvasTexture(canvas);
-      map.colorSpace = THREE.SRGBColorSpace;
-      map.magFilter = THREE.LinearFilter;
-      map.minFilter = THREE.LinearFilter;
-      map.generateMipmaps = false;
-      map.wrapS = map.wrapT = THREE.ClampToEdgeWrapping;
-      const flipbook = {
-        map, ctx, cellW, cellH, atlasImg,
-        cols, rows, frames, fps, frame: -1, height: 0, frameMap,
-      };
-      let obj;
-      if (blast || soil) {
-        const sample = texture(map);
-        const mat = new THREE.SpriteNodeMaterial({
-          transparent: true, depthWrite: false, opacity: 1, fog: false,
-        });
-        if (soil) {
-          // Lit soil dust — keep the map's albedo, no fireball emissive.
-          mat.colorNode = vec4(sample.rgb, sample.a);
-        } else {
-          // −30% saturation softens the atlas so low-res cells read less painted.
-          const lum = sample.r.mul(0.299).add(sample.g.mul(0.587)).add(sample.b.mul(0.114));
-          const desat = mix(sample.rgb, vec3(lum), float(0.3));
-          mat.colorNode = vec4(0, 0, 0, sample.a);
-          mat.emissiveNode = desat.mul(uniform(toEmissiveLevel(new THREE.Color(1.35, 1.2, 0.95))));
-        }
-        mat.blending = THREE.CustomBlending;
-        mat.blendEquation = THREE.AddEquation;
-        mat.blendSrc = THREE.SrcAlphaFactor;
-        mat.blendDst = THREE.OneMinusSrcAlphaFactor;
-        mat.blendEquationAlpha = THREE.AddEquation;
-        mat.blendSrcAlpha = THREE.ZeroFactor;
-        mat.blendDstAlpha = THREE.OneFactor;
-        obj = new THREE.Sprite(mat);
-      } else {
-        const hdr = new THREE.Color(MAIN_MUZZLE.emissive, MAIN_MUZZLE.emissive, MAIN_MUZZLE.emissive);
-        obj = new THREE.Mesh(this.muzzleCardGeo, emissiveCardMat(map, hdr));
-        obj.renderOrder = 3;
-      }
-      obj.frustumCulled = false;
-      obj.visible = false;
-      this.scene.add(obj);
+      frameAttr.setX(i, 0);
+      fadeAttr.setX(i, 0);
+      _cardS.set(0, 0, 0);
+      _cardP.set(0, -999, 0);
+      _cardQ.identity();
+      _cardM.compose(_cardP, _cardQ, _cardS);
+      mesh.setMatrixAt(i, _cardM);
+      const obj = new THREE.Object3D();
       slots.push({
-        obj, flipbook, pool: null, idle: true, age: 0,
-        life: frames / fps, muzzleDir: null,
+        obj,
+        instanceId: i,
+        flipbook: {
+          cols, rows, frames, fps, frame: -1, height: 0, frameMap,
+          cellW, cellH, billboard: blast || soil,
+        },
+        pool: null,
+        idle: true,
+        age: 0,
+        life: frames / fps,
+        muzzleDir: null,
+        fade: 1,
       });
     }
-    pool = { free: slots.slice(), slots };
+    mesh.instanceMatrix.needsUpdate = true;
+    pool = { free: slots.slice(), slots, mesh, frameAttr, fadeAttr, billboard: blast || soil };
     for (const s of slots) s.pool = pool;
     this._cardPools.set(key, pool);
     return pool;
   }
 
+  _syncCardSlot(card) {
+    const pool = card.pool;
+    const i = card.instanceId;
+    if (card.idle) {
+      _cardS.set(0, 0, 0);
+      _cardP.set(0, -999, 0);
+      _cardQ.identity();
+      _cardM.compose(_cardP, _cardQ, _cardS);
+      pool.mesh.setMatrixAt(i, _cardM);
+      pool.fadeAttr.setX(i, 0);
+    } else {
+      if (card.flipbook.billboard && this.camera) card.obj.quaternion.copy(this._camQ);
+      card.obj.updateMatrix();
+      pool.mesh.setMatrixAt(i, card.obj.matrix);
+      const atlasFrame = card.flipbook.frameMap
+        ? card.flipbook.frameMap[Math.max(0, card.flipbook.frame)]
+        : Math.max(0, card.flipbook.frame);
+      pool.frameAttr.setX(i, atlasFrame);
+      pool.fadeAttr.setX(i, card.fade);
+    }
+    pool.mesh.instanceMatrix.needsUpdate = true;
+    pool.frameAttr.needsUpdate = true;
+    pool.fadeAttr.needsUpdate = true;
+  }
+
   /** One-shot flipbook splash at a contact point (soil / water), bottom-aligned on the surface. */
   _spawnMgImpact(key, cfg, atlas, point) {
-    if (!atlas?.image) return;
-    const pool = this._ensureCardPool(key, atlas.image, {
+    if (!atlas) return;
+    const pool = this._ensureCardPool(key, atlas, {
       cols: cfg.cols, rows: cfg.rows, frames: cfg.frames, fps: cfg.fps,
       poolSize: 12, soil: true,
     });
@@ -1284,9 +1374,11 @@ export class Effects {
     const { cellW, cellH } = card.flipbook;
     const w = h * (cellW / cellH);
     card.flipbook.height = h;
+    card.flipbook.frame = 0;
+    card.fade = 1;
     card.obj.scale.set(w, h, 1);
     card.obj.position.set(point.x, point.y + h * 0.5, point.z);
-    blitFlipbookFrame(card.flipbook, 0);
+    this._syncCardSlot(card);
   }
 
   _mgSoilImpact(point) {
@@ -1308,20 +1400,18 @@ export class Effects {
     s.idle = false;
     s.age = 0;
     s.muzzleDir = null;
-    s.flipbook.frame = -1;
-    s.obj.visible = true;
-    s.obj.material.opacity = 1;
+    s.flipbook.frame = 0;
+    s.fade = 1;
     this.particles.push(s);
     return s;
   }
 
   /** One 4-frame strip. `side` lies along the barrel; the front card faces down it. */
   _spawnMainMuzzle(atlas, pos, dir, side, scale = 1) {
-    const atlasImg = atlas?.image;
-    if (!atlasImg) return;
+    if (!atlas) return;
     const cfg = MAIN_MUZZLE;
     const key = side ? 'muzzle-side' : 'muzzle-front';
-    const pool = this._ensureCardPool(key, atlasImg, cfg);
+    const pool = this._ensureCardPool(key, atlas, cfg);
     const card = this._takeCard(pool);
     const { cellW, cellH } = card.flipbook;
     const h = cfg.height * scale;
@@ -1338,7 +1428,9 @@ export class Effects {
       obj.position.copy(pos).addScaledVector(dir, 0.2);
       this._aimMuzzleFront(obj, dir);
     }
-    blitFlipbookFrame(card.flipbook, 0);
+    card.flipbook.frame = 0;
+    card.fade = 1;
+    this._syncCardSlot(card);
   }
 
   muzzleFlash(pos, dir) {
@@ -1567,9 +1659,9 @@ export class Effects {
 
   /** Keep torn-blade colours in sync with the primary FluffyGrass palette. */
   setGrassColors({ base, tip1, tip2 } = {}) {
-    if (base != null) this.grassBitMat.color.set(base);
-    if (tip1 != null) this.grassBitMatB.color.set(tip1);
-    if (tip2 != null) this.grassBitMatC.color.set(tip2);
+    if (base != null) this.grassBitColors[0].set(base);
+    if (tip1 != null) this.grassBitColors[1].set(tip1);
+    if (tip2 != null) this.grassBitColors[2].set(tip2);
   }
 
   /**
@@ -1583,11 +1675,9 @@ export class Effects {
     if (amount < 0.08 || Math.random() > amount * 0.85) return;
     const baseN = 1 + (Math.random() < amount * 0.7 ? 1 : 0);
     const n = Math.max(1, Math.round(baseN * 1.5));
-    const mats = [this.grassBitMat, this.grassBitMatB, this.grassBitMatC];
     for (let i = 0; i < n; i++) {
-      const mat = mats[(Math.random() * mats.length) | 0];
       const bit = takeMesh(this._grassPool);
-      bit.mesh.material = mat;
+      bit.color.copy(this.grassBitColors[(Math.random() * this.grassBitColors.length) | 0]);
       bit.life = 1.0 + Math.random() * 0.9;
       bit.mesh.position.copy(pos).addScaledVector(out, (Math.random() - 0.5) * 0.25);
       bit.mesh.position.y += 0.06;
@@ -1791,18 +1881,20 @@ export class Effects {
   _groundExplosion(point) {
     const cfg = GROUND_EXPLOSION;
     const atlas = this.groundExplosionAtlas;
-    if (!atlas?.image) return;
-    const pool = this._ensureCardPool('blast', atlas.image, {
+    if (!atlas) return;
+    const pool = this._ensureCardPool('blast', atlas, {
       cols: cfg.cols, rows: cfg.rows, frames: cfg.frameCount, fps: cfg.fps, blast: true,
     });
     const card = this._takeCard(pool);
     const w = cfg.width;
     const h = w / cfg.aspect;
     card.flipbook.height = h;
+    card.flipbook.frame = 0;
+    card.fade = 1;
     card.obj.scale.set(w, h, 1);
-    // Atlas cells are bottom-aligned; sprites are centered — lift so contact sits on the ground.
+    // Atlas cells are bottom-aligned; cards are centered — lift so contact sits on the ground.
     card.obj.position.set(point.x, point.y + h * 0.5, point.z);
-    blitFlipbookFrame(card.flipbook, 0);
+    this._syncCardSlot(card);
   }
 
   _explode(point, normal, dir, collider, { emissive = true, muzzle = false } = {}) {
@@ -1924,7 +2016,7 @@ export class Effects {
     }
     if (this._mgKit) {
       for (const kit of Object.values(this._mgKit)) {
-        if (kit.star?.visible) return true;
+        if (kit.flashVisible) return true;
       }
     }
     return false;
@@ -2036,22 +2128,25 @@ export class Effects {
       p.age += dt;
       const k = p.age / p.life;
       if (k >= 1) {
-        p.obj.visible = false;
+        p.idle = true;
+        this._syncCardSlot(p);
         p.pool?.free.push(p);
         this.particles.splice(i, 1);
         continue;
       }
       const fb = p.flipbook;
-      const frame = Math.min(fb.frames - 1, Math.floor(p.age * fb.fps));
-      blitFlipbookFrame(fb, frame);
+      fb.frame = Math.min(fb.frames - 1, Math.floor(p.age * fb.fps));
       if (p.muzzleDir) this._aimMuzzleSide(p.obj, p.muzzleDir);
       // Soft fade on the last ~15% so the last sparse frames don't hard-cut.
-      p.obj.material.opacity = k > 0.85 ? (1 - (k - 0.85) / 0.15) : 1;
+      p.fade = k > 0.85 ? (1 - (k - 0.85) / 0.15) : 1;
+      this._syncCardSlot(p);
     }
 
     stepMeshPool(this._debrisPool, dt, heightAt);
     stepMeshPool(this._brassPool, dt, heightAt);
     stepMeshPool(this._grassPool, dt, heightAt);
+    syncMeshPool(this._shellPool);
+    syncMeshPool(this._tracerPool);
     stepBillboards(
       [this._smokeBoard, this._flashBoard, this._streakBoard, this._glowBoard, ...this._burstBoards],
       dt, heightAt, this._camQ, this._camQInv,

@@ -2,7 +2,7 @@
 // plus a slab yard south of the deck for the water tower.
 import * as THREE from 'three';
 import { AIRFIELD_Y, PORT, PORT_YARD, WATER_Y } from './terrain.js';
-import { applyConcreteMaps, prepareSlabGeometry } from './concreteTex.js';
+import { addInstancedBoxes, applyConcreteMaps, prepareSlabGeometry } from './concreteTex.js';
 
 const SLAB = 4.0;
 const SLAB_GAP = 0.08;
@@ -13,14 +13,6 @@ const PILE_SPACING = 3.2;
 
 function mat(color, { metal = 0, rough = 0.85 } = {}) {
   return new THREE.MeshStandardMaterial({ color, metalness: metal, roughness: rough });
-}
-
-function boxMesh(geo, material, x, y, z, sx, sy, sz) {
-  const m = new THREE.Mesh(geo, material);
-  m.position.set(x, y, z);
-  m.scale.set(sx, sy, sz);
-  m.castShadow = m.receiveShadow = true;
-  return m;
 }
 
 function addCollider(RAPIER, world, body, hx, hy, hz, x, y, z) {
@@ -66,6 +58,7 @@ export function buildPort(RAPIER, world, scene) {
   const z1 = PORT.z1 - 0.6;
   const step = SLAB + SLAB_GAP;
   let si = 0;
+  const slabItems = [];
   /** [start, size] runs from a toward b (descending when b < a), skipping slivers. */
   const runs = (a, b) => {
     const out = [];
@@ -79,18 +72,16 @@ export function buildPort(RAPIER, world, scene) {
   const laySlabs = (xs, zs) => {
     for (const [x, w] of xs) {
       for (const [z, d] of zs) {
-        const m = boxMesh(
-          unit,
-          (si++ & 1) ? concrete : concreteDark,
-          x + w * 0.5,
-          y0 + SLAB_T * 0.5,
-          z + d * 0.5,
-          w,
-          SLAB_T,
-          d,
-        );
-        m.position.y += ((si * 17) % 5) * 0.004;
-        slabs.add(m);
+        const mat = si++ & 1;
+        slabItems.push({
+          mat,
+          x: x + w * 0.5,
+          y: y0 + SLAB_T * 0.5 + ((si * 17) % 5) * 0.004,
+          z: z + d * 0.5,
+          sx: w,
+          sy: SLAB_T,
+          sz: d,
+        });
       }
     }
   };
@@ -103,6 +94,8 @@ export function buildPort(RAPIER, world, scene) {
   const yz1 = z0 - SLAB_GAP;
   const yz0 = PORT_YARD.z0 + 0.6;
   laySlabs(yardXs, runs(yz1, yz0));
+  // mat index = si&1: 0 → dark, 1 → light (matches prior ternary)
+  addInstancedBoxes(slabs, unit, [concreteDark, concrete], slabItems, { name: 'PortSlab' });
 
   // Deck collider under the working pad (single slab for tanks to drive on)
   const padW = x1 - x0;
@@ -118,7 +111,7 @@ export function buildPort(RAPIER, world, scene) {
     (yx0 + x1) * 0.5, y0 - 0.15, (yz0 + yz1) * 0.5,
   );
 
-  // --- Wooden walkway along the quay edge ---
+  // --- Wooden walkway along the quay edge (instanced by material) ---
   const walk = new THREE.Group();
   walk.name = 'WoodenWalkway';
   root.add(walk);
@@ -126,72 +119,55 @@ export function buildPort(RAPIER, world, scene) {
   const walkX = PORT.x1 - WALK_W * 0.5;
   const walkLen = z1 - z0;
   const walkZ = (z0 + z1) * 0.5;
+  // mat indices: 0 wood, 1 woodDark, 2 woodWet, 3 iron
+  const walkItems = [];
+  const pushWalk = (mat, x, y, z, sx, sy, sz) => {
+    walkItems.push({ mat, x, y, z, sx, sy, sz });
+  };
 
-  // Plank deck (long boards parallel to shore)
   const plankCount = Math.max(4, Math.floor(WALK_W / 0.38));
   for (let i = 0; i < plankCount; i++) {
     const px = walkX - WALK_W * 0.5 + 0.2 + i * (WALK_W / plankCount);
-    const plank = boxMesh(
-      unit,
-      (i & 1) ? wood : woodDark,
-      px,
-      y0 + PLANK_T * 0.5 + 0.01,
-      walkZ,
-      0.32,
-      PLANK_T,
-      walkLen,
+    pushWalk(
+      (i & 1) ? 0 : 1,
+      px, y0 + PLANK_T * 0.5 + 0.01, walkZ,
+      0.32, PLANK_T, walkLen,
     );
-    walk.add(plank);
   }
 
-  // Cross-beams under the walkway
   for (let z = z0 + 1.2; z < z1 - 0.5; z += PILE_SPACING) {
-    walk.add(boxMesh(unit, woodDark, walkX, y0 - 0.08, z, WALK_W + 0.15, 0.18, 0.28));
+    pushWalk(1, walkX, y0 - 0.08, z, WALK_W + 0.15, 0.18, 0.28);
   }
 
-  // Outer header / fender beam along the water face
   const faceX = PORT.x1 + 0.12;
   const faceH = y0 - WATER_Y;
-  walk.add(boxMesh(unit, woodWet, faceX, y0 - 0.05, walkZ, 0.35, 0.4, walkLen + 0.4));
-  // Second fender lower, half in the splash zone
-  walk.add(boxMesh(unit, woodWet, faceX + 0.05, WATER_Y + faceH * 0.35, walkZ, 0.28, 0.32, walkLen + 0.2));
+  pushWalk(2, faceX, y0 - 0.05, walkZ, 0.35, 0.4, walkLen + 0.4);
+  pushWalk(2, faceX + 0.05, WATER_Y + faceH * 0.35, walkZ, 0.28, 0.32, walkLen + 0.2);
 
-  // Pilings into the water
   const pileTop = y0 + 0.35;
   const pileBot = WATER_Y - 1.6;
   const pileH = pileTop - pileBot;
   for (let z = z0 + 0.8; z <= z1 - 0.6; z += PILE_SPACING) {
-    const pile = boxMesh(
-      unit,
-      woodWet,
-      PORT.x1 + 0.55,
-      pileBot + pileH * 0.5,
-      z,
-      0.38,
-      pileH,
-      0.38,
-    );
-    walk.add(pile);
-    // Cap
-    walk.add(boxMesh(unit, woodDark, PORT.x1 + 0.55, pileTop + 0.08, z, 0.48, 0.16, 0.48));
+    pushWalk(2, PORT.x1 + 0.55, pileBot + pileH * 0.5, z, 0.38, pileH, 0.38);
+    pushWalk(1, PORT.x1 + 0.55, pileTop + 0.08, z, 0.48, 0.16, 0.48);
   }
 
-  // Walkway collider
+  for (let z = z0 + 2; z < z1 - 1; z += PILE_SPACING * 1.5) {
+    const bx = PORT.x1 - 0.55;
+    pushWalk(3, bx, y0 + 0.35, z, 0.22, 0.7, 0.22);
+    pushWalk(3, bx, y0 + 0.72, z, 0.34, 0.12, 0.34);
+  }
+
+  addInstancedBoxes(walk, unit, [wood, woodDark, woodWet, iron], walkItems, { name: 'PortWalk' });
+
   addCollider(
     RAPIER, world, body,
     WALK_W * 0.5, 0.2, walkLen * 0.5,
     walkX, y0 - 0.1, walkZ,
   );
 
-  // Bollards along the edge
-  for (let z = z0 + 2; z < z1 - 1; z += PILE_SPACING * 1.5) {
-    const bx = PORT.x1 - 0.55;
-    walk.add(boxMesh(unit, iron, bx, y0 + 0.35, z, 0.22, 0.7, 0.22));
-    walk.add(boxMesh(unit, iron, bx, y0 + 0.72, z, 0.34, 0.12, 0.34));
-  }
-
   // Short concrete retaining lips where the pads meet leftover beach / grass
-  // (the deck's south edge stays open where it runs into the yard).
+  const lipItems = [];
   const lips = [
     [x0, PORT.x1, z1 + 0.15, true],
     [x0, yx0, z0 - 0.15, true],
@@ -202,17 +178,17 @@ export function buildPort(RAPIER, world, scene) {
   for (const [a, b, at, alongX] of lips) {
     const len = b - a;
     const mid = (a + b) * 0.5;
-    root.add(boxMesh(
-      unit,
-      concreteDark,
-      alongX ? mid : at,
-      y0 + 0.18,
-      alongX ? at : mid,
-      alongX ? len : 0.35,
-      0.45,
-      alongX ? 0.35 : len,
-    ));
+    lipItems.push({
+      mat: 0,
+      x: alongX ? mid : at,
+      y: y0 + 0.18,
+      z: alongX ? at : mid,
+      sx: alongX ? len : 0.35,
+      sy: 0.45,
+      sz: alongX ? 0.35 : len,
+    });
   }
+  addInstancedBoxes(root, unit, [concreteDark], lipItems, { name: 'PortLip' });
 
   console.info(
     `[port] deck x=${PORT.x0}→${PORT.x1} z=${PORT.z0}→${PORT.z1}; ` +

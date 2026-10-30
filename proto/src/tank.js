@@ -25,6 +25,7 @@ import {
   installPickupLights, pulsePickupLight, updatePickupLights, clearPickupLights, pickupLightsHot,
   PICKUP_LIGHT_HEALTH, PICKUP_LIGHT_REPAIR,
 } from './pickupLights.js';
+import { syncTrackInstances } from './tankLod.js';
 
 export { RELOAD, MG_HEAT_TIME, MG_COOLDOWN, SHELL_SPEED } from './tankWeapons.js';
 export { stepMgHeat } from './tankWeapons.js';
@@ -708,6 +709,7 @@ export class Tank {
       }
       for (const w of s.wheels) w.rotation.z = -s.dist / w.userData.spin_radius;
     }
+    syncTrackInstances(this);
 
     if (aimPoint) {
       const local = this.turret.parent.worldToLocal(aimPoint.clone());

@@ -1,17 +1,17 @@
-// Distance steps for enemy Shermans. The player tank stays on the full rig.
+// Distance steps for enemy Shermans. The player tank stays on the full hull/turret,
+// but its track links always draw as InstancedMesh (same path as enemy LOD1 tracks).
 //
-// Sight is 170m and the far spawn sits ~225m out, so the full rig holds past a fight.
 // LOD1 merges the hull, turret, and guns (turret, main gun, and .50 still aim; wheels
 // still spin; tracks keep crawling as one instanced mesh per side).
 // LOD2 is a static hull plus a turret that only yaws.
-// Nominal edges are 300m and 420m; pickLod adds a little hysteresis so a tank sitting
-// on the line doesn't flicker. The visuals slider scales both edges.
+// Edges sit inside fight range so mid-combat enemies leave LOD0. pickLod adds hysteresis;
+// the visuals slider scales both edges.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { MeshoptSimplifier } from 'three/examples/jsm/libs/meshopt_simplifier.module.js';
 import { pickLod } from './lod.js';
 
-const LOD_EDGES = [300, 420];
+const LOD_EDGES = [55, 130];
 // Keep ratio is a target; targetError (fraction of the part's size) stops the
 // collapse before the silhouette moves. LOD1 is tight so a closer step still reads.
 const MID = { keep: 0.45, error: 0.012, flags: ['LockBorder'], shadow: true };
@@ -390,4 +390,24 @@ export function updateTankLod(tank, camPos) {
   const level = pickLod(d, LOD_EDGES, lodScale, lod.level);
   if (level !== lod.level) applyLod(lod, level);
   if (level === 1) syncTracks(lod);
+}
+
+/** Player (and any full-rig tank): one InstancedMesh per track side, links stay hidden. */
+export function installTrackInstances(tank) {
+  const tracks = [];
+  for (const side of tank.sides) {
+    const made = makeTrackInstances(side);
+    if (!made) continue;
+    made.inst.visible = true;
+    for (const link of side.links) {
+      link.visible = false;
+      link.castShadow = false;
+    }
+    tracks.push(made);
+  }
+  tank._trackInst = { tracks };
+}
+
+export function syncTrackInstances(tank) {
+  if (tank._trackInst) syncTracks(tank._trackInst);
 }
