@@ -150,8 +150,15 @@ canvas { display: block; }
 
 /* —— Health / round HUD —————————————————————————————————— */
 #hud {
-  position: fixed; left: 18px; bottom: 18px; z-index: 20; pointer-events: none;
-  display: flex; flex-direction: column; gap: 7px; letter-spacing: 0.06em;
+  position: fixed; left: 20px; right: 20px; bottom: 20px; z-index: 20; pointer-events: none;
+  display: flex; justify-content: space-between; align-items: flex-end;
+  letter-spacing: 0.06em;
+}
+#hud .hud-left {
+  display: flex; flex-direction: column; gap: 8px;
+}
+#hud .hud-right {
+  display: flex; flex-direction: column; align-items: flex-end;
 }
 #hud .hp,
 #hud .nitro,
@@ -159,9 +166,9 @@ canvas { display: block; }
 #hud .overheat,
 #hud .repair,
 #hud .hit,
-#hud .weapon { display: grid; grid-template-columns: 56px 160px 44px; align-items: center; gap: 8px; }
-#hud .repair { grid-template-columns: 120px 120px 48px; }
-#hud .weapon { grid-template-columns: 56px 1fr; }
+#hud .weapon { display: grid; grid-template-columns: 62px 176px 48px; align-items: center; gap: 9px; }
+#hud .repair { grid-template-columns: 132px 132px 53px; }
+#hud .weapon { grid-template-columns: 62px 1fr; }
 #hud .hp span,
 #hud .nitro span,
 #hud .reload span,
@@ -169,7 +176,7 @@ canvas { display: block; }
 #hud .repair span,
 #hud .hit span,
 #hud .weapon span {
-  font-family: var(--font-headline); font-size: 15px; font-weight: 400;
+  font-family: var(--font-headline); font-size: 17px; font-weight: 400;
   line-height: 1; letter-spacing: 0.04em; opacity: 0.85; text-shadow: var(--ui-shadow-sm);
 }
 #hud .hp[data-who="player"] span { color: var(--army-gold); opacity: 1; }
@@ -179,13 +186,13 @@ canvas { display: block; }
 #hud .overheat b,
 #hud .repair b,
 #hud .hit b,
-#hud .weapon b { font-weight: 600; font-size: 12px; text-align: right; text-shadow: var(--ui-shadow-sm); }
+#hud .weapon b { font-weight: 600; font-size: 13px; text-align: right; text-shadow: var(--ui-shadow-sm); }
 #hud .weapon span { color: var(--field-02); opacity: 1; }
 #hud .weapon b { text-align: left; color: var(--army-gold); letter-spacing: 0.04em; }
-#hud .weapon b { font-size: 14px; letter-spacing: 0.08em; }
+#hud .weapon b { font-size: 15px; letter-spacing: 0.08em; }
 #hud .weapon.mg b { color: var(--army-tan); }
 #hud .repair span {
-  color: #c8ff7a; opacity: 1; font-size: 18px; letter-spacing: 0.06em;
+  color: #c8ff7a; opacity: 1; font-size: 20px; letter-spacing: 0.06em;
   animation: repair-blink 0.7s ease-in-out infinite;
 }
 #hud .repair b { color: #e4ffc4; }
@@ -203,13 +210,13 @@ canvas { display: block; }
 #hud .overheat-bar,
 #hud .repair-bar,
 #hud .hit-bar {
-  height: 10px; background: rgba(34, 31, 32, 0.65); border: 1px solid rgba(191, 184, 166, 0.35);
+  height: 11px; background: rgba(34, 31, 32, 0.65); border: 1px solid rgba(191, 184, 166, 0.35);
   border-radius: 2px; overflow: hidden;
 }
 #hud .hp-bar i { display: block; height: 100%; width: 100%; background: #8fbf4a; transition: width 0.25s; }
 #hud .hp.hurt .hp-bar i { background: var(--army-gold); }
 #hud .hp.dead .hp-bar i { background: #c0392b; }
-#hud .nitro-bar { height: 8px; border-color: rgba(80, 220, 230, 0.45); }
+#hud .nitro-bar { height: 9px; border-color: rgba(80, 220, 230, 0.45); }
 #hud .nitro-bar i {
   display: block; height: 100%; width: 100%;
   background: linear-gradient(90deg, #1aa8b8, #3de8f0);
@@ -219,7 +226,7 @@ canvas { display: block; }
 #hud .nitro.active .nitro-bar i { background: linear-gradient(90deg, #2bc8d4, #7cf7ff); }
 #hud .nitro.empty .nitro-bar i { background: #1a4a52; box-shadow: none; }
 #hud .hit-bar {
-  height: 8px; border-color: rgba(255, 106, 74, 0.45);
+  height: 9px; border-color: rgba(255, 106, 74, 0.45);
 }
 #hud .hit-bar i {
   display: block; height: 100%; width: 0%;
@@ -248,18 +255,18 @@ canvas { display: block; }
 #hud .overheat.locked .overheat-bar i {
   background: linear-gradient(90deg, #ff4a1a, #ffb020);
 }
-#hud .repair-bar { height: 10px; border-color: rgba(160, 255, 110, 0.65); }
+#hud .repair-bar { height: 11px; border-color: rgba(160, 255, 110, 0.65); }
 #hud .repair-bar i {
   display: block; height: 100%; width: 0%;
   background: linear-gradient(90deg, #2f9d3a, #b6ff6a);
   box-shadow: 0 0 8px rgba(150, 255, 90, 0.45);
   transition: width 0.08s linear;
 }
-#hud .ai-debug { font-size: 11px; opacity: 0.75; text-shadow: var(--ui-shadow-sm); white-space: pre; }
+#hud .ai-debug { font-size: 12px; opacity: 0.75; text-shadow: var(--ui-shadow-sm); white-space: pre; }
 
 /* Hull fixed (up = body forward); rotating cupola + barrel = turret yaw */
 #hud #turret-compass {
-  width: 88px; height: 88px; margin-top: 4px;
+  width: 97px; height: 97px;
   filter: drop-shadow(var(--ui-shadow-sm));
 }
 #hud #turret-compass.hidden { display: none !important; }
@@ -285,7 +292,7 @@ canvas { display: block; }
   --msg-clip-hidden: inset(calc(var(--msg-clip-pad) * -1) calc(100% + var(--msg-clip-pad)) calc(var(--msg-clip-pad) * -1) calc(var(--msg-clip-pad) * -1));
   --msg-clip-visible: inset(calc(var(--msg-clip-pad) * -1));
   --msg-clip-gone: inset(calc(var(--msg-clip-pad) * -1) calc(var(--msg-clip-pad) * -1) calc(var(--msg-clip-pad) * -1) calc(100% + var(--msg-clip-pad)));
-  position: absolute; left: 50%; top: 22%; transform: translateX(-50%);
+  position: absolute; left: 50%; top: 12%; transform: translateX(-50%);
   display: flex; flex-direction: column; align-items: center; gap: 12px;
   text-align: center; max-width: 94vw;
   overflow: visible;

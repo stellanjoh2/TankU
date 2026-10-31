@@ -4,27 +4,31 @@ export function createHud() {
   const root = document.createElement('div');
   root.id = 'hud';
   root.innerHTML = `
-    <div class="hp" data-who="player"><span>YOU</span><div class="hp-bar"><i></i></div><b>100%</b></div>
-    <div class="repair hidden" data-who="repair"><span>REPAIRING</span><div class="repair-bar"><i></i></div><b>5.0s</b></div>
-    <div class="hit hidden" data-who="player-hit"><span>HIT</span><div class="hit-bar"><i></i></div><b>100%</b></div>
-    <div class="nitro" data-who="nitro"><span>NITRO</span><div class="nitro-bar"><i></i></div><b>100%</b></div>
-    <div class="weapon" data-who="weapon"><span>GUN</span><b>MAIN GUN</b></div>
-    <div class="reload hidden" data-who="reload"><span>RELOAD</span><div class="reload-bar"><i></i></div><b>0.0s</b></div>
-    <div class="overheat hidden" data-who="overheat"><span>HEAT</span><div class="overheat-bar"><i></i></div><b>0.0s</b></div>
-    <div id="turret-compass" aria-hidden="true">
-      <svg viewBox="0 0 80 80">
-        <circle class="ring" cx="40" cy="40" r="36"/>
-        <g class="hull">
-          <path d="M40 12 L54 36 L47 36 L47 58 L33 58 L33 36 L26 36 Z"/>
-        </g>
-        <g class="turret">
-          <path class="barrel" d="M38 40 L38 14 L40 8 L42 14 L42 40 Z"/>
-          <circle class="cupola" cx="40" cy="40" r="9"/>
-        </g>
-        <circle class="tick" cx="40" cy="6" r="2.2"/>
-      </svg>
+    <div class="hud-left">
+      <div class="hp" data-who="player"><span>YOU</span><div class="hp-bar"><i></i></div><b>100%</b></div>
+      <div class="repair hidden" data-who="repair"><span>REPAIRING</span><div class="repair-bar"><i></i></div><b>5.0s</b></div>
+      <div class="hit hidden" data-who="player-hit"><span>HIT</span><div class="hit-bar"><i></i></div><b>100%</b></div>
+      <div class="nitro" data-who="nitro"><span>NITRO</span><div class="nitro-bar"><i></i></div><b>100%</b></div>
+      <div class="weapon" data-who="weapon"><span>GUN</span><b>MAIN GUN</b></div>
+      <div class="reload hidden" data-who="reload"><span>RELOAD</span><div class="reload-bar"><i></i></div><b>0.0s</b></div>
+      <div class="overheat hidden" data-who="overheat"><span>HEAT</span><div class="overheat-bar"><i></i></div><b>0.0s</b></div>
+      <div class="ai-debug hidden"></div>
     </div>
-    <div class="ai-debug hidden"></div>`;
+    <div class="hud-right">
+      <div id="turret-compass" aria-hidden="true">
+        <svg viewBox="0 0 80 80">
+          <circle class="ring" cx="40" cy="40" r="36"/>
+          <g class="hull">
+            <path d="M40 12 L54 36 L47 36 L47 58 L33 58 L33 36 L26 36 Z"/>
+          </g>
+          <g class="turret">
+            <path class="barrel" d="M38 40 L38 14 L40 8 L42 14 L42 40 Z"/>
+            <circle class="cupola" cx="40" cy="40" r="9"/>
+          </g>
+          <circle class="tick" cx="40" cy="6" r="2.2"/>
+        </svg>
+      </div>
+    </div>`;
   const flash = document.createElement('div');
   flash.id = 'hit-flash';
   const dirRoot = document.createElement('div');

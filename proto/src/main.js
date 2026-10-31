@@ -9,7 +9,7 @@ import { SkyMesh } from 'three/examples/jsm/objects/SkyMesh.js';
 import { uniform, vec4 } from 'three/tsl';
 import { createPost } from './post.js';
 import { createSunLensFlare, createExplosionLensFlare } from './lensFlare.js';
-import { buildTerrain, heightAt, isGrassable, PLAYER_SPAWN, BRIDGE, ENEMY_SPAWN, ENEMY_SPAWN_BASE, WATER_Y, shoreSigned } from './terrain.js';
+import { buildTerrain, heightAt, isGrassable, onBridge, isAirfield, isPort, PLAYER_SPAWN, BRIDGE, ENEMY_SPAWN, ENEMY_SPAWN_BASE, WATER_Y, shoreSigned } from './terrain.js';
 import { buildProps } from './props.js';
 import { buildAirfield } from './airfield.js';
 import { buildPort } from './port.js';
@@ -695,6 +695,8 @@ async function main() {
   // Esc that exits pointer-lock must not also count as "resume" on the same keypress.
   let escHeld = false;
   let suppressEscResume = false;
+  // Download gesture unlocks the pointer — don't treat that as a pause.
+  let suppressPointerPause = false;
   const overlayEl = $('overlay');
   const canvasEl = renderer.domElement;
   overlayEl.classList.add('hidden');
@@ -746,7 +748,7 @@ async function main() {
   document.addEventListener('pointerlockchange', () => {
     if (document.pointerLockElement === canvasEl) {
       setMenuPaused(false);
-    } else if (!visuals.open) {
+    } else if (!visuals.open && !suppressPointerPause) {
       setMenuPaused(true);
       if (escHeld) suppressEscResume = true;
     }
@@ -826,7 +828,66 @@ async function main() {
     if (code === 'KeyR' && radial.isOpen) radial.release();
   };
 
+  // P = printscreen: one 1920×1080 PNG via the browser download (usually ~/Downloads).
+  const SHOT_W = 1920;
+  const SHOT_H = 1080;
+  let wantShot = false;
+  let shotBusy = false;
+  const _shotSize = new THREE.Vector2();
+
+  function captureScreenshot(bright) {
+    if (shotBusy) return;
+    shotBusy = true;
+    const reacquire = !menuPaused && !visuals.open;
+    if (reacquire) suppressPointerPause = true;
+    const prevPr = renderer.getPixelRatio();
+    renderer.getSize(_shotSize);
+    const prevAspect = camera.aspect;
+
+    camera.aspect = SHOT_W / SHOT_H;
+    camera.updateProjectionMatrix();
+    renderer.setPixelRatio(1);
+    renderer.setSize(SHOT_W, SHOT_H, false);
+    post.setSize(SHOT_W, SHOT_H);
+    post.render(0, bright, sunDir);
+
+    // Snapshot before restoring the live drawing buffer (toBlob alone races the resize).
+    const copy = document.createElement('canvas');
+    copy.width = SHOT_W;
+    copy.height = SHOT_H;
+    copy.getContext('2d').drawImage(renderer.domElement, 0, 0);
+
+    camera.aspect = prevAspect;
+    camera.updateProjectionMatrix();
+    renderer.setPixelRatio(prevPr);
+    renderer.setSize(_shotSize.x, _shotSize.y, false);
+    post.setSize(_shotSize.x, _shotSize.y);
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    copy.toBlob((blob) => {
+      shotBusy = false;
+      if (!blob) {
+        suppressPointerPause = false;
+        return;
+      }
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `tanku-${stamp}.png`;
+      a.click();
+      URL.revokeObjectURL(url);
+      if (reacquire) {
+        canvasEl.requestPointerLock();
+        setTimeout(() => { suppressPointerPause = false; }, 100);
+      }
+    }, 'image/png');
+  }
+
   input.onPress = (code) => {
+    if (code === 'KeyP') {
+      wantShot = true;
+      return;
+    }
     if (code === 'Escape') {
       if (visuals.open) { visuals.setOpen(false); return; }
       if (radial.isOpen) { radial.close(); return; }
@@ -1166,6 +1227,8 @@ async function main() {
       const amount = Math.min(1, Math.abs(s.speed) / 8) * 0.5;
       if (t.grounded && amount > 0.05) {
         dustPoint.set(-2.4 * Math.sign(s.speed || 1), 0.15, s.z).applyMatrix4(mw);
+        // No track dust on bridge / apron / quay (wood + concrete).
+        if (onBridge(dustPoint.x, dustPoint.z, 0.5) || isAirfield(dustPoint.x, dustPoint.z) || isPort(dustPoint.x, dustPoint.z)) continue;
         fx.dust(dustPoint, amount);
       }
     }
@@ -1212,6 +1275,7 @@ async function main() {
       kickBack.set(-sign, 0, 0).transformDirection(mw);
       for (const s of t.sides) {
         dustPoint.set(-2.35 * sign, 0.1, s.z).applyMatrix4(mw);
+        if (onBridge(dustPoint.x, dustPoint.z, 0.5) || isAirfield(dustPoint.x, dustPoint.z) || isPort(dustPoint.x, dustPoint.z)) continue;
         kickOut.set(0, 0, Math.sign(s.z || 1)).transformDirection(mw);
         fx.trackKick(dustPoint, accel, { back: kickBack, out: kickOut });
       }
@@ -1318,7 +1382,7 @@ async function main() {
       const shot = tank.tryFire(smoke.missBonus(p.x, p.z, tp.x, tp.z));
       if (shot) {
         fx.fire({ ...shot, owner: tank.body });
-        fx.muzzleFlash(shot.pos, shot.dir);
+        fx.muzzleFlash(shot.pos, shot.dir, 'player');
         tankCam.kick(0.5, RELOAD);
         sfx.fire();
         input.rumble(1, 0.92, 340);
@@ -1343,7 +1407,7 @@ async function main() {
           const shot = e.tryFire(smoke.missBonus(ep.x, ep.z, pp.x, pp.z));
           if (shot) {
             fx.fire({ ...shot, owner: pose.body });
-            fx.muzzleFlash(shot.pos, shot.dir);
+            fx.muzzleFlash(shot.pos, shot.dir, foe.mgId);
             foe.ai.onFired();
             const hearD = shot.pos.distanceTo(playerPose.position);
             sfx.fire(0.9 * distGain(hearD, 160), hearD);
@@ -1362,7 +1426,10 @@ async function main() {
     };
     const mgDt = paused ? 0 : dt;
     const mgFire = tank.tickMg(mgDt, !paused && useMg && inp.fire && playerPose.alive && !flying);
+    // Keep main-gun linger smoke locked to the live muzzle (follows turret turn).
+    if (playerPose.alive) fx.setMainMuzzle(tank.muzzle(), 'player');
     for (const { foe, pose } of foeGunners) {
+      if (versus && pose.alive) fx.setMainMuzzle(foe.tank.muzzle(), foe.mgId);
       const want = versus && !paused && pose.alive && foe.ai.wantsMg;
       const on = foe.tank.tickMg(versus ? mgDt : 0, want);
       if (on) {
@@ -1466,6 +1533,10 @@ async function main() {
       for (const f of foes) if (f.tank.emissiveHot()) { bright = true; break; }
     }
     post.render(freezeDt, bright, sunDir);
+    if (wantShot) {
+      wantShot = false;
+      captureScreenshot(bright);
+    }
   }
 
   function frame(now) {

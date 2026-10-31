@@ -12,7 +12,7 @@ import {
 } from './fxPools.js';
 
 /** Shared glow. Peak channel is this; a tint keeps its hue. */
-const SPRITE_EMISSIVE = 2.6;
+const SPRITE_EMISSIVE = 2.6 * 1.5;
 
 function toEmissiveLevel(hdr) {
   const col = hdr.isColor ? hdr.clone() : new THREE.Color(hdr);
@@ -99,6 +99,47 @@ const GROUND_EXPLOSION = {
   glowLife: 0.5,
 };
 
+/** Main-gun hit on tanks / props — 6×3 sheet, RGB on black. UV inset hides cell borders. */
+const SHELL_IMPACT = {
+  url: './textures/vfx/T_shell_impact_explosion.png',
+  cols: 6,
+  rows: 3,
+  frames: 18,
+  // ~0.6 s — same punch as the old 8@16, with smoother in-betweens.
+  fps: 30,
+  height: 12.5,
+  // ~18 px on a ~296 px cell — clears the white SubUV lines + mip bleed
+  // (denser 6×3 grid needs a larger fraction than the old 4×2 / metal sheet).
+  inset: 0.06,
+  emissive: SPRITE_EMISSIVE * 1.5 * 1.5,
+  mips: true,
+  // Soft-out from ~halfway so late smoke frames dissolve instead of popping.
+  fadeStart: 0.5,
+  // Grow through the flipbook: 0% → 150% of `height` (ease-out).
+  scaleFrom: 0,
+  scaleTo: 1.5,
+};
+
+/** Dirt blast ring, flat on the ground. Grows 0 → ~56 m over 0.5 s (ease-out) while fading out. */
+const SHELL_SHOCKWAVE = {
+  url: './textures/vfx/T_shell_shockwave.png',
+  life: 0.5,
+  endSize: 45 * 1.25,
+  mips: true,
+};
+
+/** Scorched-earth ground decal after a main-gun dirt blast. Draped on the heightfield. */
+const SCORCHED_EARTH = {
+  url: './textures/vfx/T_scorched_earth.png',
+  size: 10,
+  life: 8,
+  /** Hold full strength, then fade the rest of the life. */
+  fadeStart: 0.45,
+  lift: 0.05,
+  segs: 20,
+  poolSize: 8,
+};
+
 /** MG ground hit — 4-frame soil splash (left → right on the atlas). */
 const MG_SOIL_IMPACT = {
   url: './textures/vfx/T_mg_soil_impact.png',
@@ -119,6 +160,20 @@ const MG_WATER_IMPACT = {
   height: 4.2,
 };
 
+/** MG metal hit (tanks / metal props) — 4×2 sheet, sparks spray toward +X. */
+const MG_METAL_IMPACT = {
+  url: './textures/vfx/T_mg_metal_impact.png',
+  cols: 4,
+  rows: 2,
+  frames: 8,
+  fps: 20,
+  height: 3.25,
+  inset: 0.04,
+  mips: true,
+  /** Flash origin in the cell (left-biased). */
+  originU: 0.28,
+};
+
 /** Main-gun muzzle. Two 4-frame strips, RGB on black. Side sheet's point aims left. */
 const MAIN_MUZZLE = {
   frontUrl: './textures/vfx/T_turret_muzzle_front.png',
@@ -131,6 +186,58 @@ const MAIN_MUZZLE = {
   height: 6,
   // White scale so the painted orange stays. Same peak as every other glow sprite.
   emissive: SPRITE_EMISSIVE,
+};
+
+/** Post-shot barrel smoke: big dust burst on fire, then linger puffs pushed out the bore. */
+const MAIN_MUZZLE_SMOKE = {
+  life: 1.15,
+  /** Linger emit rate at t=0 (puffs / s), ease-out. +25% vs first pass. */
+  rate: 20,
+  /** Along-bore push (m/s); ×3 vs first pass so the cloud reaches downrange. */
+  push: 13.5,
+  /** Soft drag so speed eases out as the puff settles. */
+  drag: 0.85,
+};
+
+/** Soft volumetric puff (replaces the old flat radial). Tinted per use via instanceColor. */
+const SMOKE_PUFF = {
+  url: './textures/vfx/T_smoke_puff.png',
+  /** Max yaw drift while a puff is alive. */
+  spinMax: (10 * Math.PI) / 180,
+  /** Share of smoke that uses the old flat radial (+25% vs the first 25% mix). */
+  flatChance: 0.25 * 1.25,
+};
+
+/** Smoke grenade + MG discharge puff (separate atlas from general smoke). */
+const SMOKE_DISCHARGE = {
+  url: './textures/vfx/T_smoke_discharge.png',
+};
+
+/**
+ * Smoke colour kit — `tex` multiplies the puff atlas; `flat` paints the old radial
+ * so both boards read as the same hue when mixed.
+ *  bright — main gun / MG / ground impacts (matches the painted puff)
+ *  dark   — fires + man-made (tank/prop) impacts
+ *  beige  — sand / track dust
+ *  white  — water
+ */
+const SMOKE_TINT = {
+  bright: {
+    tex: [1, 0.99, 0.96],
+    flat: [0.76, 0.72, 0.66],
+  },
+  dark: {
+    tex: [0.28, 0.27, 0.26],
+    flat: [0.20, 0.19, 0.18],
+  },
+  beige: {
+    tex: [0.95, 0.82, 0.62],
+    flat: [0.78, 0.64, 0.44],
+  },
+  white: {
+    tex: [1.12, 1.16, 1.2],
+    flat: [0.88, 0.93, 0.96],
+  },
 };
 
 /** Shared by muzzle flash + in-flight shell so both stay in sync while tuning. */
@@ -323,14 +430,16 @@ function sparkBurstTexture(seed) {
   return t;
 }
 
-/** Sub-UV into an atlas from a per-instance frame index (row 0 = top of image). */
-function atlasUvNode(frameNode, cols, rows) {
+/** Sub-UV into an atlas from a per-instance frame index (row 0 = top of image).
+ *  `inset` (0..0.5) shrinks each cell so SubUV grid lines stay off-screen. */
+function atlasUvNode(frameNode, cols, rows, inset = 0) {
   const c = float(cols);
   const r = float(rows);
   const col = frameNode.mod(c);
   const row = frameNode.div(c).floor();
   const u = uv();
-  return vec2(col.add(u.x).div(c), r.sub(row.add(float(1))).add(u.y).div(r));
+  const uIn = inset > 0 ? u.mul(float(1 - 2 * inset)).add(float(inset)) : u;
+  return vec2(col.add(uIn.x).div(c), r.sub(row.add(float(1))).add(uIn.y).div(r));
 }
 
 const _cardM = new THREE.Matrix4();
@@ -360,8 +469,14 @@ export class Effects {
     /** Fired from every `_explode` (shell, drum, wreck) — cheap post lens ghosts. */
     this.onExplosionFlare = () => {};
     this.groundExplosionAtlas = null;
+    this.shellImpactAtlas = null;
+    this.shellShockwaveTex = null;
+    this.scorchTex = null;
+    this._scorchPool = null;
+    this._scorches = [];
     this.mgSoilImpactAtlas = null;
     this.mgWaterImpactAtlas = null;
+    this.mgMetalImpactAtlas = null;
     this.impactGlowTex = null;
 
     this.flashTex = radialTexture([[0, '#ffffff'], [0.25, '#ffd28a'], [0.6, 'rgba(255,120,30,0.35)'], [1, 'rgba(255,80,0,0)']]);
@@ -372,7 +487,9 @@ export class Effects {
     this.damageFire = null;
     this._camQInv = new THREE.Quaternion();
     this._streakV = new THREE.Vector3();
+    // Soft volumetric puff (swapped in load). Flat radial kept for a 25% mix.
     this.smokeTex = radialTexture([[0, 'rgba(255,255,255,0.9)'], [0.5, 'rgba(255,255,255,0.35)'], [1, 'rgba(255,255,255,0)']]);
+    this.smokeFlatTex = this.smokeTex;
     // Unlit HDR streak. Beauty color feeds the full-image bloom; toneMapped off keeps it hot.
     // radiusTop is the tail after rotateZ(+90°); radiusBottom is the nose.
     this.shellGeo = new THREE.CylinderGeometry(0.12, 0.054, SHELL_GEO_LEN, 6).rotateZ(Math.PI / 2);
@@ -427,6 +544,8 @@ export class Effects {
     this.mgFlashD = null;
     // Active .50 streams: id → { pose, owner, shotT, flashAge, flash, roll }
     this._mgStreams = new Map();
+    // Main-gun barrel smoke after a shot: id → { age, life, pos, dir, emitAcc }
+    this._mainSmokeStreams = new Map();
     this._mgUp = new THREE.Vector3();
     this._mgSide = new THREE.Vector3();
     this._mgSide2 = new THREE.Vector3();
@@ -448,7 +567,7 @@ export class Effects {
     this._shellDir = new THREE.Vector3();
     this._hitPoint = new THREE.Vector3();
     this._hitNormal = new THREE.Vector3();
-    this._puffTint = new THREE.Color(0.78, 0.70, 0.55);
+    this._puffTint = new THREE.Color(1, 1, 1);
     this._shellHit = new THREE.Vector3();
     this._boomPos = new THREE.Vector3();
     this._boomN = new THREE.Vector3();
@@ -460,7 +579,11 @@ export class Effects {
     this._yAxis = new THREE.Vector3(0, 1, 0);
 
     // One material per batch. Slots are reused for the whole match.
-    this._smokeBoard = createBillboard(scene, this.smokeTex, 320, { renderOrder: 1 });
+    this._smokeBoard = createBillboard(scene, this.smokeTex, 280, { renderOrder: 1 });
+    // Larger pool — smoke grenade uses only these soft radials.
+    this._smokeFlatBoard = createBillboard(scene, this.smokeFlatTex, 220, { renderOrder: 1 });
+    // Placeholder until load swaps in T_smoke_discharge.png.
+    this._smokeDischargeBoard = createBillboard(scene, this.smokeTex, 160, { renderOrder: 1 });
     this._flashBoard = createBillboard(scene, this.flashTex, 256, { emissive: true, renderOrder: 3 });
     this._streakBoard = createBillboard(scene, this.streakTex, 160, { emissive: true, renderOrder: 3 });
     this._burstBoards = this.burstTexs.map((tex) => createBillboard(scene, tex, 8, { emissive: true, renderOrder: 4 }));
@@ -484,7 +607,10 @@ export class Effects {
 
   async load() {
     const loader = new THREE.TextureLoader();
-    const [tex, glowMap, starMap, plumeMap, muzzleFront, muzzleSide, soilMap, waterMap] = await Promise.all([
+    const [
+      tex, glowMap, starMap, plumeMap, muzzleFront, muzzleSide,
+      soilMap, waterMap, shellImpactMap, mgMetalMap, shockwaveMap, scorchMap, smokeMap, dischargeMap,
+    ] = await Promise.all([
       loader.loadAsync(GROUND_EXPLOSION.url),
       loader.loadAsync(GROUND_EXPLOSION.glowUrl),
       loader.loadAsync(MG_FLASH.starUrl),
@@ -493,6 +619,12 @@ export class Effects {
       loader.loadAsync(MAIN_MUZZLE.sideUrl),
       loader.loadAsync(MG_SOIL_IMPACT.url),
       loader.loadAsync(MG_WATER_IMPACT.url),
+      loader.loadAsync(SHELL_IMPACT.url),
+      loader.loadAsync(MG_METAL_IMPACT.url),
+      loader.loadAsync(SHELL_SHOCKWAVE.url),
+      loader.loadAsync(SCORCHED_EARTH.url),
+      loader.loadAsync(SMOKE_PUFF.url),
+      loader.loadAsync(SMOKE_DISCHARGE.url),
     ]);
     tex.colorSpace = THREE.SRGBColorSpace;
     tex.magFilter = THREE.LinearFilter;
@@ -508,8 +640,43 @@ export class Effects {
       m.generateMipmaps = false;
       m.wrapS = m.wrapT = THREE.ClampToEdgeWrapping;
     }
+    // New impact sheets: mip at distance (atlas cells use a larger UV inset to avoid bleed).
+    for (const m of [shellImpactMap, mgMetalMap, shockwaveMap, scorchMap]) {
+      m.colorSpace = THREE.SRGBColorSpace;
+      m.magFilter = THREE.LinearFilter;
+      m.minFilter = THREE.LinearMipmapLinearFilter;
+      m.generateMipmaps = true;
+      m.wrapS = m.wrapT = THREE.ClampToEdgeWrapping;
+    }
     this.mgSoilImpactAtlas = soilMap;
     this.mgWaterImpactAtlas = waterMap;
+    this.shellImpactAtlas = shellImpactMap;
+    this.mgMetalImpactAtlas = mgMetalMap;
+    this.shellShockwaveTex = shockwaveMap;
+    this.scorchTex = scorchMap;
+
+    for (const m of [smokeMap, dischargeMap]) {
+      m.colorSpace = THREE.SRGBColorSpace;
+      m.magFilter = THREE.LinearFilter;
+      m.minFilter = THREE.LinearMipmapLinearFilter;
+      m.generateMipmaps = true;
+      m.wrapS = m.wrapT = THREE.ClampToEdgeWrapping;
+    }
+    this.smokeTex = smokeMap;
+    this.smokeDischargeTex = dischargeMap;
+    // Rebuild smoke batches on the real puff textures (material samples map at create time).
+    if (this._smokeBoard) {
+      this.scene.remove(this._smokeBoard.mesh);
+      this._smokeBoard.mesh.geometry.dispose();
+      this._smokeBoard.mesh.material.dispose();
+    }
+    this._smokeBoard = createBillboard(this.scene, this.smokeTex, 280, { renderOrder: 1 });
+    if (this._smokeDischargeBoard) {
+      this.scene.remove(this._smokeDischargeBoard.mesh);
+      this._smokeDischargeBoard.mesh.geometry.dispose();
+      this._smokeDischargeBoard.mesh.material.dispose();
+    }
+    this._smokeDischargeBoard = createBillboard(this.scene, this.smokeDischargeTex, 160, { renderOrder: 1 });
 
     glowMap.colorSpace = THREE.SRGBColorSpace;
     glowMap.magFilter = THREE.LinearFilter;
@@ -703,6 +870,22 @@ export class Effects {
         blast: true,
       });
     }
+    if (this.shellImpactAtlas) {
+      this._ensureCardPool('shell-impact', this.shellImpactAtlas, {
+        cols: SHELL_IMPACT.cols,
+        rows: SHELL_IMPACT.rows,
+        frames: SHELL_IMPACT.frames,
+        fps: SHELL_IMPACT.fps,
+        inset: SHELL_IMPACT.inset,
+        emissive: SHELL_IMPACT.emissive,
+        mips: SHELL_IMPACT.mips,
+        fadeStart: SHELL_IMPACT.fadeStart,
+        poolSize: 8,
+        impact: true,
+      });
+    }
+    if (this.shellShockwaveTex) this._ensureShockwavePool();
+    if (this.scorchTex) this._ensureScorchPool();
     if (this.mgSoilImpactAtlas) {
       this._ensureCardPool('mg-soil', this.mgSoilImpactAtlas, {
         cols: MG_SOIL_IMPACT.cols,
@@ -723,6 +906,18 @@ export class Effects {
         soil: true,
       });
     }
+    if (this.mgMetalImpactAtlas) {
+      this._ensureCardPool('mg-metal', this.mgMetalImpactAtlas, {
+        cols: MG_METAL_IMPACT.cols,
+        rows: MG_METAL_IMPACT.rows,
+        frames: MG_METAL_IMPACT.frames,
+        fps: MG_METAL_IMPACT.fps,
+        inset: MG_METAL_IMPACT.inset,
+        mips: MG_METAL_IMPACT.mips,
+        poolSize: 16,
+        impact: true,
+      });
+    }
     if (this.mainMuzzleFront) {
       this._ensureCardPool('muzzle-front', this.mainMuzzleFront, MAIN_MUZZLE);
     }
@@ -731,7 +926,7 @@ export class Effects {
     }
     if (this.impactGlowTex && !this._glowBoard) {
       this._glowBoard = createBillboard(this.scene, this.impactGlowTex, 8, {
-        emissive: true, renderOrder: 5, depthTest: false,
+        emissive: true, renderOrder: 5,
       });
     }
   }
@@ -746,10 +941,40 @@ export class Effects {
     L.fade = fade;
   }
 
-  /** Soft puff. Additive flames share the flash billboard; smoke shares one material. */
-  _sprite(tex, color, pos, size, life, opts = {}) {
+  /**
+   * Resolve a smoke kit tint for the board in use (puff atlas vs flat radial).
+   * @param {'bright'|'dark'|'beige'|'white'} kind
+   * @param {boolean} flat
+   */
+  _smokeTint(kind, flat) {
+    const kit = SMOKE_TINT[kind] || SMOKE_TINT.bright;
+    const rgb = flat ? kit.flat : kit.tex;
+    const j = 1 + (Math.random() - 0.5) * 0.06;
+    return new THREE.Color(rgb[0] * j, rgb[1] * j, rgb[2] * j);
+  }
+
+  /**
+   * Soft puff. Additive flames share the flash billboard; smoke shares one material.
+   * Pass a THREE.Color, or a smoke kind string: 'bright' | 'dark' | 'beige' | 'white'.
+   */
+  _sprite(tex, colorOrKind, pos, size, life, opts = {}) {
     const additive = !!opts.additive;
-    const board = additive ? this._flashBoard : this._smokeBoard;
+    const discharge = !!opts.discharge;
+    const forceFlat = !!opts.flat;
+    if (!additive) {
+      // −25% spawn count on general smoke; discharge / forced flat keep full count.
+      if (!discharge && !forceFlat && Math.random() < 0.25) return;
+    }
+    // Flat radial mix (thickens the cloud when raised). Discharge atlas stays as-is.
+    const flat = forceFlat || (!additive && !discharge && Math.random() < SMOKE_PUFF.flatChance);
+    const board = additive
+      ? this._flashBoard
+      : flat
+        ? this._smokeFlatBoard
+        : (discharge ? this._smokeDischargeBoard : this._smokeBoard);
+    const color = typeof colorOrKind === 'string'
+      ? this._smokeTint(colorOrKind, flat)
+      : colorOrKind;
     const s = takeBillboard(board);
     s.mode = 'puff';
     s.pos.copy(pos);
@@ -757,7 +982,8 @@ export class Effects {
     s.life = life;
     s.size = size;
     s.grow = opts.grow ?? 1;
-    s.opacity = opts.opacity ?? 1;
+    // −25% opacity on smoke (new + flat mix); discharge atlas another −25% (true-alpha is dense).
+    s.opacity = (opts.opacity ?? 1) * (additive ? 1 : 0.75) * (discharge ? 0.75 : 1);
     s.drag = opts.drag ?? 1.5;
     s.rise = opts.rise ?? 0;
     s.fadeLinear = !!opts.fadeLinear;
@@ -768,6 +994,9 @@ export class Effects {
       if (peak > 0) s.color.multiplyScalar(SPRITE_EMISSIVE / peak);
     } else {
       s.color.copy(color);
+      // Random facing + ≤10° drift over life so stacked puffs don't look stamped.
+      s.rot = Math.random() * Math.PI * 2;
+      s.rotSpin = (Math.random() * 2 - 1) * SMOKE_PUFF.spinMax;
     }
   }
 
@@ -950,12 +1179,11 @@ export class Effects {
   /** Splash where an MG round meets the sea (flipbook + foam). */
   waterSplash(point) {
     this._mgWaterImpact(point);
-    const foam = new THREE.Color(0.85, 0.92, 0.95);
     const n = 5;
     for (let i = 0; i < n; i++) {
       this._sprite(
         this.smokeTex,
-        foam,
+        'white',
         point.clone().add(new THREE.Vector3((Math.random() - 0.5) * 0.45, 0.05, (Math.random() - 0.5) * 0.45)),
         0.27 + Math.random() * 0.21,
         0.35 + Math.random() * 0.2,
@@ -975,8 +1203,6 @@ export class Effects {
    */
   dirtPlume(point) {
     this._mgSoilImpact(point);
-    const sand = new THREE.Color(0.82, 0.72, 0.52);
-    const sandDark = new THREE.Color(0.55, 0.45, 0.30);
     // Core column — dense, rises fast, grows into a soft cloud (+50% size).
     const n = 5 + (Math.random() * 3) | 0;
     for (let i = 0; i < n; i++) {
@@ -993,7 +1219,7 @@ export class Effects {
       );
       this._sprite(
         this.smokeTex,
-        sand.clone().lerp(sandDark, Math.random() * 0.35),
+        'bright',
         origin,
         (0.22 + Math.random() * 0.18 + t * 0.12) * 1.5,
         0.38 + Math.random() * 0.28,
@@ -1010,7 +1236,7 @@ export class Effects {
     for (let i = 0; i < 3; i++) {
       this._sprite(
         this.smokeTex,
-        sand.clone().lerp(new THREE.Color(0.9, 0.85, 0.7), 0.4),
+        'bright',
         point.clone().add(new THREE.Vector3((Math.random() - 0.5) * 0.45, 0.05, (Math.random() - 0.5) * 0.45)),
         (0.14 + Math.random() * 0.12) * 1.5,
         0.45 + Math.random() * 0.25,
@@ -1078,8 +1304,13 @@ export class Effects {
       { color: dirt ? 0x8a6230 : 0xffb060, distance: dirt ? 8 : 14 },
     );
 
-    if (!dirt) this._mgSparkBurst(point, normal, bounce);
+    if (!dirt) {
+      this._mgMetalImpact(point, normal, bounce);
+      this._mgSparkBurst(point, normal, bounce);
+    }
 
+    // Metal particle spray sits under the new impact sheet — keep it a bit smaller.
+    const metalScale = dirt ? 1 : 0.75;
     const n = dirt
       ? 6 + Math.floor(Math.random() * 3)   // ~50% of metal count
       : 12 + Math.floor(Math.random() * 6);
@@ -1088,13 +1319,13 @@ export class Effects {
       ? emissiveRamp([2.4, 1.25, 0.4], [0.45, 0.22, 0.08])
       : emissiveRamp([20, 13, 5], [10, 1.8, 0.2]);
     for (let i = 0; i < n; i++) {
-      const size = dirt ? 0.14 + Math.random() * 0.2 : 0.0675 + Math.random() * 0.105;
+      const size = (dirt ? 0.14 + Math.random() * 0.2 : 0.0675 + Math.random() * 0.105) * metalScale;
       // Pivot near the hot head so the tail trails behind the direction of travel.
       this._hitPoint.copy(point).addScaledVector(normal, 0.04 + Math.random() * 0.08);
-      const along = dirt ? 5 + Math.random() * 9 : 10 + Math.random() * 18;
-      const spray = dirt ? 4 + Math.random() * 7 : 8 + Math.random() * 14;
+      const along = (dirt ? 5 + Math.random() * 9 : 10 + Math.random() * 18) * metalScale;
+      const spray = (dirt ? 4 + Math.random() * 7 : 8 + Math.random() * 14) * metalScale;
       const v = this._shellDir.copy(bounce).multiplyScalar(along * (0.55 + Math.random() * 0.45))
-        .addScaledVector(normal, (dirt ? 1 : 2) + Math.random() * (dirt ? 4 : 7))
+        .addScaledVector(normal, ((dirt ? 1 : 2) + Math.random() * (dirt ? 4 : 7)) * metalScale)
         .add(this._shellStep.set(Math.random() - 0.5, Math.random() - 0.15, Math.random() - 0.5).multiplyScalar(spray));
       this._spawnSpark(
         this._hitPoint, v, size,
@@ -1118,7 +1349,7 @@ export class Effects {
     }
     s.rot = ang + (Math.random() - 0.5) * 0.3;
     s.pos.copy(point).addScaledVector(normal, 0.06);
-    s.size = 1.1 + Math.random() * 0.5;
+    s.size = (1.1 + Math.random() * 0.5) * 0.75;
     s.life = 0.09 + Math.random() * 0.05;
     const peak = Math.max(12, 7, 2.2);
     s.color.setRGB(12, 7, 2.2).multiplyScalar(SPRITE_EMISSIVE / peak);
@@ -1177,7 +1408,7 @@ export class Effects {
     s.mesh.rotation.setFromQuaternion(s.mesh.quaternion);
   }
 
-  /** Small grey puffs out of the .50 cal muzzle each round. */
+  /** Small discharge puffs out of the .50 cal muzzle each round. */
   _mgSmoke(pos, dir) {
     const side = this._mgSide;
     const up = this._mgUp.set(0, 1, 0);
@@ -1185,7 +1416,8 @@ export class Effects {
     side.crossVectors(dir, up).normalize();
     up.crossVectors(side, dir).normalize();
 
-    const n = 2 + (Math.random() < 0.35 ? 1 : 0);
+    // +25% vs prior 2–3 puffs.
+    const n = 3 + (Math.random() < 0.4 ? 1 : 0);
     for (let i = 0; i < n; i++) {
       const origin = pos.clone()
         .addScaledVector(dir, 0.15 + Math.random() * 0.35)
@@ -1194,14 +1426,14 @@ export class Effects {
       const v = dir.clone().multiplyScalar(0.6 + Math.random() * 1.4)
         .addScaledVector(side, (Math.random() - 0.5) * 0.7)
         .addScaledVector(up, 0.35 + Math.random() * 0.9);
-      const grey = 0.40 + Math.random() * 0.18;
       this._sprite(
-        this.smokeTex,
-        new THREE.Color(grey, grey * 0.97, grey * 0.92),
+        this.smokeDischargeTex || this.smokeTex,
+        'bright',
         origin,
         0.35 + Math.random() * 0.35,
         1.4 + Math.random() * 1.2,
         {
+          discharge: true,
           vel: v,
           grow: 3.2 + Math.random() * 1.8,
           rise: 0.7 + Math.random() * 0.5,
@@ -1243,7 +1475,9 @@ export class Effects {
    * @param {THREE.Texture} atlasTex
    */
   _ensureCardPool(key, atlasTex, {
-    cols, rows, frames, fps, blast = false, soil = false, frameMap = null, poolSize = 4,
+    cols, rows, frames, fps, blast = false, soil = false, impact = false,
+    inset = 0, emissive = null, mips = false, frameMap = null, poolSize = 4,
+    fadeStart = 0.85,
   }) {
     if (!this._cardPools) this._cardPools = new Map();
     let pool = this._cardPools.get(key);
@@ -1254,8 +1488,13 @@ export class Effects {
     const n = poolSize;
     atlasTex.colorSpace = THREE.SRGBColorSpace;
     atlasTex.magFilter = THREE.LinearFilter;
-    atlasTex.minFilter = THREE.LinearFilter;
-    atlasTex.generateMipmaps = false;
+    if (mips) {
+      atlasTex.generateMipmaps = true;
+      atlasTex.minFilter = THREE.LinearMipmapLinearFilter;
+    } else {
+      atlasTex.generateMipmaps = false;
+      atlasTex.minFilter = THREE.LinearFilter;
+    }
 
     const frameAttr = new THREE.InstancedBufferAttribute(new Float32Array(n), 1);
     const fadeAttr = new THREE.InstancedBufferAttribute(new Float32Array(n), 1);
@@ -1263,7 +1502,7 @@ export class Effects {
     fadeAttr.setUsage(THREE.DynamicDrawUsage);
     const frameNode = instancedDynamicBufferAttribute(frameAttr, 'float');
     const fadeNode = instancedDynamicBufferAttribute(fadeAttr, 'float');
-    const sample = texture(atlasTex, atlasUvNode(frameNode, cols, rows));
+    const sample = texture(atlasTex, atlasUvNode(frameNode, cols, rows, inset));
 
     const mat = new THREE.MeshBasicNodeMaterial({
       color: new THREE.Color(0, 0, 0),
@@ -1290,12 +1529,17 @@ export class Effects {
       mat.blendSrcAlpha = THREE.ZeroFactor;
       mat.blendDstAlpha = THREE.OneFactor;
     } else {
-      const hdr = toEmissiveLevel(new THREE.Color(MAIN_MUZZLE.emissive, MAIN_MUZZLE.emissive, MAIN_MUZZLE.emissive));
+      // Muzzle + shell/MG impact sheets: RGB on black, additive emissive (screenspace cards).
+      // `emissive` is an absolute peak (skip renormalize so shell impacts can run hotter).
+      const peak = emissive ?? MAIN_MUZZLE.emissive;
+      const hdr = new THREE.Color(peak, peak, peak);
+      mat.colorNode = vec3(0, 0, 0);
       mat.emissiveNode = sample.rgb.mul(uniform(hdr)).mul(fadeNode);
       mat.opacityNode = fadeNode;
       mat.blending = THREE.AdditiveBlending;
     }
 
+    const billboard = blast || soil || impact;
     const mesh = new THREE.InstancedMesh(this.muzzleCardGeo, mat, n);
     mesh.count = n;
     mesh.frustumCulled = false;
@@ -1320,21 +1564,174 @@ export class Effects {
         instanceId: i,
         flipbook: {
           cols, rows, frames, fps, frame: -1, height: 0, frameMap,
-          cellW, cellH, billboard: blast || soil,
+          cellW, cellH, billboard, fadeStart,
         },
         pool: null,
         idle: true,
         age: 0,
         life: frames / fps,
         muzzleDir: null,
+        screenRot: null,
         fade: 1,
       });
     }
     mesh.instanceMatrix.needsUpdate = true;
-    pool = { free: slots.slice(), slots, mesh, frameAttr, fadeAttr, billboard: blast || soil };
+    pool = { free: slots.slice(), slots, mesh, frameAttr, fadeAttr, billboard };
     for (const s of slots) s.pool = pool;
     this._cardPools.set(key, pool);
     return pool;
+  }
+
+  /** Flat ground shockwave discs (normal alpha blend — not emissive). */
+  _ensureShockwavePool() {
+    if (this._shockwavePool || !this.shellShockwaveTex) return this._shockwavePool;
+    const n = 6;
+    const tex = this.shellShockwaveTex;
+    const fadeAttr = new THREE.InstancedBufferAttribute(new Float32Array(n), 1);
+    fadeAttr.setUsage(THREE.DynamicDrawUsage);
+    const fadeNode = instancedDynamicBufferAttribute(fadeAttr, 'float');
+    const sample = texture(tex);
+    const mat = new THREE.MeshBasicNodeMaterial({
+      color: new THREE.Color(0xffffff),
+      lights: false,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      fog: false,
+      blending: THREE.NormalBlending,
+    });
+    mat.colorNode = sample.rgb;
+    mat.opacityNode = sample.a.mul(fadeNode);
+    const mesh = new THREE.InstancedMesh(this.muzzleCardGeo, mat, n);
+    mesh.count = n;
+    mesh.frustumCulled = false;
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    mesh.renderOrder = 1;
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.scene.add(mesh);
+    // Lie flat on XZ (local +Y → world +Y via −90° about X).
+    const flatQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+    const slots = [];
+    for (let i = 0; i < n; i++) {
+      fadeAttr.setX(i, 0);
+      _cardS.set(0, 0, 0);
+      _cardP.set(0, -999, 0);
+      _cardQ.copy(flatQ);
+      _cardM.compose(_cardP, _cardQ, _cardS);
+      mesh.setMatrixAt(i, _cardM);
+      const obj = new THREE.Object3D();
+      obj.quaternion.copy(flatQ);
+      slots.push({
+        obj,
+        instanceId: i,
+        pool: null,
+        idle: true,
+        age: 0,
+        life: SHELL_SHOCKWAVE.life,
+        endSize: SHELL_SHOCKWAVE.endSize,
+        fade: 1,
+        shockwave: true,
+        flipbook: null,
+      });
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    const pool = { free: slots.slice(), slots, mesh, fadeAttr, flatQ };
+    for (const s of slots) s.pool = pool;
+    this._shockwavePool = pool;
+    return pool;
+  }
+
+  /** Soft scorched patches that drape on the heightfield (not flat cards). */
+  _ensureScorchPool() {
+    if (this._scorchPool || !this.scorchTex) return this._scorchPool;
+    const cfg = SCORCHED_EARTH;
+    const tex = this.scorchTex;
+    const slots = [];
+    for (let i = 0; i < cfg.poolSize; i++) {
+      const geo = new THREE.PlaneGeometry(cfg.size, cfg.size, cfg.segs, cfg.segs);
+      geo.rotateX(-Math.PI / 2);
+      const fadeU = uniform(0);
+      const sample = texture(tex);
+      const mat = new THREE.MeshBasicNodeMaterial({
+        color: new THREE.Color(0xffffff),
+        lights: false,
+        transparent: true,
+        depthWrite: false,
+        depthTest: true,
+        side: THREE.DoubleSide,
+        fog: false,
+        blending: THREE.NormalBlending,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -2,
+      });
+      mat.colorNode = sample.rgb;
+      mat.opacityNode = sample.a.mul(fadeU);
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.frustumCulled = true;
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      mesh.renderOrder = 0;
+      mesh.visible = false;
+      this.scene.add(mesh);
+      slots.push({
+        mesh,
+        fadeU,
+        idle: true,
+        age: 0,
+        life: cfg.life,
+      });
+    }
+    this._scorchPool = { free: slots.slice(), slots };
+    return this._scorchPool;
+  }
+
+  _takeScorch() {
+    const pool = this._ensureScorchPool();
+    let s = pool.free.pop();
+    if (!s) {
+      s = pool.slots[0];
+      for (const c of pool.slots) if (c.age > s.age) s = c;
+      const idx = this._scorches.indexOf(s);
+      if (idx >= 0) this._scorches.splice(idx, 1);
+    }
+    s.idle = false;
+    s.age = 0;
+    s.life = SCORCHED_EARTH.life;
+    s.fadeU.value = 1;
+    s.mesh.visible = true;
+    this._scorches.push(s);
+    return s;
+  }
+
+  /**
+   * 10×10 m burn mark, vertices snapped to terrain height so it won't clip hills.
+   * @param {THREE.Vector3} point
+   */
+  _spawnScorchedEarth(point) {
+    if (!this.scorchTex) return;
+    const cfg = SCORCHED_EARTH;
+    const s = this._takeScorch();
+    const cx = point.x;
+    const cz = point.z;
+    const cy = terrainHeightAt(cx, cz);
+    const yaw = Math.random() * Math.PI * 2;
+    const cos = Math.cos(yaw);
+    const sin = Math.sin(yaw);
+    s.mesh.position.set(cx, cy, cz);
+    s.mesh.rotation.set(0, yaw, 0);
+    const pos = s.mesh.geometry.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const lx = pos.getX(i);
+      const lz = pos.getZ(i);
+      const wx = cx + lx * cos - lz * sin;
+      const wz = cz + lx * sin + lz * cos;
+      pos.setY(i, terrainHeightAt(wx, wz) - cy + cfg.lift);
+    }
+    pos.needsUpdate = true;
+    s.mesh.geometry.computeBoundingSphere();
+    s.fadeU.value = 1;
   }
 
   _syncCardSlot(card) {
@@ -1347,8 +1744,18 @@ export class Effects {
       _cardM.compose(_cardP, _cardQ, _cardS);
       pool.mesh.setMatrixAt(i, _cardM);
       pool.fadeAttr.setX(i, 0);
+    } else if (card.shockwave) {
+      card.obj.updateMatrix();
+      pool.mesh.setMatrixAt(i, card.obj.matrix);
+      pool.fadeAttr.setX(i, card.fade);
     } else {
-      if (card.flipbook.billboard && this.camera) card.obj.quaternion.copy(this._camQ);
+      if (card.flipbook.billboard && this.camera) {
+        card.obj.quaternion.copy(this._camQ);
+        if (card.screenRot != null) {
+          _cardQ.setFromAxisAngle(_cardZ, card.screenRot);
+          card.obj.quaternion.multiply(_cardQ);
+        }
+      }
       card.obj.updateMatrix();
       pool.mesh.setMatrixAt(i, card.obj.matrix);
       const atlasFrame = card.flipbook.frameMap
@@ -1358,7 +1765,7 @@ export class Effects {
       pool.fadeAttr.setX(i, card.fade);
     }
     pool.mesh.instanceMatrix.needsUpdate = true;
-    pool.frameAttr.needsUpdate = true;
+    if (pool.frameAttr) pool.frameAttr.needsUpdate = true;
     pool.fadeAttr.needsUpdate = true;
   }
 
@@ -1389,6 +1796,38 @@ export class Effects {
     this._spawnMgImpact('mg-water', MG_WATER_IMPACT, this.mgWaterImpactAtlas, point);
   }
 
+  /** Screenspace metal-hit flipbook; spray aims along the on-screen ricochet. */
+  _mgMetalImpact(point, normal, bounce) {
+    const atlas = this.mgMetalImpactAtlas;
+    if (!atlas) return;
+    const cfg = MG_METAL_IMPACT;
+    const pool = this._ensureCardPool('mg-metal', atlas, {
+      cols: cfg.cols, rows: cfg.rows, frames: cfg.frames, fps: cfg.fps,
+      inset: cfg.inset, mips: cfg.mips, poolSize: 16, impact: true,
+    });
+    const card = this._takeCard(pool);
+    const h = cfg.height;
+    const { cellW, cellH } = card.flipbook;
+    const w = h * (cellW / cellH);
+    card.flipbook.height = h;
+    card.flipbook.frame = 0;
+    card.fade = 1;
+    card.obj.scale.set(w, h, 1);
+    // Shift along bounce so the left-biased flash (originU) sits on the contact.
+    const along = (0.5 - cfg.originU) * w;
+    card.obj.position.copy(point).addScaledVector(normal, 0.08);
+    if (bounce && bounce.lengthSq() > 1e-8) {
+      card.obj.position.addScaledVector(bounce, along);
+    }
+    let ang = Math.random() * Math.PI * 2;
+    if (this.camera && bounce) {
+      const v = this._streakV.copy(bounce).applyQuaternion(this._camQInv);
+      if (Math.hypot(v.x, v.y) > 0.15) ang = Math.atan2(v.y, v.x);
+    }
+    card.screenRot = ang;
+    this._syncCardSlot(card);
+  }
+
   _takeCard(pool) {
     let s = pool.free.pop();
     if (!s) {
@@ -1400,10 +1839,111 @@ export class Effects {
     s.idle = false;
     s.age = 0;
     s.muzzleDir = null;
-    s.flipbook.frame = 0;
+    s.screenRot = null;
+    s.baseW = 0;
+    s.baseH = 0;
+    s.scaleFrom = null;
+    s.scaleTo = null;
+    if (s.flipbook) s.flipbook.frame = 0;
     s.fade = 1;
     this.particles.push(s);
     return s;
+  }
+
+  /** Main-gun non-ground hit — emissive screenspace fireball flipbook. */
+  _shellImpactExplosion(point) {
+    const atlas = this.shellImpactAtlas;
+    if (!atlas) return;
+    const cfg = SHELL_IMPACT;
+    const pool = this._ensureCardPool('shell-impact', atlas, {
+      cols: cfg.cols, rows: cfg.rows, frames: cfg.frames, fps: cfg.fps,
+      inset: cfg.inset, emissive: cfg.emissive, mips: cfg.mips, poolSize: 8, impact: true,
+      fadeStart: cfg.fadeStart,
+    });
+    const card = this._takeCard(pool);
+    const h = cfg.height;
+    const { cellW, cellH } = card.flipbook;
+    const w = h * (cellW / cellH);
+    card.flipbook.height = h;
+    card.flipbook.frame = 0;
+    card.fade = 1;
+    card.baseW = w;
+    card.baseH = h;
+    card.scaleFrom = cfg.scaleFrom;
+    card.scaleTo = cfg.scaleTo;
+    const s0 = cfg.scaleFrom ?? 1;
+    card.obj.scale.set(w * s0, h * s0, 1);
+    card.obj.position.set(point.x, point.y, point.z);
+    this._syncCardSlot(card);
+
+    // Fire-type flash particles (same size as tank burn) — shoot out from the core.
+    const nFire = 12 + Math.floor(Math.random() * 5);
+    for (let i = 0; i < nFire; i++) {
+      const heat = 0.75 + Math.random() * 0.55;
+      const a = Math.random() * Math.PI * 2;
+      const elev = (Math.random() - 0.15) * Math.PI * 0.55;
+      const speed = 28 + Math.random() * 32;
+      this._shellDir.set(
+        Math.cos(a) * Math.cos(elev) * speed,
+        Math.sin(elev) * speed + 6,
+        Math.sin(a) * Math.cos(elev) * speed,
+      );
+      this._sprite(
+        this.flashTex,
+        new THREE.Color(5.5 * heat, 1.8 * heat, 0.35 * heat),
+        this._hitPoint.copy(point).add(this._shellStep.set(
+          (Math.random() - 0.5) * 0.25, Math.random() * 0.2, (Math.random() - 0.5) * 0.25,
+        )),
+        0.55 + Math.random() * 0.5,
+        (0.45 + Math.random() * 0.4) * 1.5,
+        {
+          additive: true,
+          grow: 0.35,
+          drag: 0.6 + Math.random() * 0.5,
+          rise: 0.4,
+          vel: this._shellDir,
+        },
+      );
+    }
+
+    // A few metal-hit spark streaks (real particles — not the impact flipbook).
+    const ramp = emissiveRamp([20, 13, 5], [10, 1.8, 0.2]);
+    const nMetal = 7 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < nMetal; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const elev = 0.05 + Math.random() * 0.6;
+      const speed = 28 + Math.random() * 36;
+      this._shellDir.set(
+        Math.cos(a) * Math.cos(elev) * speed,
+        Math.sin(elev) * speed,
+        Math.sin(a) * Math.cos(elev) * speed,
+      );
+      this._spawnSpark(
+        this._hitPoint.copy(point).add(this._shellStep.set(
+          (Math.random() - 0.5) * 0.2, 0.05 + Math.random() * 0.15, (Math.random() - 0.5) * 0.2,
+        )),
+        this._shellDir,
+        0.1 + Math.random() * 0.14,
+        (0.45 + Math.random() * 0.55) * 1.5,
+        ramp.from,
+        ramp.to,
+        { streak: true },
+      );
+    }
+  }
+
+  /** Expanding dirt ring on the ground under a main-gun dirt blast. */
+  _spawnShockwave(point) {
+    if (!this.shellShockwaveTex) return;
+    const pool = this._ensureShockwavePool();
+    const card = this._takeCard(pool);
+    card.life = SHELL_SHOCKWAVE.life;
+    card.endSize = SHELL_SHOCKWAVE.endSize;
+    card.fade = 1;
+    card.obj.position.set(point.x, point.y + 0.05, point.z);
+    card.obj.quaternion.copy(pool.flatQ);
+    card.obj.scale.set(0.01, 0.01, 1);
+    this._syncCardSlot(card);
   }
 
   /** One 4-frame strip. `side` lies along the barrel; the front card faces down it. */
@@ -1433,12 +1973,32 @@ export class Effects {
     this._syncCardSlot(card);
   }
 
-  muzzleFlash(pos, dir) {
+  /**
+   * Main-gun muzzle flash + dust. `id` tracks linger smoke so the spawn follows the barrel.
+   * Call `setMainMuzzle` each frame while the tank is alive so turning the turret re-aims it.
+   */
+  muzzleFlash(pos, dir, id = 'player') {
     const d = dir.clone();
     if (d.lengthSq() < 1e-8) d.set(1, 0, 0);
     else d.normalize();
     this._spawnMainMuzzle(this.mainMuzzleFront, pos, d, false);
     this._spawnMainMuzzle(this.mainMuzzleSide, pos, d, true);
+    this._mainGunDustBurst(pos, d);
+    const smoke = this._mainSmokeStreams.get(id);
+    if (smoke) {
+      smoke.age = 0;
+      smoke.pos.copy(pos);
+      smoke.dir.copy(d);
+      smoke.emitAcc = 0;
+    } else {
+      this._mainSmokeStreams.set(id, {
+        age: 0,
+        life: MAIN_MUZZLE_SMOKE.life,
+        pos: pos.clone(),
+        dir: d.clone(),
+        emitAcc: 0,
+      });
+    }
     // Ground pool ~8 m downrange, dropped 1 m so it reads on the terrain.
     const blastLight = pos.clone().addScaledVector(d, 8);
     blastLight.y -= 1;
@@ -1447,6 +2007,84 @@ export class Effects {
       distance: MAIN_GUN_LIGHT.distance,
       fade: MAIN_GUN_LIGHT.fade,
     });
+  }
+
+  /** Keep linger barrel smoke locked to the current muzzle while a stream is active. */
+  setMainMuzzle(pose, id = 'player') {
+    const s = this._mainSmokeStreams.get(id);
+    if (!s || !pose?.pos || !pose?.dir) return;
+    s.pos.copy(pose.pos);
+    s.dir.copy(pose.dir);
+    if (s.dir.lengthSq() > 1e-8) s.dir.normalize();
+    else s.dir.set(1, 0, 0);
+  }
+
+  /** One-shot discharge cloud shoved out of the bore. */
+  _mainGunDustBurst(pos, dir) {
+    const side = this._mgSide;
+    const up = this._mgUp.set(0, 1, 0);
+    if (Math.abs(dir.dot(up)) > 0.9) up.set(1, 0, 0);
+    side.crossVectors(dir, up).normalize();
+    up.crossVectors(side, dir).normalize();
+    // +25% vs prior 6–8 puffs.
+    const n = Math.ceil((6 + Math.random() * 3) * 1.25);
+    for (let i = 0; i < n; i++) {
+      const origin = pos.clone()
+        .addScaledVector(dir, 0.2 + Math.random() * 0.8)
+        .addScaledVector(side, (Math.random() - 0.5) * 0.55)
+        .addScaledVector(up, (Math.random() - 0.5) * 0.4);
+      // ×3 along-bore throw vs first pass — reads as a blast toward the target.
+      const v = dir.clone().multiplyScalar((2.5 + Math.random() * 4.5) * 3)
+        .addScaledVector(side, (Math.random() - 0.5) * 2.2)
+        .addScaledVector(up, 0.5 + Math.random() * 1.4);
+      this._sprite(
+        this.smokeDischargeTex || this.smokeTex,
+        'bright',
+        origin,
+        2.0 + Math.random() * 2.4,
+        2.2 + Math.random() * 1.4,
+        {
+          discharge: true,
+          vel: v,
+          grow: 4.5 + Math.random() * 2.5,
+          rise: 0.55 + Math.random() * 0.4,
+          opacity: 0.5 + Math.random() * 0.2,
+          drag: MAIN_MUZZLE_SMOKE.drag,
+        },
+      );
+    }
+  }
+
+  /** Smaller discharge puffs pushed out along the bore (linger stream). */
+  _mainGunBarrelPuff(pos, dir, strength = 1) {
+    const side = this._mgSide;
+    const up = this._mgUp.set(0, 1, 0);
+    if (Math.abs(dir.dot(up)) > 0.9) up.set(1, 0, 0);
+    side.crossVectors(dir, up).normalize();
+    up.crossVectors(side, dir).normalize();
+    const origin = pos.clone()
+      .addScaledVector(dir, 0.05 + Math.random() * 0.25)
+      .addScaledVector(side, (Math.random() - 0.5) * 0.12)
+      .addScaledVector(up, (Math.random() - 0.5) * 0.1);
+    const push = MAIN_MUZZLE_SMOKE.push * (0.55 + 0.45 * strength);
+    const v = dir.clone().multiplyScalar(push * (0.7 + Math.random() * 0.8))
+      .addScaledVector(side, (Math.random() - 0.5) * 0.55)
+      .addScaledVector(up, 0.1 + Math.random() * 0.35);
+    this._sprite(
+      this.smokeDischargeTex || this.smokeTex,
+      'bright',
+      origin,
+      0.45 + Math.random() * 0.45,
+      1.35 + Math.random() * 0.9,
+      {
+        discharge: true,
+        vel: v,
+        grow: 2.8 + Math.random() * 1.6,
+        rise: 0.25 + Math.random() * 0.25,
+        opacity: 0.35 + Math.random() * 0.2,
+        drag: MAIN_MUZZLE_SMOKE.drag,
+      },
+    );
   }
 
   /** Cruiser broadside: a tank muzzle scaled up, plus a thick smoke plume downrange. */
@@ -1460,12 +2098,11 @@ export class Effects {
     this._flashLight(pos.clone().addScaledVector(d, 8), 220, { color: 0xffcc66, distance: 70 });
     for (let i = 0; i < 12; i++) {
       const along = 1.5 + Math.random() * 10;
-      const grey = 0.42 + Math.random() * 0.22;
       const puff = pos.clone().addScaledVector(d, along);
       puff.y += Math.random() * 2;
       this._sprite(
         this.smokeTex,
-        new THREE.Color(grey, grey * 0.94, grey * 0.86),
+        'bright',
         puff,
         4 + Math.random() * 4,
         2.4 + Math.random() * 1.6,
@@ -1534,53 +2171,84 @@ export class Effects {
   }
 
   /**
-   * Smoke-launcher pop: canisters fire out in a ring, then bloom into the screen cloud.
+   * Smoke-launcher pop: canisters fire out from the tank centre, then bloom into the screen cloud.
    * @param {{ x: number, y: number, z: number }} pos tank origin
    * @param {number} [radius=10.5] cloud radius (land ring scales with it)
    */
   smokeBurst(pos, radius = 10.5) {
-    const n = 8;
+    // Soft flat radials only; +25% vs prior 10 jets.
+    const n = 13;
     const y0 = pos.y + 1.5;
+    const cx = pos.x;
+    const cz = pos.z;
     const landR0 = radius * 0.4;
     const landR1 = radius * 0.58;
     for (let i = 0; i < n; i++) {
       const a = (i / n) * Math.PI * 2 + Math.random() * 0.12;
       const cos = Math.cos(a), sin = Math.sin(a);
-      const origin = new THREE.Vector3(pos.x + cos * 1.1, y0, pos.z + sin * 1.1);
-      const out = new THREE.Vector3(cos, 0.15 + Math.random() * 0.12, sin);
-      // Fast outward puff (the “grenade”)
+      // Spawn at hull centre — push reads as discharge leaving the tank.
+      const origin = new THREE.Vector3(
+        cx + cos * (0.35 + Math.random() * 0.4),
+        y0 + Math.random() * 0.25,
+        cz + sin * (0.35 + Math.random() * 0.4),
+      );
+      const out = new THREE.Vector3(cos, 0.12 + Math.random() * 0.1, sin);
+      // Fast outward jet, soft drag → ease-out settle.
       this._sprite(
-        this.smokeTex,
-        new THREE.Color(0.72, 0.7, 0.66),
+        this.smokeFlatTex,
+        'bright',
         origin,
-        0.55 + Math.random() * 0.35,
-        0.55 + Math.random() * 0.25,
+        0.7 + Math.random() * 0.45,
+        0.85 + Math.random() * 0.35,
         {
-          vel: out.clone().multiplyScalar(11 + Math.random() * 5),
+          flat: true,
+          vel: out.clone().multiplyScalar(16 + Math.random() * 7),
           grow: 9,
-          rise: 0.2,
-          opacity: 0.85,
-          drag: 2.8,
+          rise: 0.15,
+          opacity: 0.95,
+          drag: 1.15,
         },
       );
-      // Immediate bloom at the landing ring
+      // Second thinner jet for density (+25% particles overall).
+      if (Math.random() < 0.69) {
+        this._sprite(
+          this.smokeFlatTex,
+          'bright',
+          origin.clone().add(new THREE.Vector3((Math.random() - 0.5) * 0.3, 0.1, (Math.random() - 0.5) * 0.3)),
+          0.45 + Math.random() * 0.3,
+          0.7 + Math.random() * 0.3,
+          {
+            flat: true,
+            vel: out.clone().multiplyScalar(12 + Math.random() * 6)
+              .add(new THREE.Vector3((Math.random() - 0.5) * 1.2, 0, (Math.random() - 0.5) * 1.2)),
+            grow: 7,
+            rise: 0.2,
+            opacity: 0.85,
+            drag: 1.25,
+          },
+        );
+      }
+      // Landing bloom still pushed slightly outward from centre.
       const land = new THREE.Vector3(
-        pos.x + cos * (landR0 + Math.random() * (landR1 - landR0)),
+        cx + cos * (landR0 + Math.random() * (landR1 - landR0)),
         y0 + Math.random() * 0.4,
-        pos.z + sin * (landR0 + Math.random() * (landR1 - landR0)),
+        cz + sin * (landR0 + Math.random() * (landR1 - landR0)),
       );
+      const landOut = new THREE.Vector3(land.x - cx, 0.2, land.z - cz).normalize();
       this._sprite(
-        this.smokeTex,
-        new THREE.Color(0.55 + Math.random() * 0.12, 0.53, 0.48),
+        this.smokeFlatTex,
+        'bright',
         land,
         2.4 + Math.random() * 1.2,
         2.6 + Math.random() * 1.3,
         {
-          vel: new THREE.Vector3((Math.random() - 0.5) * 0.8, 1.2 + Math.random() * 0.8, (Math.random() - 0.5) * 0.8),
+          flat: true,
+          vel: landOut.multiplyScalar(2.5 + Math.random() * 2.2)
+            .add(new THREE.Vector3(0, 1.0 + Math.random() * 0.8, 0)),
           grow: 5.2,
-          rise: 0.9,
-          opacity: 0.85,
-          drag: 0.7,
+          rise: 0.7,
+          opacity: 0.95,
+          drag: 0.95,
         },
       );
     }
@@ -1588,53 +2256,58 @@ export class Effects {
 
   /**
    * Sustained screen cloud for an active smoke volume. Call every frame while alive.
+   * Puffs keep a gentle outward push from the tank/cloud centre.
    * @param {{ x: number, y: number, z: number, r: number }} cloud
    * @param {number} dt
    * @param {number} amount emission strength 0..1+ (includes density multiplier)
    */
   smokeScreen(cloud, dt, amount = 1) {
-    const rate = 14 * amount * dt;
+    // Soft flat radials; +25% vs prior rate 17.5.
+    const rate = 21.875 * amount * dt;
     let n = Math.floor(rate);
     if (Math.random() < rate - n) n += 1;
     for (let i = 0; i < n; i++) {
       const a = Math.random() * Math.PI * 2;
-      const d = cloud.r * (0.2 + Math.random() * 0.8);
-      const grey = 0.48 + Math.random() * 0.18;
+      const d = cloud.r * (0.15 + Math.random() * 0.75);
+      const cos = Math.cos(a), sin = Math.sin(a);
+      const origin = new THREE.Vector3(
+        cloud.x + cos * d,
+        cloud.y + Math.random() * 2.2,
+        cloud.z + sin * d,
+      );
+      // Radial push from centre — stronger near the core, eases out via drag.
+      const push = (1.2 + Math.random() * 1.8) * (1.15 - d / cloud.r);
       this._sprite(
-        this.smokeTex,
-        new THREE.Color(grey, grey * 0.97, grey * 0.9),
-        new THREE.Vector3(
-          cloud.x + Math.cos(a) * d,
-          cloud.y + Math.random() * 2.2,
-          cloud.z + Math.sin(a) * d,
-        ),
+        this.smokeFlatTex,
+        'bright',
+        origin,
         3.2 + Math.random() * 2.2,
         2.0 + Math.random() * 1.3,
         {
+          flat: true,
           vel: new THREE.Vector3(
-            (Math.random() - 0.5) * 0.55,
-            0.5 + Math.random() * 0.65,
-            (Math.random() - 0.5) * 0.55,
+            cos * push + (Math.random() - 0.5) * 0.35,
+            0.45 + Math.random() * 0.55,
+            sin * push + (Math.random() - 0.5) * 0.35,
           ),
           grow: 2.9 + Math.random() * 1.3,
-          rise: 0.6,
-          opacity: Math.min(0.95, (0.48 + Math.random() * 0.2) * 1.56),
-          drag: 0.55,
+          rise: 0.5,
+          opacity: Math.min(1, (0.55 + Math.random() * 0.22) * 1.56),
+          drag: 0.85,
         },
       );
     }
   }
 
-  /** Dark smoke rising off a wreck. A handful of puffs a second. */
+  /** Smoke rising off a wreck. A handful of puffs a second. */
   plume(pos, dt) {
     const n = 8 * dt;
     let count = Math.floor(n);
     if (Math.random() < n - count) count += 1;
     for (let i = 0; i < count; i++) {
-      const g = 0.08 + Math.random() * 0.07;
       this._sprite(
         this.smokeTex,
-        new THREE.Color(g, g, g),
+        'dark',
         pos.clone().add(new THREE.Vector3((Math.random() - 0.5) * 1.6, Math.random() * 0.5, (Math.random() - 0.5) * 1.6)),
         2.2 + Math.random() * 1.4,
         3.2 + Math.random() * 1.6,
@@ -1651,7 +2324,8 @@ export class Effects {
 
   dust(pos, amount) {
     if (Math.random() > amount) return;
-    this._sprite(this.smokeTex, new THREE.Color(0.42, 0.36, 0.26), pos, 0.8, 1.6 + Math.random(), {
+    this._sprite(this.smokeDischargeTex || this.smokeTex, 'beige', pos, 0.8, 1.6 + Math.random(), {
+      discharge: true,
       vel: new THREE.Vector3((Math.random() - 0.5) * 0.8, 0.4 + Math.random() * 0.5, (Math.random() - 0.5) * 0.8),
       grow: 3, opacity: 0.35, drag: 1.2,
     });
@@ -1704,14 +2378,21 @@ export class Effects {
         .addScaledVector(out, (Math.random() - 0.3) * 1.4)
         .add(new THREE.Vector3(0, 0.6 + Math.random() * 1.1, 0));
       this._sprite(
-        this.smokeTex,
-        new THREE.Color(0.48, 0.4, 0.28),
+        this.smokeDischargeTex || this.smokeTex,
+        'beige',
         pos.clone()
           .addScaledVector(out, (Math.random() - 0.5) * 0.35)
           .add(new THREE.Vector3(0, 0.05 + Math.random() * 0.08, 0)),
         0.85 + Math.random() * 0.7,
         1.3 + Math.random() * 0.7,
-        { vel: v, grow: 3.2, opacity: 0.38 + amount * 0.12, drag: 1.35, rise: 0.25 },
+        {
+          discharge: true,
+          vel: v,
+          grow: 3.2,
+          opacity: 0.38 + amount * 0.12,
+          drag: 1.35,
+          rise: 0.25,
+        },
       );
     }
     if (grassy) this.grassRip(pos, amount, { back, out });
@@ -1727,15 +2408,13 @@ export class Effects {
   engineSmoke(pos, amount, back, up) {
     // −25% spawn chance — same puff, fewer of them.
     if (amount < 0.02 || Math.random() > Math.min(1, amount * 1.4) * 0.75) return;
-    // Turret plume greys are ~0.38–0.60; diesel is half that, then another 25% darker.
-    const grey = (0.38 + Math.random() * 0.22) * 0.5 * 0.75;
     const side = new THREE.Vector3().crossVectors(up, back).normalize();
     const v = back.clone().multiplyScalar(0.4 + Math.random() * 0.5)
       .addScaledVector(up, 0.55 + Math.random() * 0.35)
       .addScaledVector(side, (Math.random() - 0.5) * 0.25);
     this._sprite(
       this.smokeTex,
-      new THREE.Color(grey, grey * 0.97, grey * 0.92),
+      'dark',
       pos.clone()
         .addScaledVector(back, (Math.random() - 0.5) * 0.1)
         .addScaledVector(up, Math.random() * 0.1)
@@ -1746,7 +2425,7 @@ export class Effects {
         vel: v,
         grow: 2.2 + Math.random() * 0.8,
         rise: 0.55 + Math.random() * 0.25,
-        opacity: 0.45 + Math.random() * 0.2,
+        opacity: (0.45 + Math.random() * 0.2) * 0.5,
         drag: 0.9,
       },
     );
@@ -1783,8 +2462,7 @@ export class Effects {
       }
     }
     for (let i = emit(10 * 0.75); i > 0; i--) {
-      const g = 0.04 + Math.random() * 0.05;
-      this._sprite(this.smokeTex, new THREE.Color(g, g, g), jitter(0.6).add(new THREE.Vector3(0, 0.6, 0)),
+      this._sprite(this.smokeTex, 'dark', jitter(0.6).add(new THREE.Vector3(0, 0.6, 0)),
         0.9 + Math.random() * 0.5, 3 + Math.random() * 1.8, {
           grow: 4 + Math.random() * 1.5, drag: 0.8, rise: 0.9, opacity: 0.6 + Math.random() * 0.2,
           vel: new THREE.Vector3((Math.random() - 0.5) * 0.5 + 0.35, 1.4 + Math.random() * 0.8, (Math.random() - 0.5) * 0.5),
@@ -1897,26 +2575,74 @@ export class Effects {
     this._syncCardSlot(card);
   }
 
-  _explode(point, normal, dir, collider, { emissive = true, muzzle = false } = {}) {
+  /**
+   * A few soft additive warm blobs that linger 0.5 s past the flipbook — fireball afterglow.
+   * @param {THREE.Vector3} point
+   * @param {THREE.Vector3} normal
+   * @param {number} flipLife active explosion sprite life (s)
+   */
+  _explosionWarmPuffs(point, normal, flipLife) {
+    const life = flipLife + 0.5;
+    const n = 5 + (Math.random() * 3) | 0;
+    // Orange / yellow / red — cycle so the mix reads warm, not grey.
+    const hues = [
+      [1.2, 0.48, 0.06],
+      [1.25, 0.9, 0.2],
+      [1.1, 0.2, 0.05],
+    ];
+    for (let i = 0; i < n; i++) {
+      const [hr, hg, hb] = hues[i % hues.length];
+      const heat = 0.75 + Math.random() * 0.45;
+      const a = Math.random() * Math.PI * 2;
+      const out = 0.5 + Math.random() * 1.6;
+      this._sprite(
+        this.flashTex,
+        new THREE.Color(hr * heat, hg * heat, hb * heat),
+        this._hitPoint.copy(point)
+          .addScaledVector(normal, 0.4 + Math.random() * 0.8)
+          .add(this._shellStep.set(
+            (Math.random() - 0.5) * 1.6,
+            0.2 + Math.random() * 0.8,
+            (Math.random() - 0.5) * 1.6,
+          )),
+        1.8 + Math.random() * 2.4,
+        life,
+        {
+          additive: true,
+          vel: this._shellDir.set(
+            Math.cos(a) * out,
+            0.35 + Math.random() * 0.9,
+            Math.sin(a) * out,
+          ),
+          grow: 2.4 + Math.random() * 2.2,
+          rise: 0.35 + Math.random() * 0.35,
+          drag: 1.1 + Math.random() * 0.4,
+          opacity: 0.7 + Math.random() * 0.25,
+        },
+      );
+    }
+  }
+
+  _explode(point, normal, dir, collider, { emissive = true, muzzle = false, ground = false } = {}) {
     // Copy off the caller's scratches. Spawns below reuse those vectors.
     point = this._boomPos.copy(point);
     normal = this._boomN.copy(normal);
     dir = this._boomDir.copy(dir);
-    // Test: ground-explosion flipbook as the main impact read (kept large).
-    this._groundExplosion(point);
-    // Main-gun hits reuse the turret firing cards. Plume points out of the surface.
-    if (muzzle) {
-      const out = this._hitNormal.copy(normal);
-      if (out.lengthSq() < 1e-8) out.copy(dir).negate();
-      else out.normalize();
-      this._spawnMainMuzzle(this.mainMuzzleFront, point, out, false, 2);
-      this._spawnMainMuzzle(this.mainMuzzleSide, point, out, true, 2);
+    // Dirt atlas only on terrain; tanks / props get the new fireball sheet.
+    if (ground) {
+      this._groundExplosion(point);
+      this._spawnShockwave(point);
+      this._spawnScorchedEarth(point);
+      this._explosionWarmPuffs(point, normal, GROUND_EXPLOSION.frameCount / GROUND_EXPLOSION.fps);
+    } else {
+      this._shellImpactExplosion(point);
+      this._explosionWarmPuffs(point, normal, SHELL_IMPACT.frames / SHELL_IMPACT.fps);
     }
     // Quick emissive glow-ball flash (placeholder texture, additive, fades over glowLife).
     if (emissive && this.impactGlowTex) {
       if (!this._glowBoard) {
         this._glowBoard = createBillboard(this.scene, this.impactGlowTex, 8, {
-          emissive: true, renderOrder: 5, depthTest: false,
+          emissive: true, renderOrder: 5,
         });
       }
       const glow = takeBillboard(this._glowBoard);
@@ -1958,7 +2684,8 @@ export class Effects {
       this._spawnSpark(this._hitPoint, v, size, 1.1 + Math.random() * 0.9);
     }
 
-    // A few beige dust puffs rising out from the impact — softens the flipbook’s hard edges.
+    // Soft edge puffs — bright on dirt, dark on tanks/props.
+    const edgeKind = ground ? 'bright' : 'dark';
     for (let i = 0; i < 4; i++) {
       const a = Math.random() * Math.PI * 2;
       const out = 1.8 + Math.random() * 2.4;
@@ -1969,12 +2696,42 @@ export class Effects {
       );
       this._sprite(
         this.smokeTex,
-        this._puffTint.clone().offsetHSL(0, (Math.random() - 0.5) * 0.06, (Math.random() - 0.5) * 0.08),
+        edgeKind,
         this._hitPoint.copy(point).add(this._shellStep.set((Math.random() - 0.5) * 1.2, 0.3, (Math.random() - 0.5) * 1.2)),
         1.4 + Math.random() * 1.1,
         1.8 + Math.random() * 1.2,
         { vel: v, grow: 4.5, rise: 1.1, opacity: 0.5, drag: 1.4 },
       );
+    }
+    // Non-ground (tank / prop) hits: extra dark soot cloud.
+    if (!ground) {
+      const dustN = 5 + (Math.random() * 3) | 0;
+      for (let i = 0; i < dustN; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const out = 1.2 + Math.random() * 2.8;
+        this._sprite(
+          this.smokeTex,
+          'dark',
+          this._hitPoint.copy(point).add(this._shellStep.set(
+            (Math.random() - 0.5) * 1.4,
+            0.2 + Math.random() * 0.6,
+            (Math.random() - 0.5) * 1.4,
+          )).addScaledVector(normal, 0.15),
+          2.4 + Math.random() * 2.2,
+          2.2 + Math.random() * 1.6,
+          {
+            vel: this._shellDir.set(
+              Math.cos(a) * out,
+              1.6 + Math.random() * 2.4,
+              Math.sin(a) * out,
+            ),
+            grow: 4.2 + Math.random() * 2.2,
+            rise: 0.9 + Math.random() * 0.5,
+            opacity: 0.45 + Math.random() * 0.2,
+            drag: 1.15,
+          },
+        );
+      }
     }
     for (let i = 0; i < 10; i++) {
       const chunk = takeMesh(this._debrisPool);
@@ -2028,6 +2785,21 @@ export class Effects {
       this.camera.getWorldQuaternion(this._camQ);
       this._camQInv.copy(this._camQ).invert();
     }
+    for (let i = this._scorches.length - 1; i >= 0; i--) {
+      const s = this._scorches[i];
+      s.age += dt;
+      const k = s.age / s.life;
+      if (k >= 1) {
+        s.idle = true;
+        s.fadeU.value = 0;
+        s.mesh.visible = false;
+        this._scorchPool.free.push(s);
+        this._scorches.splice(i, 1);
+        continue;
+      }
+      const fadeStart = SCORCHED_EARTH.fadeStart;
+      s.fadeU.value = k < fadeStart ? 1 : Math.max(0, 1 - (k - fadeStart) / (1 - fadeStart));
+    }
     for (let i = this.shells.length - 1; i >= 0; i--) {
       const s = this.shells[i];
       s.age += dt;
@@ -2058,19 +2830,19 @@ export class Effects {
           this._boomN.set(hit.normal.x, hit.normal.y, hit.normal.z);
           this.onShellHit({ point: this._shellHit, collider: hit.collider, owner: s.owner, dir, naval: !!s.naval });
           // Ground/dirt: near terrain with an upward face (tank / metal stay onShellHit only).
-          if (
-            Math.abs(this._shellHit.y - terrainHeightAt(this._shellHit.x, this._shellHit.z)) < 1.0
-            && this._boomN.y > 0.35
-          ) {
+          const ground = Math.abs(this._shellHit.y - terrainHeightAt(this._shellHit.x, this._shellHit.z)) < 1.0
+            && this._boomN.y > 0.35;
+          if (ground) {
             this.onShellDirtHit({
               point: this._shellHit, owner: s.owner, naval: !!s.naval, normal: this._boomN,
             });
           }
-          this._explode(this._shellHit, this._boomN, dir, hit.collider, { muzzle: true });
+          this._explode(this._shellHit, this._boomN, dir, hit.collider, { muzzle: true, ground });
         } else if (due) {
           this._shellHit.set(s.aim.x, s.aim.y, s.aim.z);
           this._boomN.set(0, 1, 0);
-          this._explode(this._shellHit, this._boomN, dir, null, { muzzle: true });
+          const ground = Math.abs(this._shellHit.y - terrainHeightAt(this._shellHit.x, this._shellHit.z)) < 1.0;
+          this._explode(this._shellHit, this._boomN, dir, null, { muzzle: true, ground });
         }
         this._releaseShell(s);
         this.shells.splice(i, 1);
@@ -2105,6 +2877,22 @@ export class Effects {
       }
     }
 
+    // Main-gun barrel linger: small puffs pushed out the bore from the live muzzle pose.
+    for (const [id, s] of this._mainSmokeStreams) {
+      s.age += dt;
+      if (s.age >= s.life) {
+        this._mainSmokeStreams.delete(id);
+        continue;
+      }
+      const t = s.age / s.life;
+      const strength = (1 - t) * (1 - t);
+      s.emitAcc += MAIN_MUZZLE_SMOKE.rate * strength * dt;
+      while (s.emitAcc >= 1) {
+        s.emitAcc -= 1;
+        this._mainGunBarrelPuff(s.pos, s.dir, strength);
+      }
+    }
+
     for (let i = this.mgTracers.length - 1; i >= 0; i--) {
       const t = this.mgTracers[i];
       let step = MG_TRACER_SPEED * dt;
@@ -2134,11 +2922,27 @@ export class Effects {
         this.particles.splice(i, 1);
         continue;
       }
+      if (p.shockwave) {
+        // Ease-out scale (fast expand, settle), linear fade.
+        const ease = 1 - (1 - k) * (1 - k);
+        const s = Math.max(0.01, p.endSize * ease);
+        p.obj.scale.set(s, s, 1);
+        p.fade = 1 - k;
+        this._syncCardSlot(p);
+        continue;
+      }
       const fb = p.flipbook;
       fb.frame = Math.min(fb.frames - 1, Math.floor(p.age * fb.fps));
       if (p.muzzleDir) this._aimMuzzleSide(p.obj, p.muzzleDir);
-      // Soft fade on the last ~15% so the last sparse frames don't hard-cut.
-      p.fade = k > 0.85 ? (1 - (k - 0.85) / 0.15) : 1;
+      // Soft fade over the tail so sparse / smoke frames don't hard-cut.
+      const fadeStart = fb.fadeStart ?? 0.85;
+      p.fade = k > fadeStart ? Math.max(0, 1 - (k - fadeStart) / (1 - fadeStart)) : 1;
+      if (p.scaleFrom != null && p.baseW) {
+        // Ease-out: fast expand early, settles toward the end.
+        const ease = 1 - (1 - k) * (1 - k);
+        const s = p.scaleFrom + (p.scaleTo - p.scaleFrom) * ease;
+        p.obj.scale.set(p.baseW * s, p.baseH * s, 1);
+      }
       this._syncCardSlot(p);
     }
 
@@ -2148,7 +2952,10 @@ export class Effects {
     syncMeshPool(this._shellPool);
     syncMeshPool(this._tracerPool);
     stepBillboards(
-      [this._smokeBoard, this._flashBoard, this._streakBoard, this._glowBoard, ...this._burstBoards],
+      [
+        this._smokeBoard, this._smokeFlatBoard, this._smokeDischargeBoard,
+        this._flashBoard, this._streakBoard, this._glowBoard, ...this._burstBoards,
+      ],
       dt, heightAt, this._camQ, this._camQInv,
     );
 

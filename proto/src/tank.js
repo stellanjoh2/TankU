@@ -36,13 +36,13 @@ const LINK_T = 0.07;
 const RAY_UP = 0.4;          // ray starts this far above each contact's resting track bottom
 const SAG = 0.10;            // static spring compression (softer = more bounce)
 const MU_LONG = 1.14;        // longitudinal grip; higher = harder launch
-const MU_SIDE = 0.6091875;  // lateral grip; lower = more drift in a turn
+const MU_SIDE = 0.54826875;  // lateral grip; lower = more drift in a turn
 // Grip stays full on driveable ground, then fades so a rock shoulder sheds the hull
 // instead of the tracks parking on it. n·up: 0.88 ≈ 28°, 0.55 ≈ 57°.
 const GRIP_FLAT = 0.88;
 const GRIP_STEEP = 0.55;
 const GRIP_FLOOR = 0.15;
-const SPEED = { cruise: 9.975, boost: 16.17, reverse: 4.725, pivot: 4.921875, turn: 4.1015625 };   // m/s
+const SPEED = { cruise: 10.9725, boost: 17.787, reverse: 5.1975, pivot: 5.4140625, turn: 4.51171875 };   // m/s
 const DAMP_RATIO = 0.28;     // fraction of critical; lower = bouncier rebound
 const BRAKE_DIVE = 0.75;     // keep this fraction of nose-dive pitch under hard braking
 // Side bumps spin the long axis easily. Stiffen roll inertia, and past a small lean

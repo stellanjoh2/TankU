@@ -62,7 +62,8 @@ export function createBillboard(scene, map, capacity, { emissive = false, render
     mat.emissiveNode = mapNode.rgb.mul(instanceColor);
     mat.opacityNode = mapNode.a.mul(fadeNode);
   } else {
-    mat.colorNode = mapNode.rgb;
+    // instanceColor tints diesel / dirt / soot without needing unique materials.
+    mat.colorNode = mapNode.rgb.mul(instanceColor);
     mat.opacityNode = mapNode.a.mul(fadeNode);
   }
   const mesh = new THREE.InstancedMesh(geo, mat, capacity);
@@ -98,6 +99,8 @@ export function createBillboard(scene, map, capacity, { emissive = false, render
       pivotX: 0.5,
       pivotY: 0.5,
       rot: 0,
+      /** Total yaw (rad) applied over life for puff spin. */
+      rotSpin: 0,
       scaleToZero: false,
       fadeLinear: false,
     };
@@ -119,6 +122,7 @@ export function takeBillboard(board) {
   s.pivotX = 0.5;
   s.pivotY = 0.5;
   s.rot = 0;
+  s.rotSpin = 0;
   s.scaleToZero = false;
   s.fadeLinear = false;
   s.vel.set(0, 0, 0);
@@ -269,12 +273,17 @@ export function stepBillboards(boards, dt, heightAt, camQ, camQInv) {
         p.vel.multiplyScalar(Math.exp(-p.drag * dt));
         p.vel.y += p.rise * dt;
         p.pos.addScaledVector(p.vel, dt);
+        // Subtle spin: rotSpin is the full delta over life (capped at ±10° by spawn).
+        rot = p.rot + p.rotSpin * k;
         const scale = p.scaleToZero
           ? p.size * (1 - k)
           : p.size * (1 + (p.grow - 1) * Math.sqrt(k));
         sx = scale;
         sy = scale;
-        const lifeFade = p.fadeLinear ? (1 - k) : (1 - k) * (1 - k);
+        // Reach ~0 by 88% of life so the last frames aren't a hard pop.
+        const lifeFade = p.fadeLinear
+          ? (1 - k)
+          : (k >= 0.88 ? 0 : Math.pow(1 - k / 0.88, 1.15));
         fade = p.opacity * lifeFade;
         _color.copy(p.color);
       }
