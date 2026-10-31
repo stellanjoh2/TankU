@@ -1100,7 +1100,6 @@ async function main() {
     post.setHurt(tank.alive ? tank.hp / tank.maxHp : 0);
     hud.setNitro(tank.nitroCharge, tank.nitroActive);
     hud.setWeapon(MAIN_GUNS[mainGun].label, gunId);
-    hud.setReload(tank.alive ? tank.reload : 0, RELOAD);
     hud.setOverheat(tank.mgHeat, tank.mgLock, MG_HEAT_TIME, tank.mgFiring);
     hud.setTurretYaw(tank.alive && !tank.wrecked ? tank.turret.rotation.y : 0, tank.alive && !tank.wrecked);
     radial.setActive(activeGadget);

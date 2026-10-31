@@ -1,4 +1,4 @@
-// Tessendorf FFT ocean: 3 cascades of 128² in one 128×384 atlas.
+// Tessendorf FFT ocean: 2 cascades of 128² in one 128×256 atlas.
 // WebGPU port of Ultra-Water's OceanSim (MIT, Copyright (c) 2026 Humpalumps).
 import { FloatType, HalfFloatType, LinearFilter, LinearMipmapLinearFilter, NearestFilter, RepeatWrapping, StorageTexture, Vector4 } from 'three/webgpu';
 import { instanceIndex, storageTexture, texture, uniform, wgslFn } from 'three/tsl';
@@ -80,7 +80,7 @@ fn directional(theta: f32, w: f32, a: vec4f, b: vec4f) -> f32 {
 
 fn spectrum(w: f32, theta: f32, kl: f32, c: i32, specA: vec4f, specB: vec4f, capFade: f32) -> f32 {
   if (specA.x <= 0.0) { return 0.0; }
-  let fade = select(specB.w, capFade, c == 2);
+  let fade = select(specB.w, capFade, c == 1);
   return jonswap(w, specA, specB) * directional(theta, w, specA, specB) * exp(-fade * fade * kl * kl);
 }
 
@@ -92,8 +92,7 @@ fn h0(id: vec2i, c: i32, specA0: vec4f, specB0: vec4f, specA1: vec4f, specB1: ve
   var lo = 1e-4;
   var hi = 1e4;
   if (c == 0) { hi = cut.x; }
-  else if (c == 1) { lo = cut.x; hi = cut.y; }
-  else { lo = cut.y; }
+  else { lo = cut.x; }
   if (kl < lo || kl > hi) { return vec2f(0.0); }
   let w = omega(kl);
   let dwdk = (9.81 + 3.0 * 7.4e-5 * kl * kl) / (2.0 * w);
@@ -275,8 +274,11 @@ export class OceanSim {
     this.specB0 = uniform(new Vector4());
     this.specA1 = uniform(new Vector4());
     this.specB1 = uniform(new Vector4());
-    this.wl = uniform(new Vector4(...CASCADE_LENGTHS, 0));
-    this.cut = uniform(new Vector4(...CASCADE_LENGTHS.slice(1).map((L) => (2 * Math.PI / L) * 6), 0, 0));
+    this.wl = uniform(new Vector4(
+      CASCADE_LENGTHS[0] ?? 0, CASCADE_LENGTHS[1] ?? 0, CASCADE_LENGTHS[2] ?? 0, 0,
+    ));
+    const cuts = CASCADE_LENGTHS.slice(1).map((L) => (2 * Math.PI / L) * 6);
+    this.cut = uniform(new Vector4(cuts[0] ?? 0, cuts[1] ?? 0, cuts[2] ?? 0, 0));
     this.capFade = uniform(0.08);
     this.seed = uniform(1337);
     this.uTime = uniform(0);

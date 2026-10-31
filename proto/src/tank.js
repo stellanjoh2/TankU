@@ -3,7 +3,6 @@
 import * as THREE from 'three';
 import { float, materialEmissive, mix, positionWorld, smoothstep, uniform } from 'three/tsl';
 import { applyBurntMetal } from './burntMetal.js';
-import { createEngineHeatHaze } from './heatHaze.js';
 import { heightAt, onBridge, WATER_Y } from './terrain.js';
 import { waveHeight } from './waves.js';
 import { createWake } from './wake.js';
@@ -32,6 +31,11 @@ export { stepMgHeat } from './tankWeapons.js';
 export { REPAIR_CHARGES, REPAIR_TIME, REPAIR_HEAL, STRESS_MAX } from './tankGadgets.js';
 
 const MASS = 25500;          // a bit lighter → more playful pitch under throttle
+// Main-gun hit shove (Δv ≈ impulse / MASS). Side punches hardest; rear nudges forward;
+// front never reverse-shoves — soft-brakes forward speed instead.
+const SHELL_HIT_SIDE = 146250;     // ~5.7 m/s full broadside
+const SHELL_HIT_REAR = 37500;      // ~1.5 m/s boost when shot from behind
+const SHELL_HIT_FRONT_BRAKE = 2.06; // m/s soft-brake when driving into a frontal hit
 const LINK_T = 0.07;
 const RAY_UP = 0.4;          // ray starts this far above each contact's resting track bottom
 const SAG = 0.10;            // static spring compression (softer = more bounce)
@@ -105,6 +109,7 @@ const _susTarget = { L: 0, R: 0 };
 const _susLong = { L: [0, 0], R: [0, 0] };
 const _up = new THREE.Vector3(0, 1, 0);
 const _side = new THREE.Vector3();
+const _hitImp = new THREE.Vector3();
 
 function loopSegments(flat) {
   const pts = [];
@@ -404,7 +409,8 @@ export class Tank {
     const rb = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(spawn.x, spawn.y, spawn.z)
       .setRotation(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), spawn.yaw ?? 0))
-      .setLinearDamping(0.04).setAngularDamping(0.48).setCanSleep(false);
+      .setLinearDamping(0.04).setAngularDamping(0.48).setCanSleep(false)
+      .setUserData({ tank: true }); // fx._explode skips generic impact; match applies anisotropic shove
     this.body = world.createRigidBody(rb);
     const hx = 2.9, hy = 0.7, hz = 1.62;
     const hullRound = 0.22; // eased corners; outer size stays hx/hy/hz
@@ -542,6 +548,51 @@ export class Tank {
     const v = this.body.linvel();
     _v.set(1, 0, 0).applyQuaternion(_q.copy(this.body.rotation()));
     return v.x * _v.x + v.y * _v.y + v.z * _v.z;
+  }
+
+  /**
+   * Main-gun impact: shove in the shell's travel direction with hull-aware weight.
+   * Broadside → lateral punch (+ yaw via hit point). From behind → slight speed boost.
+   * Frontal → soft-brake forward speed only (no reverse shove).
+   */
+  applyShellHit(dir, point) {
+    if (!dir || !this.body.isEnabled() || this.wrecked) return;
+    _q.copy(this.body.rotation());
+    _v.set(1, 0, 0).applyQuaternion(_q);
+    _side.set(0, 0, 1).applyQuaternion(_q);
+
+    const hLen = Math.hypot(dir.x, dir.z);
+    if (hLen < 1e-6) return;
+    const hx = dir.x / hLen;
+    const hz = dir.z / hLen;
+    const along = hx * _v.x + hz * _v.z;     // +1 shell with us (rear hit)
+    const across = hx * _side.x + hz * _side.z;
+
+    // Front: trim speed while driving; never push the hull backwards.
+    if (along < -0.15) {
+      const lv = this.body.linvel();
+      const spd = lv.x * _v.x + lv.y * _v.y + lv.z * _v.z;
+      if (spd > 0.05) {
+        const cut = Math.min(spd, SHELL_HIT_FRONT_BRAKE * (-along));
+        this.body.setLinvel({
+          x: lv.x - _v.x * cut,
+          y: lv.y - _v.y * cut,
+          z: lv.z - _v.z * cut,
+        }, true);
+      }
+    }
+
+    const sideMag = across * SHELL_HIT_SIDE;
+    const rearMag = Math.max(0, along) * SHELL_HIT_REAR;
+    if (Math.abs(sideMag) < 1 && rearMag < 1) return;
+
+    _hitImp.set(
+      _side.x * sideMag + _v.x * rearMag,
+      0,
+      _side.z * sideMag + _v.z * rearMag,
+    );
+    const at = point ?? this.body.translation();
+    this.body.applyImpulseAtPoint(_hitImp, at, true);
   }
 
   /** One fixed physics step: suspension, traction, drive. */
@@ -927,16 +978,8 @@ export class Tank {
       old.dispose();
     }
 
-    this.mgHaze = createEngineHeatHaze({
-      local: new THREE.Vector3(1.08, 0.92, 0),
-      width: 0.95,
-      height: 1.35,
-      strength: 0,
-    });
-    this.mgHaze.name = 'MGHeatHaze';
-    this.mgHaze.userData.skipLod = true;
-    this.mgHaze.visible = false;
-    this.mg.add(this.mgHaze);
+    // Heat haze is player damage-fire only (see main.js) — no MG barrel refraction.
+    this.mgHaze = null;
   }
 
   /**

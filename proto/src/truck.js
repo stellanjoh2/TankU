@@ -4,7 +4,6 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { AIRFIELD_Y, heightAt } from './terrain.js';
 import { lodDist, pickLod } from './lod.js';
-import { createEngineHeatHaze } from './heatHaze.js';
 import { applyBurntMetal } from './burntMetal.js';
 import { wreckFireFade, wreckMeshFade, applyWreckMeshFade } from './fx.js';
 
@@ -202,14 +201,6 @@ export async function buildTrucks(scene, { RAPIER, world }) {
     ruin.visible = false;
     obj.add(ruin);
 
-    const haze = createEngineHeatHaze({
-      local: new THREE.Vector3(0.2, 1.55, 0),
-      width: 1.7,
-      height: 2.1,
-    });
-    haze.visible = false;
-    haze.name = `${obj.name}_HeatHaze`;
-    obj.add(haze);
     root.add(obj);
 
     const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), spot.yaw);
@@ -227,10 +218,9 @@ export async function buildTrucks(scene, { RAPIER, world }) {
     );
 
     const t = {
-      obj, lods, ruin, haze, lod: -2, body, collider, spot, dead: false, gone: false,
+      obj, lods, ruin, lod: -2, body, collider, spot, dead: false, gone: false,
       fireSlot: FIRE_SLOT0 + i,
       burnT: 0,
-      hazeBase: haze.userData.heatStrength.value,
     };
     live.push(t);
     setLod(t, 0);
@@ -251,15 +241,12 @@ export async function buildTrucks(scene, { RAPIER, world }) {
         if (t.dead) {
           if (t.gone) {
             t.ruin.visible = false;
-            t.haze.visible = false;
             continue;
           }
           // Keep ruin + fire FX visible until culled far away.
           const d = t.obj.position.distanceTo(camPos);
           const cull = CULL_DIST * lodScale + (t.ruin.visible ? cullPad : -cullPad);
-          const show = lodDist(d) <= cull;
-          t.ruin.visible = show;
-          t.haze.visible = show && wreckFireFade(t.burnT) > 0;
+          t.ruin.visible = lodDist(d) <= cull;
           continue;
         }
         const d = t.obj.position.distanceTo(camPos);
@@ -282,7 +269,6 @@ export async function buildTrucks(scene, { RAPIER, world }) {
       for (const m of t.lods) m.visible = false;
       applyWreckMeshFade(t.ruin, 1);
       t.ruin.visible = true;
-      t.haze.visible = true;
       t.lod = -3;
       spawnScrap(t, dir);
       return true;
@@ -292,28 +278,21 @@ export async function buildTrucks(scene, { RAPIER, world }) {
         if (!t.dead || t.gone || !fx) continue;
         t.burnT += dt;
         const k = wreckFireFade(t.burnT);
-        const hazeU = t.haze.userData.heatStrength;
         if (k <= 0) {
-          t.haze.visible = false;
-          if (hazeU) hazeU.value = 0;
           fx.setDamageFire(null, 0, t.fireSlot);
-        } else {
-          if (hazeU) hazeU.value = t.hazeBase * k;
+        } else if (t.ruin.visible) {
           // Fire gif is bottom-anchored — sit on terrain so flames don't float over the wreck.
           smokeAt.set(t.spot.x, heightAt(t.spot.x, t.spot.z), t.spot.z);
-          if (t.haze.visible) {
-            fx.plume(smokeAt, dt * 0.85 * k);
-            fx.setDamageFire(smokeAt, FIRE_STAGE, t.fireSlot, k);
-          } else {
-            fx.setDamageFire(null, 0, t.fireSlot);
-          }
+          fx.plume(smokeAt, dt * 0.85 * k);
+          fx.setDamageFire(smokeAt, FIRE_STAGE, t.fireSlot, k);
+        } else {
+          fx.setDamageFire(null, 0, t.fireSlot);
         }
         const meshK = wreckMeshFade(t.burnT);
         if (meshK < 1) applyWreckMeshFade(t.ruin, meshK);
         if (meshK <= 0) {
           t.gone = true;
           t.ruin.visible = false;
-          t.haze.visible = false;
           t.body.setEnabled(false);
         }
       }
@@ -343,8 +322,6 @@ export async function buildTrucks(scene, { RAPIER, world }) {
         t.burnT = 0;
         applyWreckMeshFade(t.ruin, 1);
         t.ruin.visible = false;
-        t.haze.visible = false;
-        t.haze.userData.heatStrength.value = t.hazeBase;
         t.lod = -2;
         if (!t.body.isEnabled()) t.body.setEnabled(true);
         fx?.setDamageFire(null, 0, t.fireSlot);

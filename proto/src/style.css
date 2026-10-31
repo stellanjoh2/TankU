@@ -162,7 +162,6 @@ canvas { display: block; }
 }
 #hud .hp,
 #hud .nitro,
-#hud .reload,
 #hud .overheat,
 #hud .repair,
 #hud .hit,
@@ -171,7 +170,6 @@ canvas { display: block; }
 #hud .weapon { grid-template-columns: 62px 1fr; }
 #hud .hp span,
 #hud .nitro span,
-#hud .reload span,
 #hud .overheat span,
 #hud .repair span,
 #hud .hit span,
@@ -182,7 +180,6 @@ canvas { display: block; }
 #hud .hp[data-who="player"] span { color: var(--army-gold); opacity: 1; }
 #hud .hp b,
 #hud .nitro b,
-#hud .reload b,
 #hud .overheat b,
 #hud .repair b,
 #hud .hit b,
@@ -206,7 +203,6 @@ canvas { display: block; }
 #hud .hit.smoke span { color: var(--field-02); }
 #hud .hp-bar,
 #hud .nitro-bar,
-#hud .reload-bar,
 #hud .overheat-bar,
 #hud .repair-bar,
 #hud .hit-bar {
@@ -238,10 +234,6 @@ canvas { display: block; }
 }
 #hud .hit.smoke .hit-bar i {
   background: linear-gradient(90deg, var(--field-01), var(--field-02));
-}
-#hud .reload-bar i {
-  display: block; height: 100%; width: 0%;
-  background: var(--army-gold); transition: width 0.08s linear;
 }
 #hud .overheat span { color: #ff9a3a; opacity: 1; }
 #hud .overheat-bar { border-color: rgba(255, 140, 40, 0.55); }

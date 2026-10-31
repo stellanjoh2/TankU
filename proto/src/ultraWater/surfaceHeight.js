@@ -111,7 +111,7 @@ function sampleCascade(field, length, x, z) {
 function dampOf(depth, waveDamp) {
   const swell = smoothstep(2, waveDamp.x, depth);
   const chop = smoothstep(-0.4, 2, depth) * (waveDamp.y + (1 - waveDamp.y) * smoothstep(0, 10, depth));
-  return [swell, chop, chop];
+  return [swell, chop];
 }
 
 function shoreDisp(x, z, time, shore, params, swellDir) {
@@ -197,8 +197,8 @@ function fftDisp(fields, x, z, depth, waveDamp) {
 const CAPTURE_EVERY = 3; // frames between GPU→CPU FFT copies (hull bob)
 
 export function createSurfaceHeight(renderer, { shore, sim, params, waveDamp, swellDir }) {
-  const fields = [null, null, null];
-  const bufs = [null, null, null];
+  const fields = Array(CASCADES).fill(null);
+  const bufs = Array(CASCADES).fill(null);
   let busy = false;
   let captureAge = CAPTURE_EVERY; // capture on first call, then every CAPTURE_EVERY frames
 

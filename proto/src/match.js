@@ -176,8 +176,11 @@ export function createMatch({
     if (victim === tank) {
       input.rumble(1, 1, 700);
       endRound(true, victim);
-    } else if (!hostilesRemain()) endRound(false, victim);
-    else announceRemaining();
+    } else {
+      sfx.radioChatter();
+      if (!hostilesRemain()) endRound(false, victim);
+      else announceRemaining();
+    }
   }
 
   /** Fuel-drum blast: full shell hit point-blank, a graze further out. */
@@ -253,6 +256,7 @@ export function createMatch({
       const boatWasAlive = !!boat?.alive;
       if (patrolBoat?.shellHit(body, dir)) {
         if (boatWasAlive && !boat.alive && tank.alive && game.overT <= 0) {
+          sfx.radioChatter();
           if (!hostilesRemain()) endRound(false);
           else announceRemaining();
         }
@@ -268,6 +272,8 @@ export function createMatch({
       if (!naval && ownerFoe && victimFoe) return;
       const dmg = naval ? victim.hp : shellDamage(victim, point, owner);
       victim.hp = Math.max(0, victim.hp - dmg);
+      // Tangible weight: side shove / rear nudge / front soft-brake (see Tank.applyShellHit).
+      if (dir) victim.applyShellHit(dir, point);
       // Main-gun only — MG path never calls addStress. Rear hits spike harder.
       if (victim.alive) victim.addStress(STRESS_PER_SHELL * dmg);
       // Clank at the impact — audible ~140 m, squared falloff (no distant floor).
@@ -302,6 +308,7 @@ export function createMatch({
         const sunk = air ? patrolBoat.airHit(body) : false;
         if (!air) patrolBoat.flashHit(body);
         if (sunk && tank.alive) {
+          sfx.radioChatter();
           if (!hostilesRemain()) endRound(false);
           else announceRemaining();
         }

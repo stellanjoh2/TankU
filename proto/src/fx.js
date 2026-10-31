@@ -128,7 +128,7 @@ const SHELL_SHOCKWAVE = {
   mips: true,
 };
 
-/** Scorched-earth ground decal after a main-gun dirt blast. Draped on the heightfield. */
+/** Scorched-earth ground decal after a main-gun dirt blast. */
 const SCORCHED_EARTH = {
   url: './textures/vfx/T_scorched_earth.png',
   size: 10,
@@ -136,7 +136,8 @@ const SCORCHED_EARTH = {
   /** Hold full strength, then fade the rest of the life. */
   fadeStart: 0.45,
   lift: 0.05,
-  segs: 20,
+  // 1×1 → 4 corner verts only (was 20×20 / 441 height samples). Bilinear warp is enough for a soft blot.
+  segs: 1,
   poolSize: 8,
 };
 
@@ -293,7 +294,7 @@ const DAMAGE_FIRE_URL = './textures/vfx/fire.gif';
 // World metres. Matches the old screen-space size at the chase camera, and shrinks on a distant tank.
 // Steps: 25% / 50% / 75% damage, then the wreck.
 const DAMAGE_FIRE_SCALE = [0, 2.1, 3.6, 5.3, 7.6];
-const DAMAGE_FIRE_SPEED = 2.25;
+const DAMAGE_FIRE_SPEED = 2.25 * 1.5; // +50% — more violent burn playback
 /** Destroyed tank / truck: full burn, then a short fade, then the wreck is cold. */
 export const WRECK_FIRE_LIFE = 60;
 const WRECK_FIRE_FADE = 8;
@@ -1706,7 +1707,7 @@ export class Effects {
   }
 
   /**
-   * 10×10 m burn mark, vertices snapped to terrain height so it won't clip hills.
+   * Dark burn blot: 4-corner height snap (cheap bilinear drape). Soft texture hides the facets.
    * @param {THREE.Vector3} point
    */
   _spawnScorchedEarth(point) {
@@ -1716,21 +1717,18 @@ export class Effects {
     const cx = point.x;
     const cz = point.z;
     const cy = terrainHeightAt(cx, cz);
-    const yaw = Math.random() * Math.PI * 2;
-    const cos = Math.cos(yaw);
-    const sin = Math.sin(yaw);
     s.mesh.position.set(cx, cy, cz);
-    s.mesh.rotation.set(0, yaw, 0);
+    s.mesh.rotation.set(0, 0, 0);
     const pos = s.mesh.geometry.attributes.position;
+    // 4 verts with segs:1 — one heightAt each.
     for (let i = 0; i < pos.count; i++) {
-      const lx = pos.getX(i);
-      const lz = pos.getZ(i);
-      const wx = cx + lx * cos - lz * sin;
-      const wz = cz + lx * sin + lz * cos;
-      pos.setY(i, terrainHeightAt(wx, wz) - cy + cfg.lift);
+      pos.setY(i, terrainHeightAt(cx + pos.getX(i), cz + pos.getZ(i)) - cy + cfg.lift);
     }
     pos.needsUpdate = true;
-    s.mesh.geometry.computeBoundingSphere();
+    // Fixed radius — skip computeBoundingSphere (was rebuilding every spawn).
+    const sph = s.mesh.geometry.boundingSphere ?? (s.mesh.geometry.boundingSphere = new THREE.Sphere());
+    sph.center.set(0, 0, 0);
+    sph.radius = cfg.size * 0.75;
     s.fadeU.value = 1;
   }
 
@@ -2676,7 +2674,7 @@ export class Effects {
     }
 
     // Emissive sparks: fly out from center, bounce, white → red as they die.
-    for (let i = 0; emissive && i < 30; i++) {
+    for (let i = 0; emissive && i < 15; i++) {
       const size = (0.45 + Math.random() * 0.55) * 0.25;
       this._hitPoint.copy(point).addScaledVector(normal, 0.5 + Math.random() * 0.4);
       const v = this._shellDir.copy(normal).multiplyScalar(6 + Math.random() * 10)
@@ -2733,7 +2731,7 @@ export class Effects {
         );
       }
     }
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 5; i++) {
       const chunk = takeMesh(this._debrisPool);
       chunk.life = 2.5;
       chunk.mesh.position.copy(point).addScaledVector(normal, 0.2);
@@ -2745,8 +2743,11 @@ export class Effects {
 
     const body = collider?.parent();
     // onShellHit may have already despawned the hit body (e.g. wooden crates).
+    // Tanks get anisotropic shove in match → Tank.applyShellHit (skip generic reverse punch).
     try {
-      if (body && body.isDynamic()) body.applyImpulseAtPoint(dir.clone().multiplyScalar(IMPACT_IMPULSE), point, true);
+      if (body && body.isDynamic() && !body.userData?.tank) {
+        body.applyImpulseAtPoint(dir.clone().multiplyScalar(IMPACT_IMPULSE), point, true);
+      }
     } catch (_) { /* freed rigid body */ }
     for (const { body: b } of this.dynamic) {
       const p = b.translation();

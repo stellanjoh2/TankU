@@ -1,8 +1,9 @@
 // Look defaults from Ultra-Water's Water / Waves / Shore folders (MIT, Humpalumps).
 // Colour presets are linear RGB: absorption (1/m), in-scatter, thin-foam tint.
 
-// Three cascades (was four incl. 2.1 m capillaries) — ~25% less FFT + shade samples.
-export const CASCADE_LENGTHS = [600, 85, 12];
+// Two cascades (was three: 600 / 85 / 12) — ~25–33% less FFT + shade samples.
+// Mid length nudged down so wind chop still covers what the old 12 m band held.
+export const CASCADE_LENGTHS = [600, 45];
 
 export const WATER_PRESETS = {
   clear: { absorption: [0.42, 0.075, 0.048], scatter: [0.0, 0.05, 0.08], foam: [0.62, 0.78, 0.82] },

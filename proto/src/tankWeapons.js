@@ -52,7 +52,7 @@ export function tickMg(tank, dt, trigger) {
   return s.firing;
 }
 
-export function syncMgHeatVisual(tank, firing) {
+export function syncMgHeatVisual(tank, _firing) {
   const h = tank.mgHeat;
   const glow = h <= 0.5 ? 0 : (h - 0.5) / 0.5;
   const hot = glow > 0.02;
@@ -66,14 +66,6 @@ export function syncMgHeatVisual(tank, firing) {
       m.emissiveIntensity = 1;
     }
   }
-  const haze = tank.mgHaze;
-  if (!haze) return;
-  const k = firing ? Math.max(h, 0.45) : (h > 0.05 ? h : 0);
-  const show = tank.alive && k > 0.03;
-  haze.visible = show;
-  if (!show) return;
-  haze.userData.heatStrength.value = 0.02 * k;
-  haze.scale.setScalar(0.75 + 0.45 * h);
 }
 
 export function muzzleOf(tank) {

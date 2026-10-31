@@ -19,6 +19,7 @@
 // + repair complete (Sounds/242501__gabrielaraujo__powerupsuccess.wav).
 // + victory fanfare (Sounds/161984__robinhood76__03599-majestic-foreboding-fanfare.wav).
 // + enemy kill jingle (Sounds/270404__littlerobotsoundfactory__jingle_achievement_00.wav).
+// + radio chatter on kill (Sounds/163623…hes-down.wav, 163626…enemy-down.wav).
 // + C-47 supply pass (Sounds/515293__breviceps__propeller-plane.wav, +5 dB).
 // + ship horn (Sounds/371535__robinhood76__06934-distant-ship-horn.wav).
 // + weapon switch (Sounds/414439__inspectorj__light-pulley-switch-on-b.wav).
@@ -49,12 +50,17 @@ const REPAIR_URL = './sounds/repair_wrench.wav';
 const REPAIR_DONE_URL = './sounds/repair_done.wav';
 const FANFARE_URL = './sounds/161984__robinhood76__03599-majestic-foreboding-fanfare.wav';
 const KILL_JINGLE_URL = './sounds/270404__littlerobotsoundfactory__jingle_achievement_00.wav';
+const RADIO_CHATTER_URLS = [
+  './sounds/163623__twisterman__radio-chatter-hes-down.wav',
+  './sounds/163626__twisterman__radio-chatter-enemy-down.wav',
+];
 const SHIP_HORN_URL = './sounds/371535__robinhood76__06934-distant-ship-horn.wav';
 const WEAPON_SWITCH_URL = './sounds/414439__inspectorj__light-pulley-switch-on-b.wav';
 // Source peaks at ~0 dBFS; leave headroom so it sits over a ducked music bed.
 const FANFARE_GAIN = 0.72;
 const FANFARE_MUSIC_DUCK = 0.32;
 const KILL_JINGLE_GAIN = 0.7 * Math.pow(10, 5 / 20); // +5 dB
+const RADIO_CHATTER_GAIN = 0.85 * Math.pow(10, 3 / 20); // +3 dB
 // Source wrench is 4.88s; slow it so the clip fills the 5s repair channel.
 const REPAIR_WRENCH_RATE = 4.880295 / 5;
 // Success sample peaks at −11.5 dBFS; +12 dB puts it up with the wrench clicks.
@@ -160,10 +166,12 @@ export class Sfx {
     this.repairBuf = null;
     this.repairDoneBuf = null;
     this.fanfareBuf = null;
+    this.radioChatterBufs = [];
     this.shipHornBuf = null;
     this.weaponSwitchBuf = null;
     this.ready = false;
     this._last = -1;
+    this._radioLast = -1;
     this._ricoLast = -1;
     this._hitCool = 0;
     this._ricoCool = 0;
@@ -237,7 +245,7 @@ export class Sfx {
       const res = await fetch(url);
       return this.ctx.decodeAudioData(await res.arrayBuffer());
     };
-    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, ocean, p51Pass, p51Mg, p51Orbit, c47, dirtThump, waterSplash, mgBass, smokeBomb, flyby, repair, repairDone, fanfare, killJingle, shipHorn, weaponSwitch] = await Promise.all([
+    const [shots, engine, mg, turret, hit, mgClank, music, nitro, reload, fire, ocean, p51Pass, p51Mg, p51Orbit, c47, dirtThump, waterSplash, mgBass, smokeBomb, flyby, repair, repairDone, fanfare, killJingle, radioChatter, shipHorn, weaponSwitch] = await Promise.all([
       Promise.all(SHOT_URLS.map(decode)),
       decode(ENGINE_URL),
       decode(MG50_URL),
@@ -262,6 +270,7 @@ export class Sfx {
       decode(REPAIR_DONE_URL),
       decode(FANFARE_URL),
       decode(KILL_JINGLE_URL),
+      Promise.all(RADIO_CHATTER_URLS.map(decode)),
       decode(SHIP_HORN_URL),
       decode(WEAPON_SWITCH_URL),
     ]);
@@ -289,6 +298,7 @@ export class Sfx {
     this.repairDoneBuf = repairDone;
     this.fanfareBuf = fanfare;
     this.killJingleBuf = killJingle;
+    this.radioChatterBufs = radioChatter;
     this.shipHornBuf = shipHorn;
     this.weaponSwitchBuf = weaponSwitch;
     this.ready = true;
@@ -811,6 +821,25 @@ export class Sfx {
     this._active.add(src);
     src.onended = () => this._active.delete(src);
     src.start();
+  }
+
+  /** Random radio chatter on an enemy kill (avoids the same clip twice in a row). */
+  radioChatter(volume = 1, delay = 1.5) {
+    if (!this.ready || !this.radioChatterBufs.length) return;
+    this.unlock();
+    let i = Math.floor(Math.random() * this.radioChatterBufs.length);
+    if (this.radioChatterBufs.length > 1 && i === this._radioLast) {
+      i = (i + 1) % this.radioChatterBufs.length;
+    }
+    this._radioLast = i;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.radioChatterBufs[i];
+    const g = this.ctx.createGain();
+    g.gain.value = volume * RADIO_CHATTER_GAIN;
+    src.connect(g).connect(this.ctx.destination);
+    this._active.add(src);
+    src.onended = () => this._active.delete(src);
+    src.start(this.ctx.currentTime + delay);
   }
 
   /** Match-won sting. Music ducks for the clip (~8s), including into the next round. */

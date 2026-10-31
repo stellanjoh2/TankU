@@ -90,10 +90,8 @@ export function createUltraWater(renderer, { shore, skyCube, seaY }) {
 
   const d0 = sim.dispNodes[0];
   const d1 = sim.dispNodes[1];
-  const d2 = sim.dispNodes[2];
   const s0 = sim.slopeNodes[0];
   const s1 = sim.slopeNodes[1];
-  const s2 = sim.slopeNodes[2];
   const shMap = texture(shore.texture);
   const trMap = texture(shore.travel);
   const foamMap = texture(foamTex);
@@ -102,8 +100,8 @@ export function createUltraWater(renderer, { shore, skyCube, seaY }) {
   const skyMap = cubeTexture(skyCube);
 
   const maps = {
-    d0, d0s: d0, d1, d1s: d1, d2, d2s: d2,
-    s0, s0s: s0, s1, s1s: s1, s2, s2s: s2,
+    d0, d0s: d0, d1, d1s: d1,
+    s0, s0s: s0, s1, s1s: s1,
     shMap, shS: shMap, trMap, trS: trMap,
   };
   const look = {
